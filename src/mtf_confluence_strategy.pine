@@ -1,30 +1,38 @@
 //@version=6
 // =============================================================================
-// MTF Confluence System — MODULE M2: Market Structure (HH/HL/LH/LL + Trend)
+// MTF Confluence System — ANA STRATEJİ DOSYASI (single-file architecture)
 // -----------------------------------------------------------------------------
-// M2, YALNIZCA onaylanmış MAIN pivotlarından piyasa yapısını üretir:
-//   - Her yeni TEPE, bir önceki onaylı tepeyle karşılaştırılır -> HH veya LH.
-//   - Her yeni DİP,  bir önceki onaylı diple karşılaştırılır  -> HL veya LL.
-//   - Trend state (UP/DOWN/RANGE) bu iki sınıfın bileşiminden türetilir.
+// Tüm modüller bu TEK strategy dosyasında fonksiyon olarak yaşar. Kod tekrarı
+// yoktur; çekirdek başka dosyaya kopyalanmaz.
 //
-// Yasaklı gösterge yok, DIŞ FİLTRE yok: EMA/RSI/MACD/hacim/momentum kullanılmaz.
-// Trend tamamen pivot dizisinin geometrisinden gelir.
+// Uygulanan modüller:
+//   M1 · Pivot Engine (Confirmed ZigZag) — Main + Fast, iki bağımsız motor.
+//   M2 · Market Structure — onaylı MAIN pivotlarından HH/HL/LH/LL + trend state.
 //
-// Bu dosya M2'nin izole test prototipidir; içine M1 çekirdeği (değişmeden)
-// gömülüdür ki tek başına derlenip doğrulanabilsin. Nihai birleşik strateji
-// dosyasında bu fonksiyonlar aynen kullanılacaktır.
+// Sıradaki modüller (henüz eklenmedi): M3 XABCD, M4 Harmonic, M5 MTF Confluence,
+//   M6 HTF Veto, M7 Weighted Score, M8 Risk, M9 Signal/Backtest.
 //
-// NOT: EQH/EQL (eşit tepe/dip) sınıfları da işaretlenir ama trend'i UP/DOWN'a
-// çevirmez (nötr kabul edilir) — LONG-only bağlamında konservatif davranış.
+// KISITLAR:
+//   - Yalnızca LONG (ileride). Şimdilik hiçbir entry/exit/alarm YOK.
+//   - REPAINT YOK: tüm state yalnızca KAPANMIŞ barlarda (barstate.isconfirmed)
+//     ilerler; pivotlar onay sonrası sabittir.
+//   - Yasaklı gösterge / dış filtre YOK: yalnızca OHLC geometrisi + ATR.
+//     EMA/RSI/MACD/hacim/momentum KULLANILMAZ.
 // =============================================================================
 
-strategy("M2 · Market Structure", overlay = true, pyramiding = 0,
+strategy("MTF Confluence Strategy (M1+M2)", overlay = true, pyramiding = 0,
      max_lines_count = 500, max_labels_count = 500)
 
 // =============================================================================
-// M1 ÇEKİRDEĞİ (değişmedi — kabul edilmiş sürüm)
+// Tipler
 // =============================================================================
 
+// --- M1: Onaylanmış pivot kaydı. kind: +1 = HIGH (tepe), -1 = LOW (dip). ------
+// bidx   : pivotun GERÇEKLEŞTİĞİ bar_index (geçmişte, sabit).
+// confIdx: pivotun BİLİNDİĞİ/onaylandığı bar_index (bidx'ten büyük/eşit).
+// theta  : onayı sağlayan, aday barında DONDURULMUŞ sapma eşiği (k*ATR).
+// NOT: gelecekte strateji girişleri YALNIZCA confIdx barında veya SONRASINDA
+// yapılabilir; asla bidx'te değil (aksi repaint olur).
 type Pivot
     float price
     int   bidx
@@ -33,6 +41,12 @@ type Pivot
     int   confIdx
     float theta
 
+// --- M1: Motor durumu (state machine) ----------------------------------------
+//   init  : ilk (ATR'li) bar görüldü mü?
+//   booted: yön belirlendi mi? (bootstrap tamamlandı mı?)
+//   dir   : +1 => TEPE arıyoruz, -1 => DİP arıyoruz.
+//   cur*  : aranan yöndeki aday uç + curTheta (aday barında donmuş eşik)
+//   opp*  : ters uç takipçisi (geri çekilme) + oppTheta
 type Engine
     bool  init
     bool  booted
@@ -46,6 +60,26 @@ type Engine
     int   oppTime
     float oppTheta
 
+// --- M2: Piyasa yapısı durumu — YALNIZCA onaylanmış MAIN pivotlarından --------
+//   highClass: +1 = HH, -1 = LH, 0 = yok/EQH
+//   lowClass : +1 = HL, -1 = LL, 0 = yok/EQL
+//   trend    : +1 = UP, -1 = DOWN, 0 = RANGE
+//   lastChangeConfIdx: trend'in en son DEĞİŞTİĞİ pivotun confIdx'i
+type Structure
+    bool  haveHigh
+    bool  haveLow
+    float lastHigh
+    int   lastHighIdx
+    float lastLow
+    int   lastLowIdx
+    int   highClass
+    int   lowClass
+    int   trend
+    int   lastChangeConfIdx
+
+// =============================================================================
+// Girdiler
+// =============================================================================
 atrLen      = input.int(14,  "ATR uzunluğu",              minval = 1, group = "Genel")
 
 grpMain     = "MAIN motor (yapısal)"
@@ -60,11 +94,22 @@ grpViz      = "Görsel"
 showMain    = input.bool(true, "MAIN zigzag + yapı etiketleri", group = grpViz)
 showFast    = input.bool(true, "FAST zigzag göster",            group = grpViz)
 
+// =============================================================================
+// M1 · Pivot Engine (KABUL EDİLMİŞ — davranış değişmedi)
+// =============================================================================
+
+// Yeni, sıfırlanmış bir motor üretir.
 f_engine_new() =>
     Engine.new(init = false, booted = false, dir = 0,
          curPrice = na, curIdx = na, curTime = na, curTheta = na,
          oppPrice = na, oppIdx = na, oppTime = na, oppTheta = na)
 
+// Bir motoru tek bar ileri adımlar. Pivot ONAYLANDIYSA onu döndürür, yoksa na.
+// State doğrudan `e` üzerinde mutasyona uğrar. Yalnızca KAPANMIŞ barlarda çağır.
+//
+// KONSERVATİF BAR-İÇİ KURAL: bir mumun içinde high/low sırası bilinmez. AYNI mumda
+// hem yeni ekstrem hem ters sapma oluşursa, o ekstremi kullanan onay O BARDA
+// VERİLMEZ (normal modda 'else' dalı; bootstrap'ta 'not newHigh'/'not newLow').
 f_engine_step(Engine e, float k, int minBars, float atr) =>
     Pivot result = na
 
@@ -193,38 +238,24 @@ f_engine_step(Engine e, float k, int minBars, float atr) =>
     result
 
 // =============================================================================
-// M2: MARKET STRUCTURE
+// M2 · Market Structure (yalnızca MAIN onaylı pivotlarından)
 // =============================================================================
-
-// Piyasa yapısı durumu — yalnızca onaylanmış pivotlardan beslenir.
-//   highClass: +1 = HH, -1 = LH, 0 = yok/EQH
-//   lowClass : +1 = HL, -1 = LL, 0 = yok/EQL
-//   trend    : +1 = UP, -1 = DOWN, 0 = RANGE
-type Structure
-    bool  haveHigh
-    bool  haveLow
-    float lastHigh
-    int   lastHighIdx
-    float lastLow
-    int   lastLowIdx
-    int   highClass
-    int   lowClass
-    int   trend
 
 f_structure_new() =>
     Structure.new(haveHigh = false, haveLow = false,
          lastHigh = na, lastHighIdx = na, lastLow = na, lastLowIdx = na,
-         highClass = 0, lowClass = 0, trend = 0)
+         highClass = 0, lowClass = 0, trend = 0, lastChangeConfIdx = na)
 
-// Yeni bir onaylı pivotu yapıya işler ve o pivota bir etiket döndürür:
-//   TEPE: "HH" / "LH" / "EQH" / "H1" (ilk)
-//   DİP : "HL" / "LL" / "EQL" / "L1" (ilk)
-// Trend, her güncellemeden sonra highClass + lowClass bileşiminden türetilir.
+// Yeni bir onaylı MAIN pivotu yapıya işler ve o pivota bir etiket döndürür:
+//   TEPE: "HH"/"LH"/"EQH"/"H1"      DİP: "HL"/"LL"/"EQL"/"L1"
+// Trend her güncellemede highClass+lowClass bileşiminden türetilir. Trend
+// DEĞİŞTİYSE, değişimi tetikleyen pivotun confIdx'i saklanır.
+// (Bu fonksiyon yalnızca yeni MAIN pivot onaylandığında çağrılır -> trend
+//  değişimi de yalnızca o anda oluşur.)
 f_structure_update(Structure s, Pivot p) =>
     string tag = na
 
     if p.kind == 1
-        // ---- TEPE ----
         if not s.haveHigh
             tag         := "H1"
             s.highClass := 0
@@ -241,7 +272,6 @@ f_structure_update(Structure s, Pivot p) =>
         s.lastHighIdx := p.bidx
         s.haveHigh    := true
     else
-        // ---- DİP ----
         if not s.haveLow
             tag        := "L1"
             s.lowClass := 0
@@ -258,31 +288,47 @@ f_structure_update(Structure s, Pivot p) =>
         s.lastLowIdx := p.bidx
         s.haveLow    := true
 
-    // Trend: UP ancak HH + HL; DOWN ancak LH + LL; aksi halde RANGE.
-    bool up   = s.highClass == 1  and s.lowClass == 1
-    bool down = s.highClass == -1 and s.lowClass == -1
-    s.trend := up ? 1 : down ? -1 : 0
+    // Trend: UP ancak HH+HL; DOWN ancak LH+LL; aksi RANGE.
+    int  oldTrend = s.trend
+    bool up       = s.highClass == 1  and s.lowClass == 1
+    bool down     = s.highClass == -1 and s.lowClass == -1
+    int  newTrend = up ? 1 : down ? -1 : 0
+    if newTrend != oldTrend
+        s.lastChangeConfIdx := p.confIdx
+    s.trend := newTrend
     tag
 
-// Yardımcılar (yalnızca görsel/tablo).
+// --- Görsel/tablo yardımcıları (algoritma dışı) ------------------------------
 f_trend_str(int tr) =>
     tr == 1 ? "UP" : tr == -1 ? "DOWN" : "RANGE"
 
 f_trend_color(int tr) =>
     tr == 1 ? color.new(color.green, 0) : tr == -1 ? color.new(color.red, 0) : color.new(color.gray, 0)
 
-// Bullish etiketler (HH/HL) yeşil, bearish (LH/LL) kırmızı, nötr gri.
 f_tag_color(string tag) =>
     bool bull = tag == "HH" or tag == "HL"
     bool bear = tag == "LH" or tag == "LL"
     bull ? color.new(color.green, 20) : bear ? color.new(color.red, 20) : color.new(color.gray, 30)
 
+f_engine_dir_str(Engine e) =>
+    e.booted ? (e.dir == 1 ? "tepe arıyor" : "dip arıyor") : "bootstrap"
+
 // =============================================================================
-// Örnekleme + akış
+// Örnekleme + ring buffer + akış
 // =============================================================================
 var Engine    mainEng = f_engine_new()
 var Engine    fastEng = f_engine_new()
 var Structure struct  = f_structure_new()
+
+var array<Pivot> mainPivots = array.new<Pivot>()
+var array<Pivot> fastPivots = array.new<Pivot>()
+
+BUFFER_MAX = 32
+
+f_push(array<Pivot> buf, Pivot p) =>
+    array.push(buf, p)
+    if array.size(buf) > BUFFER_MAX
+        array.shift(buf)
 
 atr = ta.atr(atrLen)
 
@@ -294,12 +340,16 @@ if barstate.isconfirmed
     mainNew := f_engine_step(mainEng, mainK, mainMinBars, atr)
     fastNew := f_engine_step(fastEng, fastK, fastMinBars, atr)
     if not na(mainNew)
-        mainTag := f_structure_update(struct, mainNew)   // M2: yalnızca MAIN pivotları
+        f_push(mainPivots, mainNew)
+        mainTag := f_structure_update(struct, mainNew)   // M2: yalnızca MAIN
+    if not na(fastNew)
+        f_push(fastPivots, fastNew)
 
 // =============================================================================
 // Görsel doğrulama
-//   - MAIN zigzag çizgisi + yapı etiketi (HH/HL/LH/LL) pivotun bidx barında.
+//   - MAIN zigzag + yapı etiketi (HH/HL/LH/LL) pivotun bidx barında.
 //   - FAST zigzag (taktik, etiketsiz).
+//   - Onay barında (confIdx) küçük daireler.
 // =============================================================================
 var Pivot mainLast = na
 var Pivot fastLast = na
@@ -324,36 +374,59 @@ if not na(fastNew)
                  width = 1, style = line.style_dashed)
     fastLast := fastNew
 
+// Onay-barı işaretleri (strateji girişinin en erken yapılabileceği bar).
+plotshape(showMain and not na(mainNew), title = "MAIN confirmed",
+     style = shape.circle, location = location.belowbar,
+     color = color.new(color.gray, 0), size = size.tiny)
+plotshape(showFast and not na(fastNew), title = "FAST confirmed",
+     style = shape.circle, location = location.abovebar,
+     color = color.new(color.teal, 0), size = size.tiny)
+
 // =============================================================================
-// M2 denetim tablosu
+// Birleşik denetim tablosu (M1 + M2)
 // =============================================================================
 if barstate.islast
-    var table t = table.new(position.top_right, 2, 7, border_width = 1)
+    var table t = table.new(position.top_right, 2, 10, border_width = 1)
 
-    hiCls = struct.highClass == 1 ? "HH" : struct.highClass == -1 ? "LH" : "EQH/-"
-    loCls = struct.lowClass == 1 ? "HL" : struct.lowClass == -1 ? "LL" : "EQL/-"
-    hiStr = struct.haveHigh ? hiCls + "  @ " + str.tostring(struct.lastHigh, format.mintick) : "-"
-    loStr = struct.haveLow ? loCls + "  @ " + str.tostring(struct.lastLow, format.mintick) : "-"
+    hiCls   = struct.highClass == 1 ? "HH" : struct.highClass == -1 ? "LH" : "EQH/-"
+    loCls   = struct.lowClass == 1 ? "HL" : struct.lowClass == -1 ? "LL" : "EQL/-"
+    hiStr   = struct.haveHigh ? hiCls + " @ " + str.tostring(struct.lastHigh, format.mintick) : "-"
+    loStr   = struct.haveLow  ? loCls + " @ " + str.tostring(struct.lastLow, format.mintick) : "-"
+    chgStr  = na(struct.lastChangeConfIdx) ? "-" : str.tostring(struct.lastChangeConfIdx)
+    cntStr  = "M:" + str.tostring(array.size(mainPivots)) + " / F:" + str.tostring(array.size(fastPivots))
+    dirStr  = f_engine_dir_str(mainEng) + " / " + f_engine_dir_str(fastEng)
 
-    table.cell(t, 0, 0, "M2 · Market Structure", bgcolor = color.gray, text_color = color.white)
+    // MAIN son pivot ayrıntısı (M1 denetimi)
+    hasM    = not na(mainLast)
+    pivStr  = hasM ? (mainLast.kind == 1 ? "TEPE" : "DİP") + " bidx " + str.tostring(mainLast.bidx) + " -> conf " + str.tostring(mainLast.confIdx) + " (gec " + str.tostring(mainLast.confIdx - mainLast.bidx) + ")" : "-"
+    thStr   = hasM ? str.tostring(mainLast.theta, format.mintick) : "-"
+
+    table.cell(t, 0, 0, "MTF · M1+M2", bgcolor = color.gray, text_color = color.white)
     table.cell(t, 1, 0, "", bgcolor = color.gray)
 
     table.cell(t, 0, 1, "Trend state")
-    table.cell(t, 1, 1, f_trend_str(struct.trend),
-         bgcolor = f_trend_color(struct.trend), text_color = color.white)
+    table.cell(t, 1, 1, f_trend_str(struct.trend), bgcolor = f_trend_color(struct.trend), text_color = color.white)
 
-    table.cell(t, 0, 2, "Son TEPE (high)")
-    table.cell(t, 1, 2, hiStr)
+    table.cell(t, 0, 2, "Son yapı değişimi (confIdx)")
+    table.cell(t, 1, 2, chgStr)
 
-    table.cell(t, 0, 3, "Son DİP (low)")
-    table.cell(t, 1, 3, loStr)
+    table.cell(t, 0, 3, "Son TEPE")
+    table.cell(t, 1, 3, hiStr)
 
-    table.cell(t, 0, 4, "highClass / lowClass")
-    table.cell(t, 1, 4, str.tostring(struct.highClass) + " / " + str.tostring(struct.lowClass))
+    table.cell(t, 0, 4, "Son DİP")
+    table.cell(t, 1, 4, loStr)
 
-    lastStr = na(mainLast) ? "-" : (mainLast.kind == 1 ? "TEPE" : "DİP") + " (bidx " + str.tostring(mainLast.bidx) + ")"
-    table.cell(t, 0, 5, "Son MAIN pivot etiketi")
-    table.cell(t, 1, 5, lastStr)
+    table.cell(t, 0, 5, "highClass / lowClass")
+    table.cell(t, 1, 5, str.tostring(struct.highClass) + " / " + str.tostring(struct.lowClass))
 
-    table.cell(t, 0, 6, "MAIN yön (motor)")
-    table.cell(t, 1, 6, mainEng.booted ? (mainEng.dir == 1 ? "tepe arıyor" : "dip arıyor") : "bootstrap")
+    table.cell(t, 0, 6, "Pivot sayısı (M/F)")
+    table.cell(t, 1, 6, cntStr)
+
+    table.cell(t, 0, 7, "Motor yön (M/F)")
+    table.cell(t, 1, 7, dirStr)
+
+    table.cell(t, 0, 8, "MAIN son pivot")
+    table.cell(t, 1, 8, pivStr)
+
+    table.cell(t, 0, 9, "MAIN theta (sabit)")
+    table.cell(t, 1, 9, thStr)
