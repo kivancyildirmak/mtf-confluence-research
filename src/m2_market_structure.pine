@@ -1,0 +1,359 @@
+//@version=6
+// =============================================================================
+// MTF Confluence System — MODULE M2: Market Structure (HH/HL/LH/LL + Trend)
+// -----------------------------------------------------------------------------
+// M2, YALNIZCA onaylanmış MAIN pivotlarından piyasa yapısını üretir:
+//   - Her yeni TEPE, bir önceki onaylı tepeyle karşılaştırılır -> HH veya LH.
+//   - Her yeni DİP,  bir önceki onaylı diple karşılaştırılır  -> HL veya LL.
+//   - Trend state (UP/DOWN/RANGE) bu iki sınıfın bileşiminden türetilir.
+//
+// Yasaklı gösterge yok, DIŞ FİLTRE yok: EMA/RSI/MACD/hacim/momentum kullanılmaz.
+// Trend tamamen pivot dizisinin geometrisinden gelir.
+//
+// Bu dosya M2'nin izole test prototipidir; içine M1 çekirdeği (değişmeden)
+// gömülüdür ki tek başına derlenip doğrulanabilsin. Nihai birleşik strateji
+// dosyasında bu fonksiyonlar aynen kullanılacaktır.
+//
+// NOT: EQH/EQL (eşit tepe/dip) sınıfları da işaretlenir ama trend'i UP/DOWN'a
+// çevirmez (nötr kabul edilir) — LONG-only bağlamında konservatif davranış.
+// =============================================================================
+
+strategy("M2 · Market Structure", overlay = true, pyramiding = 0,
+     max_lines_count = 500, max_labels_count = 500)
+
+// =============================================================================
+// M1 ÇEKİRDEĞİ (değişmedi — kabul edilmiş sürüm)
+// =============================================================================
+
+type Pivot
+    float price
+    int   bidx
+    int   ptime
+    int   kind
+    int   confIdx
+    float theta
+
+type Engine
+    bool  init
+    bool  booted
+    int   dir
+    float curPrice
+    int   curIdx
+    int   curTime
+    float curTheta
+    float oppPrice
+    int   oppIdx
+    int   oppTime
+    float oppTheta
+
+atrLen      = input.int(14,  "ATR uzunluğu",              minval = 1, group = "Genel")
+
+grpMain     = "MAIN motor (yapısal)"
+mainK       = input.float(3.0, "MAIN sapma eşiği (× ATR)", minval = 0.1, step = 0.1, group = grpMain)
+mainMinBars = input.int(8,     "MAIN minimum bar",         minval = 1, group = grpMain)
+
+grpFast     = "FAST motor (taktik)"
+fastK       = input.float(1.0, "FAST sapma eşiği (× ATR)", minval = 0.1, step = 0.1, group = grpFast)
+fastMinBars = input.int(3,     "FAST minimum bar",         minval = 1, group = grpFast)
+
+grpViz      = "Görsel"
+showMain    = input.bool(true, "MAIN zigzag + yapı etiketleri", group = grpViz)
+showFast    = input.bool(true, "FAST zigzag göster",            group = grpViz)
+
+f_engine_new() =>
+    Engine.new(init = false, booted = false, dir = 0,
+         curPrice = na, curIdx = na, curTime = na, curTheta = na,
+         oppPrice = na, oppIdx = na, oppTime = na, oppTheta = na)
+
+f_engine_step(Engine e, float k, int minBars, float atr) =>
+    Pivot result = na
+
+    if not na(atr)
+        if not e.init
+            e.init     := true
+            e.booted   := false
+            e.curPrice := high
+            e.curIdx   := bar_index
+            e.curTime  := time
+            e.curTheta := k * atr
+            e.oppPrice := low
+            e.oppIdx   := bar_index
+            e.oppTime  := time
+            e.oppTheta := k * atr
+
+        else if not e.booted
+            newHigh = high > e.curPrice
+            newLow  = low  < e.oppPrice
+            if newHigh
+                e.curPrice := high
+                e.curIdx   := bar_index
+                e.curTime  := time
+                e.curTheta := k * atr
+            if newLow
+                e.oppPrice := low
+                e.oppIdx   := bar_index
+                e.oppTime  := time
+                e.oppTheta := k * atr
+
+            dropFromHigh = (not newHigh) and (e.curPrice - low) >= e.curTheta and (bar_index - e.curIdx) >= minBars
+            riseFromLow  = (not newLow)  and (high - e.oppPrice) >= e.oppTheta and (bar_index - e.oppIdx) >= minBars
+
+            bool doHigh = false
+            bool doLow  = false
+            if dropFromHigh and riseFromLow
+                if e.curIdx < e.oppIdx
+                    doHigh := true
+                else if e.oppIdx < e.curIdx
+                    doLow  := true
+            else if dropFromHigh
+                doHigh := true
+            else if riseFromLow
+                doLow  := true
+
+            if doHigh
+                result := Pivot.new(e.curPrice, e.curIdx, e.curTime, 1, bar_index, e.curTheta)
+                e.booted := true
+                e.dir    := -1
+                e.curPrice := low
+                e.curIdx   := bar_index
+                e.curTime  := time
+                e.curTheta := k * atr
+                e.oppPrice := high
+                e.oppIdx   := bar_index
+                e.oppTime  := time
+                e.oppTheta := k * atr
+            else if doLow
+                result := Pivot.new(e.oppPrice, e.oppIdx, e.oppTime, -1, bar_index, e.oppTheta)
+                e.booted := true
+                e.dir    := 1
+                e.curPrice := high
+                e.curIdx   := bar_index
+                e.curTime  := time
+                e.curTheta := k * atr
+                e.oppPrice := low
+                e.oppIdx   := bar_index
+                e.oppTime  := time
+                e.oppTheta := k * atr
+
+        else
+            if e.dir == 1
+                if high > e.curPrice
+                    e.curPrice := high
+                    e.curIdx   := bar_index
+                    e.curTime  := time
+                    e.curTheta := k * atr
+                    e.oppPrice := low
+                    e.oppIdx   := bar_index
+                    e.oppTime  := time
+                    e.oppTheta := k * atr
+                else
+                    if low < e.oppPrice
+                        e.oppPrice := low
+                        e.oppIdx   := bar_index
+                        e.oppTime  := time
+                        e.oppTheta := k * atr
+                    if (e.curPrice - e.oppPrice) >= e.curTheta and (bar_index - e.curIdx) >= minBars
+                        result := Pivot.new(e.curPrice, e.curIdx, e.curTime, 1, bar_index, e.curTheta)
+                        e.dir      := -1
+                        e.curPrice := e.oppPrice
+                        e.curIdx   := e.oppIdx
+                        e.curTime  := e.oppTime
+                        e.curTheta := e.oppTheta
+                        e.oppPrice := high
+                        e.oppIdx   := bar_index
+                        e.oppTime  := time
+                        e.oppTheta := k * atr
+            else
+                if low < e.curPrice
+                    e.curPrice := low
+                    e.curIdx   := bar_index
+                    e.curTime  := time
+                    e.curTheta := k * atr
+                    e.oppPrice := high
+                    e.oppIdx   := bar_index
+                    e.oppTime  := time
+                    e.oppTheta := k * atr
+                else
+                    if high > e.oppPrice
+                        e.oppPrice := high
+                        e.oppIdx   := bar_index
+                        e.oppTime  := time
+                        e.oppTheta := k * atr
+                    if (e.oppPrice - e.curPrice) >= e.curTheta and (bar_index - e.curIdx) >= minBars
+                        result := Pivot.new(e.curPrice, e.curIdx, e.curTime, -1, bar_index, e.curTheta)
+                        e.dir      := 1
+                        e.curPrice := e.oppPrice
+                        e.curIdx   := e.oppIdx
+                        e.curTime  := e.oppTime
+                        e.curTheta := e.oppTheta
+                        e.oppPrice := low
+                        e.oppIdx   := bar_index
+                        e.oppTime  := time
+                        e.oppTheta := k * atr
+    result
+
+// =============================================================================
+// M2: MARKET STRUCTURE
+// =============================================================================
+
+// Piyasa yapısı durumu — yalnızca onaylanmış pivotlardan beslenir.
+//   highClass: +1 = HH, -1 = LH, 0 = yok/EQH
+//   lowClass : +1 = HL, -1 = LL, 0 = yok/EQL
+//   trend    : +1 = UP, -1 = DOWN, 0 = RANGE
+type Structure
+    bool  haveHigh
+    bool  haveLow
+    float lastHigh
+    int   lastHighIdx
+    float lastLow
+    int   lastLowIdx
+    int   highClass
+    int   lowClass
+    int   trend
+
+f_structure_new() =>
+    Structure.new(haveHigh = false, haveLow = false,
+         lastHigh = na, lastHighIdx = na, lastLow = na, lastLowIdx = na,
+         highClass = 0, lowClass = 0, trend = 0)
+
+// Yeni bir onaylı pivotu yapıya işler ve o pivota bir etiket döndürür:
+//   TEPE: "HH" / "LH" / "EQH" / "H1" (ilk)
+//   DİP : "HL" / "LL" / "EQL" / "L1" (ilk)
+// Trend, her güncellemeden sonra highClass + lowClass bileşiminden türetilir.
+f_structure_update(Structure s, Pivot p) =>
+    string tag = na
+
+    if p.kind == 1
+        // ---- TEPE ----
+        if not s.haveHigh
+            tag         := "H1"
+            s.highClass := 0
+        else if p.price > s.lastHigh
+            tag         := "HH"
+            s.highClass := 1
+        else if p.price < s.lastHigh
+            tag         := "LH"
+            s.highClass := -1
+        else
+            tag         := "EQH"
+            s.highClass := 0
+        s.lastHigh    := p.price
+        s.lastHighIdx := p.bidx
+        s.haveHigh    := true
+    else
+        // ---- DİP ----
+        if not s.haveLow
+            tag        := "L1"
+            s.lowClass := 0
+        else if p.price > s.lastLow
+            tag        := "HL"
+            s.lowClass := 1
+        else if p.price < s.lastLow
+            tag        := "LL"
+            s.lowClass := -1
+        else
+            tag        := "EQL"
+            s.lowClass := 0
+        s.lastLow    := p.price
+        s.lastLowIdx := p.bidx
+        s.haveLow    := true
+
+    // Trend: UP ancak HH + HL; DOWN ancak LH + LL; aksi halde RANGE.
+    bool up   = s.highClass == 1  and s.lowClass == 1
+    bool down = s.highClass == -1 and s.lowClass == -1
+    s.trend := up ? 1 : down ? -1 : 0
+    tag
+
+// Yardımcılar (yalnızca görsel/tablo).
+f_trend_str(int tr) =>
+    tr == 1 ? "UP" : tr == -1 ? "DOWN" : "RANGE"
+
+f_trend_color(int tr) =>
+    tr == 1 ? color.new(color.green, 0) : tr == -1 ? color.new(color.red, 0) : color.new(color.gray, 0)
+
+// Bullish etiketler (HH/HL) yeşil, bearish (LH/LL) kırmızı, nötr gri.
+f_tag_color(string tag) =>
+    bool bull = tag == "HH" or tag == "HL"
+    bool bear = tag == "LH" or tag == "LL"
+    bull ? color.new(color.green, 20) : bear ? color.new(color.red, 20) : color.new(color.gray, 30)
+
+// =============================================================================
+// Örnekleme + akış
+// =============================================================================
+var Engine    mainEng = f_engine_new()
+var Engine    fastEng = f_engine_new()
+var Structure struct  = f_structure_new()
+
+atr = ta.atr(atrLen)
+
+// REPAINT GÜVENLİĞİ: state yalnızca bar kapanınca ilerler.
+Pivot  mainNew = na
+Pivot  fastNew = na
+string mainTag = na
+if barstate.isconfirmed
+    mainNew := f_engine_step(mainEng, mainK, mainMinBars, atr)
+    fastNew := f_engine_step(fastEng, fastK, fastMinBars, atr)
+    if not na(mainNew)
+        mainTag := f_structure_update(struct, mainNew)   // M2: yalnızca MAIN pivotları
+
+// =============================================================================
+// Görsel doğrulama
+//   - MAIN zigzag çizgisi + yapı etiketi (HH/HL/LH/LL) pivotun bidx barında.
+//   - FAST zigzag (taktik, etiketsiz).
+// =============================================================================
+var Pivot mainLast = na
+var Pivot fastLast = na
+
+if not na(mainNew)
+    if showMain
+        if not na(mainLast)
+            line.new(mainLast.bidx, mainLast.price, mainNew.bidx, mainNew.price,
+                 xloc = xloc.bar_index, color = color.new(color.gray, 20), width = 2)
+        label.new(mainNew.bidx, mainNew.price, mainTag,
+             xloc = xloc.bar_index,
+             yloc = mainNew.kind == 1 ? yloc.abovebar : yloc.belowbar,
+             style = mainNew.kind == 1 ? label.style_label_down : label.style_label_up,
+             color = f_tag_color(mainTag), textcolor = color.white, size = size.small)
+    mainLast := mainNew
+
+if not na(fastNew)
+    if showFast
+        if not na(fastLast)
+            line.new(fastLast.bidx, fastLast.price, fastNew.bidx, fastNew.price,
+                 xloc = xloc.bar_index, color = color.new(color.teal, 50),
+                 width = 1, style = line.style_dashed)
+    fastLast := fastNew
+
+// =============================================================================
+// M2 denetim tablosu
+// =============================================================================
+if barstate.islast
+    var table t = table.new(position.top_right, 2, 7, border_width = 1)
+
+    hiCls = struct.highClass == 1 ? "HH" : struct.highClass == -1 ? "LH" : "EQH/-"
+    loCls = struct.lowClass == 1 ? "HL" : struct.lowClass == -1 ? "LL" : "EQL/-"
+    hiStr = struct.haveHigh ? hiCls + "  @ " + str.tostring(struct.lastHigh, format.mintick) : "-"
+    loStr = struct.haveLow ? loCls + "  @ " + str.tostring(struct.lastLow, format.mintick) : "-"
+
+    table.cell(t, 0, 0, "M2 · Market Structure", bgcolor = color.gray, text_color = color.white)
+    table.cell(t, 1, 0, "", bgcolor = color.gray)
+
+    table.cell(t, 0, 1, "Trend state")
+    table.cell(t, 1, 1, f_trend_str(struct.trend),
+         bgcolor = f_trend_color(struct.trend), text_color = color.white)
+
+    table.cell(t, 0, 2, "Son TEPE (high)")
+    table.cell(t, 1, 2, hiStr)
+
+    table.cell(t, 0, 3, "Son DİP (low)")
+    table.cell(t, 1, 3, loStr)
+
+    table.cell(t, 0, 4, "highClass / lowClass")
+    table.cell(t, 1, 4, str.tostring(struct.highClass) + " / " + str.tostring(struct.lowClass))
+
+    lastStr = na(mainLast) ? "-" : (mainLast.kind == 1 ? "TEPE" : "DİP") + " (bidx " + str.tostring(mainLast.bidx) + ")"
+    table.cell(t, 0, 5, "Son MAIN pivot etiketi")
+    table.cell(t, 1, 5, lastStr)
+
+    table.cell(t, 0, 6, "MAIN yön (motor)")
+    table.cell(t, 1, 6, mainEng.booted ? (mainEng.dir == 1 ? "tepe arıyor" : "dip arıyor") : "bootstrap")
