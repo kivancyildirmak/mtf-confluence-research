@@ -318,7 +318,7 @@ f_engine_dir_str(Engine e) =>
 // =============================================================================
 var Engine    mainEng = f_engine_new()
 var Engine    fastEng = f_engine_new()
-var Structure struct  = f_structure_new()
+var Structure marketStruct = f_structure_new()
 
 var array<Pivot> mainPivots = array.new<Pivot>()
 var array<Pivot> fastPivots = array.new<Pivot>()
@@ -341,7 +341,7 @@ if barstate.isconfirmed
     fastNew := f_engine_step(fastEng, fastK, fastMinBars, atr)
     if not na(mainNew)
         f_push(mainPivots, mainNew)
-        mainTag := f_structure_update(struct, mainNew)   // M2: yalnızca MAIN
+        mainTag := f_structure_update(marketStruct, mainNew)   // M2: yalnızca MAIN
     if not na(fastNew)
         f_push(fastPivots, fastNew)
 
@@ -388,11 +388,11 @@ plotshape(showFast and not na(fastNew), title = "FAST confirmed",
 if barstate.islast
     var table t = table.new(position.top_right, 2, 10, border_width = 1)
 
-    hiCls   = struct.highClass == 1 ? "HH" : struct.highClass == -1 ? "LH" : "EQH/-"
-    loCls   = struct.lowClass == 1 ? "HL" : struct.lowClass == -1 ? "LL" : "EQL/-"
-    hiStr   = struct.haveHigh ? hiCls + " @ " + str.tostring(struct.lastHigh, format.mintick) : "-"
-    loStr   = struct.haveLow  ? loCls + " @ " + str.tostring(struct.lastLow, format.mintick) : "-"
-    chgStr  = na(struct.lastChangeConfIdx) ? "-" : str.tostring(struct.lastChangeConfIdx)
+    hiCls   = marketStruct.highClass == 1 ? "HH" : marketStruct.highClass == -1 ? "LH" : "EQH/-"
+    loCls   = marketStruct.lowClass == 1 ? "HL" : marketStruct.lowClass == -1 ? "LL" : "EQL/-"
+    hiStr   = marketStruct.haveHigh ? hiCls + " @ " + str.tostring(marketStruct.lastHigh, format.mintick) : "-"
+    loStr   = marketStruct.haveLow  ? loCls + " @ " + str.tostring(marketStruct.lastLow, format.mintick) : "-"
+    chgStr  = na(marketStruct.lastChangeConfIdx) ? "-" : str.tostring(marketStruct.lastChangeConfIdx)
     cntStr  = "M:" + str.tostring(array.size(mainPivots)) + " / F:" + str.tostring(array.size(fastPivots))
     dirStr  = f_engine_dir_str(mainEng) + " / " + f_engine_dir_str(fastEng)
 
@@ -405,7 +405,7 @@ if barstate.islast
     table.cell(t, 1, 0, "", bgcolor = color.gray)
 
     table.cell(t, 0, 1, "Trend state")
-    table.cell(t, 1, 1, f_trend_str(struct.trend), bgcolor = f_trend_color(struct.trend), text_color = color.white)
+    table.cell(t, 1, 1, f_trend_str(marketStruct.trend), bgcolor = f_trend_color(marketStruct.trend), text_color = color.white)
 
     table.cell(t, 0, 2, "Son yapı değişimi (confIdx)")
     table.cell(t, 1, 2, chgStr)
@@ -417,7 +417,7 @@ if barstate.islast
     table.cell(t, 1, 4, loStr)
 
     table.cell(t, 0, 5, "highClass / lowClass")
-    table.cell(t, 1, 5, str.tostring(struct.highClass) + " / " + str.tostring(struct.lowClass))
+    table.cell(t, 1, 5, str.tostring(marketStruct.highClass) + " / " + str.tostring(marketStruct.lowClass))
 
     table.cell(t, 0, 6, "Pivot sayısı (M/F)")
     table.cell(t, 1, 6, cntStr)
