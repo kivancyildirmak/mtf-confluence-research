@@ -384,10 +384,14 @@ plotshape(showFast and not na(fastNew), title = "FAST confirmed",
 
 // =============================================================================
 // Birleşik denetim tablosu (M1 + M2)
+//   Tablo NESNESİ global scope'ta KOŞULSUZ ve `var` ile bir kez oluşturulur;
+//   böylece normal grafikte de her zaman görünür (barstate/Replay'e bağlı değil).
+//   Yalnızca HÜCRE içerikleri `if barstate.islast` içinde güncellenir.
+//   table.clear() kullanılmaz.
 // =============================================================================
-if barstate.islast
-    var table t = table.new(position.top_right, 2, 10, border_width = 1)
+var table t = table.new(position.top_right, 2, 10, border_width = 1)
 
+if barstate.islast
     hiCls   = marketStruct.highClass == 1 ? "HH" : marketStruct.highClass == -1 ? "LH" : "EQH/-"
     loCls   = marketStruct.lowClass == 1 ? "HL" : marketStruct.lowClass == -1 ? "LL" : "EQL/-"
     hiStr   = marketStruct.haveHigh ? hiCls + " @ " + str.tostring(marketStruct.lastHigh, format.mintick) : "-"
