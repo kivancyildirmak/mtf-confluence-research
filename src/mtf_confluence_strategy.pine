@@ -8,8 +8,9 @@
 // Uygulanan modüller:
 //   M1 · Pivot Engine (Confirmed ZigZag) — Main + Fast, iki bağımsız motor.
 //   M2 · Market Structure — onaylı MAIN pivotlarından HH/HL/LH/LL + trend state.
+//   M3 · XABCD Builder — ardışık 5 onaylı MAIN pivotundan X-A-B-C-D adayı (yapısal).
 //
-// Sıradaki modüller (henüz eklenmedi): M3 XABCD, M4 Harmonic, M5 MTF Confluence,
+// Sıradaki modüller (henüz eklenmedi): M4 Harmonic, M5 MTF Confluence,
 //   M6 HTF Veto, M7 Weighted Score, M8 Risk, M9 Signal/Backtest.
 //
 // KISITLAR:
@@ -20,7 +21,7 @@
 //     EMA/RSI/MACD/hacim/momentum KULLANILMAZ.
 // =============================================================================
 
-strategy("MTF Confluence Strategy (M1+M2)", overlay = true, pyramiding = 0,
+strategy("MTF Confluence Strategy (M1+M2+M3)", overlay = true, pyramiding = 0,
      max_lines_count = 500, max_labels_count = 500)
 
 // =============================================================================
@@ -77,6 +78,29 @@ type Structure
     int   trend
     int   lastChangeConfIdx
 
+// --- M3: XABCD adayı — ardışık 5 onaylı MAIN pivotundan (X,A,B,C,D) -----------
+//   valid    : alternans + kronolojik sıra sağlanıyor mu? (geçerli 5-pivot dizisi)
+//   isBullish: D bir DİP mi? (yükseliş tamamlanması D'de olur)
+//   dir      : +1 = bullish (D dip), -1 = bearish (D tepe)
+//   *Len     : leg fiyat büyüklüğü |Δprice|;  *Bars: leg bar açıklığı (Δbidx)
+type Xabcd
+    Pivot X
+    Pivot A
+    Pivot B
+    Pivot C
+    Pivot D
+    bool  valid
+    bool  isBullish
+    int   dir
+    float xaLen
+    float abLen
+    float bcLen
+    float cdLen
+    int   xaBars
+    int   abBars
+    int   bcBars
+    int   cdBars
+
 // =============================================================================
 // Girdiler
 // =============================================================================
@@ -93,6 +117,7 @@ fastMinBars = input.int(3,     "FAST minimum bar",         minval = 1, group = g
 grpViz      = "Görsel"
 showMain    = input.bool(true, "MAIN zigzag + yapı etiketleri", group = grpViz)
 showFast    = input.bool(true, "FAST zigzag göster",            group = grpViz)
+showXabcd   = input.bool(true, "M3: XABCD adayını çiz (X-A-B-C-D)", group = grpViz)
 
 // =============================================================================
 // M1 · Pivot Engine (KABUL EDİLMİŞ — davranış değişmedi)
@@ -314,6 +339,35 @@ f_engine_dir_str(Engine e) =>
     e.booted ? (e.dir == 1 ? "tepe arıyor" : "dip arıyor") : "bootstrap"
 
 // =============================================================================
+// M3 · XABCD Builder (yalnızca onaylanmış MAIN pivotlarından)
+// -----------------------------------------------------------------------------
+// Son 5 ardışık MAIN pivotunu X-A-B-C-D olarak alır (D = en yeni onaylı pivot).
+// YALNIZCA yapısal bilgi üretir: pivot alternansı, kronolojik sıra, yön ve leg
+// uzunlukları; ayrıca 5-pivot dizisinin geçerliliği. Harmonik desen adı, Fibonacci
+// uygunluğu, entry/exit veya alarm YOKTUR (bunlar M4+ modüllerine aittir).
+// =============================================================================
+f_build_xabcd(array<Pivot> buf) =>
+    Xabcd res = na
+    int n = array.size(buf)
+    if n >= 5
+        Pivot X = array.get(buf, n - 5)
+        Pivot A = array.get(buf, n - 4)
+        Pivot B = array.get(buf, n - 3)
+        Pivot C = array.get(buf, n - 2)
+        Pivot D = array.get(buf, n - 1)
+        // Alternans: ardışık pivot türleri farklı olmalı (H,L,H,L,H veya L,H,L,H,L).
+        bool alt = X.kind != A.kind and A.kind != B.kind and B.kind != C.kind and C.kind != D.kind
+        // Kronolojik sıra: bidx kesin artan olmalı.
+        bool chrono = X.bidx < A.bidx and A.bidx < B.bidx and B.bidx < C.bidx and C.bidx < D.bidx
+        bool ok   = alt and chrono
+        bool bull = D.kind == -1     // D bir DİP ise bullish tamamlanma yönelimi
+        res := Xabcd.new(X, A, B, C, D, ok, bull, bull ? 1 : -1,
+             math.abs(A.price - X.price), math.abs(B.price - A.price),
+             math.abs(C.price - B.price), math.abs(D.price - C.price),
+             A.bidx - X.bidx, B.bidx - A.bidx, C.bidx - B.bidx, D.bidx - C.bidx)
+    res
+
+// =============================================================================
 // Örnekleme + ring buffer + akış
 // =============================================================================
 var Engine    mainEng = f_engine_new()
@@ -322,6 +376,11 @@ var Structure marketStruct = f_structure_new()
 
 var array<Pivot> mainPivots = array.new<Pivot>()
 var array<Pivot> fastPivots = array.new<Pivot>()
+
+// M3 durumu: en son geçerli/aday XABCD + çizim tamponları.
+var Xabcd        lastXabcd = na
+var array<line>  xabLines  = array.new<line>()
+var array<label> xabLabels = array.new<label>()
 
 BUFFER_MAX = 32
 
@@ -336,12 +395,16 @@ atr = ta.atr(atrLen)
 Pivot  mainNew = na
 Pivot  fastNew = na
 string mainTag = na
+Xabcd  xabNew  = na
 if barstate.isconfirmed
     mainNew := f_engine_step(mainEng, mainK, mainMinBars, atr)
     fastNew := f_engine_step(fastEng, fastK, fastMinBars, atr)
     if not na(mainNew)
         f_push(mainPivots, mainNew)
         mainTag := f_structure_update(marketStruct, mainNew)   // M2: yalnızca MAIN
+        xabNew  := f_build_xabcd(mainPivots)                    // M3: yalnızca MAIN, yeni D geldiğinde
+        if not na(xabNew)
+            lastXabcd := xabNew
     if not na(fastNew)
         f_push(fastPivots, fastNew)
 
@@ -373,6 +436,31 @@ if not na(fastNew)
                  xloc = xloc.bar_index, color = color.new(color.teal, 50),
                  width = 1, style = line.style_dashed)
     fastLast := fastNew
+
+// --- M3: XABCD adayının çizimi -----------------------------------------------
+// Her yeni MAIN pivotunda (yeni D) önceki XABCD çizimi silinip yenisi çizilir;
+// yalnızca geçerli (alternans + kronoloji) dizi çizilir. Mevcut zigzag ile
+// karışmaması için noktalı mavi segmentler + X/A/B/C/D harf etiketleri kullanılır.
+if not na(xabNew) and xabNew.valid and showXabcd
+    for ln in xabLines
+        line.delete(ln)
+    array.clear(xabLines)
+    for lb in xabLabels
+        label.delete(lb)
+    array.clear(xabLabels)
+
+    xcol = color.new(color.blue, 0)
+    array.push(xabLines, line.new(xabNew.X.bidx, xabNew.X.price, xabNew.A.bidx, xabNew.A.price, xloc = xloc.bar_index, color = xcol, width = 1, style = line.style_dotted))
+    array.push(xabLines, line.new(xabNew.A.bidx, xabNew.A.price, xabNew.B.bidx, xabNew.B.price, xloc = xloc.bar_index, color = xcol, width = 1, style = line.style_dotted))
+    array.push(xabLines, line.new(xabNew.B.bidx, xabNew.B.price, xabNew.C.bidx, xabNew.C.price, xloc = xloc.bar_index, color = xcol, width = 1, style = line.style_dotted))
+    array.push(xabLines, line.new(xabNew.C.bidx, xabNew.C.price, xabNew.D.bidx, xabNew.D.price, xloc = xloc.bar_index, color = xcol, width = 1, style = line.style_dotted))
+
+    lcol = color.new(color.blue, 20)
+    array.push(xabLabels, label.new(xabNew.X.bidx, xabNew.X.price, "X", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny))
+    array.push(xabLabels, label.new(xabNew.A.bidx, xabNew.A.price, "A", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny))
+    array.push(xabLabels, label.new(xabNew.B.bidx, xabNew.B.price, "B", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny))
+    array.push(xabLabels, label.new(xabNew.C.bidx, xabNew.C.price, "C", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny))
+    array.push(xabLabels, label.new(xabNew.D.bidx, xabNew.D.price, "D", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny))
 
 // Onay-barı işaretleri (strateji girişinin en erken yapılabileceği bar).
 plotshape(showMain and not na(mainNew), title = "MAIN confirmed",
@@ -434,3 +522,43 @@ if barstate.islast
 
     table.cell(t, 0, 9, "MAIN theta (sabit)")
     table.cell(t, 1, 9, thStr)
+
+// =============================================================================
+// M3 denetim tablosu — AYRI tablo (mevcut M1+M2 tablosu DEĞİŞTİRİLMEDİ)
+//   Aynı repaint-safe desen: nesne global scope'ta bir kez, hücreler son barda.
+// =============================================================================
+var table t3 = table.new(position.bottom_right, 2, 8, border_width = 1)
+
+if barstate.islast
+    hasX   = not na(lastXabcd)
+    vldStr = hasX ? (lastXabcd.valid ? "EVET" : "HAYIR") : "-"
+    dirX   = hasX ? (lastXabcd.isBullish ? "BULLISH (D=dip)" : "BEARISH (D=tepe)") : "-"
+    kndStr = hasX ? (lastXabcd.X.kind == 1 ? "H" : "L") + (lastXabcd.A.kind == 1 ? "H" : "L") + (lastXabcd.B.kind == 1 ? "H" : "L") + (lastXabcd.C.kind == 1 ? "H" : "L") + (lastXabcd.D.kind == 1 ? "H" : "L") : "-"
+    seqStr = hasX ? str.tostring(lastXabcd.X.bidx) + "," + str.tostring(lastXabcd.A.bidx) + "," + str.tostring(lastXabcd.B.bidx) + "," + str.tostring(lastXabcd.C.bidx) + "," + str.tostring(lastXabcd.D.bidx) : "-"
+    lenStr = hasX ? str.tostring(lastXabcd.xaLen, format.mintick) + "/" + str.tostring(lastXabcd.abLen, format.mintick) + "/" + str.tostring(lastXabcd.bcLen, format.mintick) + "/" + str.tostring(lastXabcd.cdLen, format.mintick) : "-"
+    barStr = hasX ? str.tostring(lastXabcd.xaBars) + "/" + str.tostring(lastXabcd.abBars) + "/" + str.tostring(lastXabcd.bcBars) + "/" + str.tostring(lastXabcd.cdBars) : "-"
+    rdyStr = array.size(mainPivots) >= 5 ? "EVET (" + str.tostring(array.size(mainPivots)) + ")" : "HAYIR (" + str.tostring(array.size(mainPivots)) + ")"
+
+    table.cell(t3, 0, 0, "M3 · XABCD", bgcolor = color.new(color.blue, 0), text_color = color.white)
+    table.cell(t3, 1, 0, "", bgcolor = color.new(color.blue, 0))
+
+    table.cell(t3, 0, 1, "5-pivot hazır")
+    table.cell(t3, 1, 1, rdyStr)
+
+    table.cell(t3, 0, 2, "Geçerli dizi")
+    table.cell(t3, 1, 2, vldStr)
+
+    table.cell(t3, 0, 3, "Yön")
+    table.cell(t3, 1, 3, dirX)
+
+    table.cell(t3, 0, 4, "Pivot türleri (X..D)")
+    table.cell(t3, 1, 4, kndStr)
+
+    table.cell(t3, 0, 5, "Pivot barları (bidx)")
+    table.cell(t3, 1, 5, seqStr)
+
+    table.cell(t3, 0, 6, "Leg uzunluk XA/AB/BC/CD")
+    table.cell(t3, 1, 6, lenStr)
+
+    table.cell(t3, 0, 7, "Leg bar XA/AB/BC/CD")
+    table.cell(t3, 1, 7, barStr)
