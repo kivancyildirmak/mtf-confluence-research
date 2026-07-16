@@ -181,6 +181,48 @@ harmonic girişlere izin verilir.
 
 ---
 
+### M2S — MTF Structure Summary (çok-zaman-dilimli yapı özeti)
+
+**Amaç:** M1+M2 çıktısını (trend state + son yapı etiketi) **birden çok, kullanıcı
+tarafından seçilebilen zaman diliminde** toplayıp ana grafikte **tek bir özet
+tabloda** göstermek. Bu, M2'nin mevcut aktif-TF tablosunu **değiştirmez**; onun
+yanında ayrı, bağımsız bir raporlama modülüdür.
+
+> Konum: M2 ile M5 arasında bir *köprü*. Kendi başına karar üretmez; ürettiği
+> özet ileride M5 (MTF Confluence) ve M6 (HTF Veto) için hazır girdi olur.
+
+**Kapsam ve girdiler:**
+- Kullanıcı seçilebilir TF listesi (varsayılan mimari seti: **15m / 1h / 1D**;
+  her satır bir `input` timeframe olacak).
+- Her TF için istenen değerler: `trend ∈ {UP, DOWN, RANGE}`, son yapı etiketi
+  (`HH/HL/LH/LL/EQH/EQL`), ve o etiketin `confIdx`'i (opsiyonel, tazelik göstergesi).
+
+**Repaint-safe MTF erişimi (kritik):**
+- Değerler `request.security(tf, timeframe.period_of_chart? hayır — hedef tf, expr)`
+  ile çekilir; **repaint önlemleri zorunlu**:
+  - `lookahead = barmerge.lookahead_off`,
+  - HTF ifadesi **onaylanmış** bardan alınır: pratikte `expr[1]` (bir önceki HTF
+    barı) veya `barstate.isconfirmed` filtreli değer kullanılır.
+  - Böylece üst TF'in **kapanmamış** barından değer sızmaz; ana grafikte gösterilen
+    özet, seçili TF'lerin **kapanmış** yapısını yansıtır.
+- İç içe güvenlik: M2S, M1+M2 hesabını her hedef TF'in kendi bağlamında çalıştırır
+  (aynı `f_engine_step` + `f_structure_update` fonksiyonları, TF'e `request.security`
+  ile taşınır). Tek dosya mimarisi korunur; fonksiyonlar tek tanımdan çağrılır.
+
+**Çıktı (yalnızca görsel + sonraki modüllere veri):**
+```
+MtfRow { tf, trend, lastTag, lastConfIdx }   // her seçili TF için bir satır
+```
+Ana grafikte tek tablo: satır = TF, sütunlar = Trend (UP/DOWN/RANGE, renkli) +
+Son etiket. Aktif-TF tablosu ayrı kalır.
+
+**Kısıtlar:** Alarm/entry/exit yok; yalnızca OHLC + ATR türevi (M1/M2 ile aynı);
+hiçbir dış filtre eklenmez. Repaint yasağı MTF çağrılarında da geçerlidir.
+
+**Durum:** Bu modül şu an **yalnızca mimaride tanımlıdır** — henüz kodlanmadı.
+
+---
+
 ### M3 — XABCD Builder
 
 **Amaç:** Onaylı pivot akışından X-A-B-C-D 5-nokta yapısını kurmak.
@@ -350,6 +392,7 @@ Her modül saf fonksiyonlar + gerekli minimal `var` durum. İsimler taslaktır.
 |-------|-------------------------------|
 | M1 Pivot | `f_pivot_engine_step(state, k, minBars) → (state, newPivot?)`, `f_pivot_push(buf, p)` |
 | M2 Structure | `f_classify_pivot(buf) → kind`, `f_structure_state(buf) → state`, `f_bos_confirmed(buf, close)` |
+| M2S MTF Summary | `f_tf_structure(tf) → (trend, lastTag, confIdx)` (repaint-safe `request.security`), `f_mtf_summary_table(rows)` — yalnızca özet/görsel |
 | M3 XABCD | `f_build_xabcd(buf) → xabcd?`, `f_leg_ratios(xabcd) → ratios` |
 | M4 Harmonic | `f_match_patterns(ratios) → (name, score, prz)`, `f_ratio_distance(r,c,t)` |
 | M5 MTF | `f_htf_pivots(tf) → levels`, `f_cluster_density(price, levels, atr) → 0..1` |
@@ -375,6 +418,7 @@ Her modül saf fonksiyonlar + gerekli minimal `var` durum. İsimler taslaktır.
 
 1. **M1** Pivot Engine (Main+Fast) — çekirdek; her şey buna bağlı.
 2. **M2** Market Structure — LONG kapısı.
+2b. **M2S** MTF Structure Summary — çok-TF yapı özeti (repaint-safe); M5/M6 için ön hazırlık.
 3. **M3 + M4** XABCD & Harmonic — sinyal üreticisi.
 4. **M5 + M6** MTF Confluence & HTF Veto — bağlam katmanı.
 5. **M7** Weighted Score — birleştirme.
