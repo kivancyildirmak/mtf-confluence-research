@@ -1,2 +1,2 @@
-1# mtf-confluence-research
+# mtf-confluence-research
 TradingView Pine Script research
