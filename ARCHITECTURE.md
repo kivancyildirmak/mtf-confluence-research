@@ -25,9 +25,11 @@
 | Klasik ihtiyaç | Yasaklı çözüm | Bu sistemdeki özgün çözüm |
 |----------------|---------------|---------------------------|
 | Trend yönü | EMA/SMA/Supertrend | **Swing yapısı**: onaylı pivotlardan HH/HL/LH/LL dizisi (market structure state machine) |
-| Momentum | RSI/MACD | **Pivot ivmesi**: ardışık legler arasındaki fiyat/zaman eğiminin değişim oranı |
-| Hacim onayı | OBV/CMF | **Range-normalized effort**: (kapanış konumu × bar aralığı) ile bar-içi baskı ölçümü, ATR ile normalize |
 | Volatilite/risk | — | **ATR** (izinli; bir gösterge değil, volatilite ölçüsüdür) |
+
+> **Kesin kısıt:** Momentum (RSI/MACD benzeri) ve effort/hacim (OBV/CMF benzeri)
+> bileşenleri sistemde **yoktur**. Trend, confluence ve veto'nun tamamı yalnızca
+> **pivot geometrisi + harmonik yapı**dan türetilir. Hiçbir dış filtre eklenmez.
 
 ---
 
@@ -206,10 +208,11 @@ oran-hata metriğiyle özgün skorlama**.
 **Oranlar (Fibonacci geometrisi — kamuya açık matematik):**
 - `AB/XA`, `BC/AB`, `CD/BC`, `AD/XA` retracement/extension oranları.
 
-**Şablon tablosu (bullish tamamlanmalar):** her desen için hedef oran aralığı
-`[lo, hi]`. Örnek desen isimleri: Gartley, Bat, Butterfly, Crab, Cypher, Shark.
-(Şablon oranları herkese açık Fibonacci sabitleridir; bir ücretli göstergeden
-alınmaz.)
+**Şablon tablosu (bullish tamamlanmalar) — çekirdek 3 desen:** her desen için
+hedef oran aralığı `[lo, hi]`. Kapsam: **Gartley, Bat, Butterfly**. (Şablon oranları
+herkese açık Fibonacci sabitleridir; bir ücretli göstergeden alınmaz. Kapsam
+sonradan genişletilebilir; tablo veri-odaklı olduğu için desen eklemek yalnızca
+satır eklemektir.)
 
 **Özgün skorlama — "Ratio Distance Score":**
 Her oran `r_i` için hedef merkez `c_i` ve tolerans `t_i`:
@@ -232,7 +235,7 @@ patternScore = 100 · (Σ w_i·match_i) / (Σ w_i)   # ağırlıklı ortalama
 **Amaç:** Mevcut fiyatın **birden çok zaman diliminden** gelen pivot seviyelerine
 yakınlığını ölçmek. Farklı TF'lerdeki pivotların üst üste gelmesi = güçlü seviye.
 
-**Zaman dilimleri:** `LTF (mevcut)`, `MTF (ara)`, `HTF (üst)`. Her biri için M1
+**Zaman dilimleri (kilitli):** `LTF = 15m`, `MTF = 1h`, `HTF = 1D`. Her biri için M1
 motoru `request.security` ile çağrılır:
 ```
 lookahead = barmerge.lookahead_off, ifade [1] offset ile → repaint yok
@@ -258,12 +261,13 @@ Böylece "üç farklı TF'de aynı bölgede pivot var" durumu yüksek skor üret
 
 **Yöntem:**
 - HTF üzerinde M2 (market structure) çalıştırılır (yine `lookahead_off`, `[1]`).
-- **Veto koşulları (herhangi biri doğruysa LONG bloklanır):**
-  1. HTF `structureState == DOWN`.
-  2. Fiyat HTF son onaylı tepe ile dip arasında ama momentum aşağı (pivot ivmesi < 0).
-  3. HTF'de yakın zamanda LL teyidi.
+- **Veto koşulları (herhangi biri doğruysa LONG bloklanır) — yalnızca pivot yapısı:**
+  1. HTF `structureState == DOWN` (son LH + LL).
+  2. HTF son onaylı pivotu bir **LH** (lower-high) ve fiyat son onaylı HTF dibinin altında.
+  3. HTF'de yakın zamanda **LL** teyidi (yapı kırılımı aşağı).
 - Veto çıktısı boolean `htfVetoLong`. Ayrıca yumuşak bir `htfBias ∈ [-1..+1]`
-  üretilir (skor motoruna ağırlık olarak girer).
+  üretilir (skor motoruna ağırlık olarak girer) — bu bias da **yalnızca HTF pivot
+  dizisinden** (HH/HL oranı) hesaplanır, momentum kullanılmaz.
 
 Veto **sert filtredir**: skor ne olursa olsun `htfVetoLong == true` ise sinyal yok.
 
@@ -273,15 +277,16 @@ Veto **sert filtredir**: skor ne olursa olsun `htfVetoLong == true` ise sinyal y
 
 **Amaç:** Tüm alt sinyalleri tek, yorumlanabilir 0–100 skora indirmek.
 
-**Girdiler (her biri 0..1'e normalize):**
+**Girdiler (her biri 0..1'e normalize) — yalnızca pivot/harmonik kaynaklı:**
 | Bileşen | Kaynak | Örnek ağırlık `w` |
 |---------|--------|-------------------|
-| `structure` | M2 (UP + BoS gücü) | 0.25 |
-| `harmonic` | M4 (patternScore/100) | 0.25 |
-| `mtf` | M5 (confluenceDensity) | 0.20 |
-| `htfBias` | M6 (pozitife map'lenmiş) | 0.15 |
-| `effort` | range-normalized baskı (OBV/CMF alternatifi) | 0.10 |
-| `momentum` | pivot ivmesi (RSI alternatifi) | 0.05 |
+| `structure` | M2 (UP + BoS gücü) | 0.30 |
+| `harmonic` | M4 (patternScore/100) | 0.30 |
+| `mtf` | M5 (confluenceDensity) | 0.22 |
+| `htfBias` | M6 (pozitife map'lenmiş) | 0.18 |
+
+> Effort ve momentum bileşenleri **kaldırıldı**; skor tamamen yapı + harmonik +
+> MTF pivot yoğunluğu + HTF bias'tan oluşur. Ağırlıklar toplamı 1.0.
 
 ```
 score = 100 · ( Σ w_i · s_i ) / ( Σ w_i )          # s_i ∈ [0,1]
@@ -300,14 +305,12 @@ score = 100 · ( Σ w_i · s_i ) / ( Σ w_i )          # s_i ∈ [0,1]
 **Kurallar:**
 - **Entry:** onay barının kapanışı (yalnızca kapanmış mum).
 - **Stop:** `min( D_pivot_low, entry − s·ATR )` — yapı dibinin ATR tamponu altında.
-- **Target(lar):**
-  - `TP1 = entry + R·(entry − stop)` (sabit RR, örn. R=1.5),
-  - `TP2 = Fib projeksiyonu` (CD legi uzantısı / önceki HH bölgesi).
+- **Target (sabit RR — kilitli):** `TP = entry + R·(entry − stop)`, tek hedef, `R`
+  input (örn. 1.5). Fib hedefleri ve trailing **yok** (deterministik backtest tercihi).
 - **Pozisyon boyutu:** `qty = (equity · riskPct) / (entry − stop)` (risk-parity).
-- **Trailing (opsiyonel):** yeni onaylı HL altına ATR-tamponlu stop yükseltme.
 - Tüm seviyeler onay barında sabittir → repaint yok.
 
-**Çıktı:** `RiskPlan { entry, stop, tp1, tp2, qty, rr }`.
+**Çıktı:** `RiskPlan { entry, stop, tp, qty, rr }`.
 
 ---
 
@@ -329,11 +332,13 @@ LONG ⇔  structureState==UP
 **Backtest mimarisi:**
 - `strategy(...)` başlığı; `calc_on_every_tick=false`, `process_orders_on_close`
   ayarları repaint-safe kullanılır.
-- Çıkışlar: `strategy.exit` ile stop + iki hedef (kısmi kapama).
+- Çıkışlar: `strategy.exit` ile tek stop + tek hedef (sabit RR).
 - **Performans metrikleri** araştırma için tablo/label ile raporlanır: net profit,
   profit factor, win rate, maxDD, ortalama RR, sinyal sayısı.
-- İki mod tek dosyada: `indicator` (görsel) vs `strategy` (test) — `input`
-  ile derleme-zamanı seçimi yerine ayrı dosya önerilir (M-strategy / M-indicator).
+- **Dosya yapısı (kilitli):** tek `strategy` dosyası; tüm modüller bu dosyada
+  fonksiyon olarak yaşar, görsel doğrulama `plot`/`label` ile aynı dosyada yapılır.
+  Modüller geliştirme sırasında ayrı `.pine` dosyalarında prototiplenir, sonra tek
+  strateji dosyasında birleştirilir.
 
 ---
 
@@ -381,9 +386,14 @@ modunda plot/label ile).
 
 ---
 
-## 7. Açık Tasarım Soruları (Aşama 2 öncesi karar)
+## 7. Kilitli Kararlar (Aşama 2 girişi)
 
-1. Hedef enstrüman/zaman dilimi seti (örn. kripto 15m + 1h + 4h)?
-2. Harmonik desen kapsamı: tam set mi (Gartley…Shark) yoksa çekirdek 3 desen mi?
-3. Çıkış politikası: sabit RR mi, Fib hedefleri mi, trailing mi (yoksa hibrit)?
-4. Tek dosya (indicator+strategy toggle) mı, ayrı iki dosya mı?
+| Konu | Karar |
+|------|-------|
+| Zaman dilimi seti | **LTF 15m · MTF 1h · HTF 1D** |
+| Harmonik kapsam | **Çekirdek 3: Gartley, Bat, Butterfly** |
+| Çıkış politikası | **Sabit RR** (tek stop + tek hedef, trailing/Fib yok) |
+| Dosya yapısı | **Tek `strategy` dosyası** (modüller fonksiyon olarak) |
+| Skor bileşenleri | structure + harmonic + mtf + htfBias (**effort/momentum yok**) |
+| Pivot motorları | Main + **Fast (korunuyor)**, ikisi de M1 algoritması |
+| Dış filtre | **Yok** — EMA/RSI/MACD/hacim vb. eklenmez; her şey pivot/harmonik türevi |

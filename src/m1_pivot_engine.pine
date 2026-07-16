@@ -1,0 +1,215 @@
+//@version=6
+// =============================================================================
+// MTF Confluence System — MODULE M1: Pivot Engine (Confirmed ZigZag)
+// -----------------------------------------------------------------------------
+// Özgün algoritma: "Dual-Tracker Confirmed Deviation ZigZag"
+//
+//   - Onaylanmış pivotlar: bir tepe/dip, fiyat ondan k*ATR kadar TERS yöne
+//     çekildiğinde VE en az minBars kapanmış bar geçtiğinde KESİNLEŞİR.
+//   - İki bağımsız motor: MAIN (yapısal, büyük eşik) ve FAST (taktik, küçük eşik).
+//     İkisi de aynı fonksiyonu farklı parametreyle örnekler; ayrı state tutarlar.
+//   - REPAINT YOK: pivot fiyatı/indeksi geçmişte sabittir; yalnızca "onay" olayı
+//     ileri bir barda tetiklenir. Tüm state mutasyonu barstate.isconfirmed ile
+//     yalnızca KAPANMIŞ barlarda çalışır.
+//
+// Bu dosya M1'in izole görsel testidir (indicator modu): iki motorun zigzag
+// çizgilerini ve H/L etiketlerini üst üste çizer. Nihai sistemde bu fonksiyonlar
+// tek strategy dosyasına taşınacaktır.
+//
+// Yasaklı gösterge yok: yalnızca OHLC geometrisi + ATR (volatilite ölçüsü).
+// =============================================================================
+
+indicator("M1 · Pivot Engine (Confirmed ZigZag)", overlay = true,
+     max_lines_count = 500, max_labels_count = 500)
+
+// ----------------------------------------------------------------------------
+// Tipler
+// ----------------------------------------------------------------------------
+
+// Onaylanmış pivot kaydı. kind: +1 = HIGH (tepe), -1 = LOW (dip).
+type Pivot
+    float price
+    int   bidx      // pivotun gerçekleştiği bar_index (GEÇMİŞTE, sabit)
+    int   ptime     // pivotun bar zamanı
+    int   kind      // +1 HIGH, -1 LOW
+    int   confIdx   // onayın verildiği bar_index (bidx'ten büyük/eşit)
+
+// Motor durumu (state machine).
+// dir: +1 => şu an bir TEPE arıyoruz (yükseliş legi), -1 => bir DİP arıyoruz.
+// cur*: mevcut yöndeki aday uç (tepe arıyorsak en yüksek high; dip arıyorsak en düşük low)
+// opp*: cur uç güncellendikten sonraki ters uç takipçisi (geri çekilme derinliği)
+type Engine
+    bool  init
+    int   dir
+    float curPrice
+    int   curIdx
+    int   curTime
+    float oppPrice
+    int   oppIdx
+    int   oppTime
+
+// ----------------------------------------------------------------------------
+// Girdiler
+// ----------------------------------------------------------------------------
+atrLen      = input.int(14,  "ATR uzunluğu",              minval = 1, group = "Genel")
+
+grpMain     = "MAIN motor (yapısal)"
+mainK       = input.float(3.0, "MAIN sapma eşiği (× ATR)", minval = 0.1, step = 0.1, group = grpMain)
+mainMinBars = input.int(8,     "MAIN minimum bar",         minval = 1, group = grpMain)
+
+grpFast     = "FAST motor (taktik)"
+fastK       = input.float(1.0, "FAST sapma eşiği (× ATR)", minval = 0.1, step = 0.1, group = grpFast)
+fastMinBars = input.int(3,     "FAST minimum bar",         minval = 1, group = grpFast)
+
+grpViz      = "Görsel"
+showMain    = input.bool(true, "MAIN zigzag göster", group = grpViz)
+showFast    = input.bool(true, "FAST zigzag göster", group = grpViz)
+
+// ----------------------------------------------------------------------------
+// M1 çekirdek fonksiyonları
+// ----------------------------------------------------------------------------
+
+// Yeni, sıfırlanmış bir motor üretir.
+f_engine_new() =>
+    Engine.new(init = false, dir = 0,
+         curPrice = na, curIdx = na, curTime = na,
+         oppPrice = na, oppIdx = na, oppTime = na)
+
+// Bir motoru tek bar ileri adımlar. Bir pivot ONAYLANDIYSA onu döndürür, aksi
+// halde na döndürür. State doğrudan `e` nesnesi üzerinde mutasyona uğrar.
+//   theta = k * atr  -> onay için gereken minimum ters sapma
+// NOT: yalnızca KAPANMIŞ barlarda çağrılmalıdır (repaint güvenliği).
+f_engine_step(Engine e, float k, int minBars, float atr) =>
+    Pivot result = na
+
+    if not e.init
+        // İlk bar: yönü keyfi olarak "tepe ara" (+1) seç; algoritma kendini düzeltir.
+        e.init     := true
+        e.dir      := 1
+        e.curPrice := high
+        e.curIdx   := bar_index
+        e.curTime  := time
+        e.oppPrice := low
+        e.oppIdx   := bar_index
+        e.oppTime  := time
+    else
+        theta = k * atr
+
+        if e.dir == 1
+            // ---- TEPE arıyoruz --------------------------------------------
+            if high > e.curPrice
+                // Daha yüksek tepe: adayı yükselt, geri-çekilme takipçisini sıfırla.
+                e.curPrice := high
+                e.curIdx   := bar_index
+                e.curTime  := time
+                e.oppPrice := low
+                e.oppIdx   := bar_index
+                e.oppTime  := time
+            else
+                // Geri çekilme derinliğini güncelle.
+                if low < e.oppPrice
+                    e.oppPrice := low
+                    e.oppIdx   := bar_index
+                    e.oppTime  := time
+                // Onay koşulu: yeterli ters sapma + yeterli bar mesafesi.
+                if (e.curPrice - e.oppPrice) >= theta and (bar_index - e.curIdx) >= minBars
+                    result := Pivot.new(e.curPrice, e.curIdx, e.curTime, 1, bar_index)
+                    // DİP aramaya geç: yeni aday = geri-çekilme dibi.
+                    e.dir      := -1
+                    e.curPrice := e.oppPrice
+                    e.curIdx   := e.oppIdx
+                    e.curTime  := e.oppTime
+                    e.oppPrice := high
+                    e.oppIdx   := bar_index
+                    e.oppTime  := time
+        else
+            // ---- DİP arıyoruz ---------------------------------------------
+            if low < e.curPrice
+                e.curPrice := low
+                e.curIdx   := bar_index
+                e.curTime  := time
+                e.oppPrice := high
+                e.oppIdx   := bar_index
+                e.oppTime  := time
+            else
+                if high > e.oppPrice
+                    e.oppPrice := high
+                    e.oppIdx   := bar_index
+                    e.oppTime  := time
+                if (e.oppPrice - e.curPrice) >= theta and (bar_index - e.curIdx) >= minBars
+                    result := Pivot.new(e.curPrice, e.curIdx, e.curTime, -1, bar_index)
+                    // TEPE aramaya geç: yeni aday = geri-çekilme tepesi.
+                    e.dir      := 1
+                    e.curPrice := e.oppPrice
+                    e.curIdx   := e.oppIdx
+                    e.curTime  := e.oppTime
+                    e.oppPrice := low
+                    e.oppIdx   := bar_index
+                    e.oppTime  := time
+    result
+
+// ----------------------------------------------------------------------------
+// Motorların örneklenmesi + ring buffer
+// ----------------------------------------------------------------------------
+var Engine mainEng = f_engine_new()
+var Engine fastEng = f_engine_new()
+
+var array<Pivot> mainPivots = array.new<Pivot>()
+var array<Pivot> fastPivots = array.new<Pivot>()
+
+BUFFER_MAX = 32
+
+// Ring buffer'a pivot ekler, kapasiteyi korur.
+f_push(array<Pivot> buf, Pivot p) =>
+    array.push(buf, p)
+    if array.size(buf) > BUFFER_MAX
+        array.shift(buf)
+
+atr = ta.atr(atrLen)
+
+// REPAINT GÜVENLİĞİ: state yalnızca bar kapanınca ilerler.
+Pivot mainNew = na
+Pivot fastNew = na
+if barstate.isconfirmed
+    mainNew := f_engine_step(mainEng, mainK, mainMinBars, atr)
+    fastNew := f_engine_step(fastEng, fastK, fastMinBars, atr)
+    if not na(mainNew)
+        f_push(mainPivots, mainNew)
+    if not na(fastNew)
+        f_push(fastPivots, fastNew)
+
+// ----------------------------------------------------------------------------
+// Görsel doğrulama (yalnızca M1 testi için)
+// ----------------------------------------------------------------------------
+var Pivot mainPrev = na
+var Pivot fastPrev = na
+
+if showMain and not na(mainNew)
+    if not na(mainPrev)
+        line.new(mainPrev.bidx, mainPrev.price, mainNew.bidx, mainNew.price,
+             xloc = xloc.bar_index, color = color.new(color.orange, 0), width = 2)
+    label.new(mainNew.bidx, mainNew.price, mainNew.kind == 1 ? "H" : "L",
+         xloc = xloc.bar_index,
+         yloc = mainNew.kind == 1 ? yloc.abovebar : yloc.belowbar,
+         style = mainNew.kind == 1 ? label.style_label_down : label.style_label_up,
+         color = color.new(color.orange, 20), textcolor = color.white, size = size.small)
+    mainPrev := mainNew
+
+if showFast and not na(fastNew)
+    if not na(fastPrev)
+        line.new(fastPrev.bidx, fastPrev.price, fastNew.bidx, fastNew.price,
+             xloc = xloc.bar_index, color = color.new(color.teal, 40),
+             width = 1, style = line.style_dashed)
+    fastPrev := fastNew
+
+// Hızlı denetim tablosu: kaç pivot onaylandı, mevcut yönler.
+if barstate.islast
+    var table t = table.new(position.top_right, 2, 4, border_width = 1)
+    table.cell(t, 0, 0, "Motor",       bgcolor = color.gray, text_color = color.white)
+    table.cell(t, 1, 0, "Onaylı pivot", bgcolor = color.gray, text_color = color.white)
+    table.cell(t, 0, 1, "MAIN")
+    table.cell(t, 1, 1, str.tostring(array.size(mainPivots)))
+    table.cell(t, 0, 2, "FAST")
+    table.cell(t, 1, 2, str.tostring(array.size(fastPivots)))
+    table.cell(t, 0, 3, "MAIN yön")
+    table.cell(t, 1, 3, mainEng.dir == 1 ? "tepe arıyor" : "dip arıyor")
