@@ -9,6 +9,7 @@
 //   M1 · Pivot Engine (Confirmed ZigZag) — Main + Fast, iki bağımsız motor.
 //   M2 · Market Structure — onaylı MAIN pivotlarından HH/HL/LH/LL + trend state.
 //   M3 · XABCD Builder — ardışık 5 onaylı MAIN pivotundan X-A-B-C-D adayı (yapısal).
+//   M2S· MTF Structure Summary — seçilebilir TF'lerde M1+M2 özeti (repaint-safe).
 //
 // Sıradaki modüller (henüz eklenmedi): M4 Harmonic, M5 MTF Confluence,
 //   M6 HTF Veto, M7 Weighted Score, M8 Risk, M9 Signal/Backtest.
@@ -21,7 +22,7 @@
 //     EMA/RSI/MACD/hacim/momentum KULLANILMAZ.
 // =============================================================================
 
-strategy("MTF Confluence Strategy (M1+M2+M3)", overlay = true, pyramiding = 0,
+strategy("MTF Confluence Strategy (M1+M2+M3+M2S)", overlay = true, pyramiding = 0,
      max_lines_count = 500, max_labels_count = 500)
 
 // =============================================================================
@@ -118,6 +119,22 @@ grpViz      = "Görsel"
 showMain    = input.bool(true, "MAIN zigzag + yapı etiketleri", group = grpViz)
 showFast    = input.bool(true, "FAST zigzag göster",            group = grpViz)
 showXabcd   = input.bool(true, "M3: XABCD adayını çiz (X-A-B-C-D)", group = grpViz)
+
+// M2S · MTF Structure Summary — seçilebilir zaman dilimleri (varsayılan M1..D1).
+grpMtf   = "M2S · MTF Structure Summary"
+mtfShow  = input.bool(true, "MTF özet tablosunu göster (sağ üst)", group = grpMtf)
+en1 = input.bool(true, "", inline = "mtf1", group = grpMtf)
+tf1 = input.timeframe("1",   "TF 1", inline = "mtf1", group = grpMtf)
+en2 = input.bool(true, "", inline = "mtf2", group = grpMtf)
+tf2 = input.timeframe("5",   "TF 2", inline = "mtf2", group = grpMtf)
+en3 = input.bool(true, "", inline = "mtf3", group = grpMtf)
+tf3 = input.timeframe("15",  "TF 3", inline = "mtf3", group = grpMtf)
+en4 = input.bool(true, "", inline = "mtf4", group = grpMtf)
+tf4 = input.timeframe("60",  "TF 4", inline = "mtf4", group = grpMtf)
+en5 = input.bool(true, "", inline = "mtf5", group = grpMtf)
+tf5 = input.timeframe("240", "TF 5", inline = "mtf5", group = grpMtf)
+en6 = input.bool(true, "", inline = "mtf6", group = grpMtf)
+tf6 = input.timeframe("1D",  "TF 6", inline = "mtf6", group = grpMtf)
 
 // =============================================================================
 // M1 · Pivot Engine (KABUL EDİLMİŞ — davranış değişmedi)
@@ -368,6 +385,46 @@ f_build_xabcd(array<Pivot> buf) =>
     res
 
 // =============================================================================
+// M2S · MTF Structure Summary (çok-zaman-dilimli yapı özeti)
+// -----------------------------------------------------------------------------
+// Seçilebilir TF'lerde M1+M2'yi request.security ile çalıştırır ve tek özet
+// tabloda toplar. REPAINT YOK:
+//   - request.security tarafında  lookahead = barmerge.lookahead_off,
+//   - f_tf_compute BİR ÖNCEKİ KAPANMIŞ HTF barının değerlerini döndürür
+//     (prevTrend/prevTag/prevPt). Bu, "[1] onaylı-bar" offsetinin ta kendisidir:
+//     forming (kapanmamış) HTF barı hiçbir zaman gösterilmez.
+// Yalnızca özet/görsel üretir; entry/exit/alarm veya dış filtre YOK. M1/M2
+// mantığı DEĞİŞMEDEN, aynı fonksiyonlarla her TF bağlamında çalışır.
+// =============================================================================
+
+// Yapı etiketini int'e kodla (request.security tuple'ında string taşımamak için).
+f_tag_code(string tg) =>
+    tg == "HH" ? 1 : tg == "HL" ? 2 : tg == "LH" ? 3 : tg == "LL" ? 4 : tg == "EQH" ? 5 : tg == "EQL" ? 6 : tg == "H1" ? 7 : tg == "L1" ? 8 : 0
+
+f_tag_decode(int c) =>
+    c == 1 ? "HH" : c == 2 ? "HL" : c == 3 ? "LH" : c == 4 ? "LL" : c == 5 ? "EQH" : c == 6 ? "EQL" : c == 7 ? "H1" : c == 8 ? "L1" : "-"
+
+// request.security bağlamında (hedef TF) M1+M2'yi çalıştırır.
+// DÖNÜŞ: [trend, sonEtiketKodu, sonPivotZamanı] — hepsi BİR ÖNCEKİ kapanmış
+// HTF barına ait ([1] offset). var state, security bağlamında TF başına ayrı yaşar.
+f_tf_compute() =>
+    var Engine    e           = f_engine_new()
+    var Structure s           = f_structure_new()
+    var int       lastTagCode = 0
+    var int       lastPivotT  = na
+    // [1] offset: bu barı işlemeden ÖNCE, bir önceki (kapanmış) barın anlık görüntüsü.
+    int prevTrend = s.trend
+    int prevTag   = lastTagCode
+    int prevPt    = lastPivotT
+    // Bu HTF barını işle (yalnızca OHLC + ATR; M1 motoru + M2 yapısı).
+    float a  = ta.atr(atrLen)
+    Pivot np = f_engine_step(e, mainK, mainMinBars, a)
+    if not na(np)
+        lastTagCode := f_tag_code(f_structure_update(s, np))
+        lastPivotT  := np.ptime
+    [prevTrend, prevTag, prevPt]
+
+// =============================================================================
 // Örnekleme + ring buffer + akış
 // =============================================================================
 var Engine    mainEng = f_engine_new()
@@ -476,8 +533,9 @@ plotshape(showFast and not na(fastNew), title = "FAST confirmed",
 //   böylece normal grafikte de her zaman görünür (barstate/Replay'e bağlı değil).
 //   Yalnızca HÜCRE içerikleri `if barstate.islast` içinde güncellenir.
 //   table.clear() kullanılmaz.
+//   KONUM: top_LEFT — sağ üst artık M2S özet tablosuna ayrıldı (içerik/mantık aynı).
 // =============================================================================
-var table t = table.new(position.top_right, 2, 10, border_width = 1)
+var table t = table.new(position.top_left, 2, 10, border_width = 1)
 
 if barstate.islast
     hiCls   = marketStruct.highClass == 1 ? "HH" : marketStruct.highClass == -1 ? "LH" : "EQH/-"
@@ -562,3 +620,53 @@ if barstate.islast
 
     table.cell(t3, 0, 7, "Leg bar XA/AB/BC/CD")
     table.cell(t3, 1, 7, barStr)
+
+// =============================================================================
+// M2S · MTF çağrıları — her TF için M1+M2 sonucu (repaint-safe)
+//   lookahead_off + f_tf_compute içindeki [1] onaylı-bar offset'i birlikte.
+//   request.security global scope'ta çağrılır (koşulsuz; 6 çağrı << 40 limiti).
+// =============================================================================
+[mtfTr1, mtfTg1, mtfPt1] = request.security(syminfo.tickerid, tf1, f_tf_compute(), lookahead = barmerge.lookahead_off)
+[mtfTr2, mtfTg2, mtfPt2] = request.security(syminfo.tickerid, tf2, f_tf_compute(), lookahead = barmerge.lookahead_off)
+[mtfTr3, mtfTg3, mtfPt3] = request.security(syminfo.tickerid, tf3, f_tf_compute(), lookahead = barmerge.lookahead_off)
+[mtfTr4, mtfTg4, mtfPt4] = request.security(syminfo.tickerid, tf4, f_tf_compute(), lookahead = barmerge.lookahead_off)
+[mtfTr5, mtfTg5, mtfPt5] = request.security(syminfo.tickerid, tf5, f_tf_compute(), lookahead = barmerge.lookahead_off)
+[mtfTr6, mtfTg6, mtfPt6] = request.security(syminfo.tickerid, tf6, f_tf_compute(), lookahead = barmerge.lookahead_off)
+
+// =============================================================================
+// M2S · Özet tablosu (SAĞ ÜST) — tek tabloda tüm seçili TF'ler
+//   Sütunlar: TF | Trend (renkli) | Son etiket | Son pivot zamanı
+//   Repaint-safe desen: nesne global scope'ta bir kez, hücreler son barda.
+// =============================================================================
+var table tm = table.new(position.top_right, 4, 7, border_width = 1)
+
+if barstate.islast and mtfShow
+    // Başlık
+    table.cell(tm, 0, 0, "M2S · TF",     bgcolor = color.new(color.blue, 0), text_color = color.white)
+    table.cell(tm, 1, 0, "Trend",        bgcolor = color.new(color.blue, 0), text_color = color.white)
+    table.cell(tm, 2, 0, "Son etiket",   bgcolor = color.new(color.blue, 0), text_color = color.white)
+    table.cell(tm, 3, 0, "Son pivot",    bgcolor = color.new(color.blue, 0), text_color = color.white)
+
+    tfs = array.from(tf1, tf2, tf3, tf4, tf5, tf6)
+    ens = array.from(en1, en2, en3, en4, en5, en6)
+    trs = array.from(mtfTr1, mtfTr2, mtfTr3, mtfTr4, mtfTr5, mtfTr6)
+    tgs = array.from(mtfTg1, mtfTg2, mtfTg3, mtfTg4, mtfTg5, mtfTg6)
+    pts = array.from(mtfPt1, mtfPt2, mtfPt3, mtfPt4, mtfPt5, mtfPt6)
+
+    for i = 0 to 5
+        r     = i + 1
+        tfLbl = array.get(tfs, i)
+        if array.get(ens, i)
+            trv = array.get(trs, i)
+            tgv = array.get(tgs, i)
+            ptv = array.get(pts, i)
+            ptStr = na(ptv) ? "-" : str.format_time(ptv, "yy-MM-dd HH:mm", syminfo.timezone)
+            table.cell(tm, 0, r, tfLbl)
+            table.cell(tm, 1, r, f_trend_str(trv), bgcolor = f_trend_color(trv), text_color = color.white)
+            table.cell(tm, 2, r, f_tag_decode(tgv))
+            table.cell(tm, 3, r, ptStr)
+        else
+            table.cell(tm, 0, r, tfLbl, text_color = color.gray)
+            table.cell(tm, 1, r, "kapalı", text_color = color.gray)
+            table.cell(tm, 2, r, "-", text_color = color.gray)
+            table.cell(tm, 3, r, "-", text_color = color.gray)
