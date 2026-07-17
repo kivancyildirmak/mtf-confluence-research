@@ -115,14 +115,19 @@ grpFast     = "FAST motor (taktik)"
 fastK       = input.float(1.0, "FAST sapma eşiği (× ATR)", minval = 0.1, step = 0.1, group = grpFast)
 fastMinBars = input.int(3,     "FAST minimum bar",         minval = 1, group = grpFast)
 
-grpViz      = "Görsel"
-showMain    = input.bool(true, "MAIN zigzag + yapı etiketleri", group = grpViz)
-showFast    = input.bool(true, "FAST zigzag göster",            group = grpViz)
-showXabcd   = input.bool(true, "M3: XABCD adayını çiz (X-A-B-C-D)", group = grpViz)
+// --- Display: yalnızca GÖRSEL katmanı aç/kapar; hesaplama & state daima çalışır -
+grpDisp          = "Display"
+showMainZz       = input.bool(true,  "Show MAIN ZigZag",          group = grpDisp)
+showFastZz       = input.bool(false, "Show FAST ZigZag / dots",   group = grpDisp)
+showStructLabels = input.bool(true,  "Show Structure Labels",     group = grpDisp)
+showXabcdLetters = input.bool(false, "Show XABCD Letters",        group = grpDisp)
+showM12Table     = input.bool(false, "Show M1+M2 Detail Table",   group = grpDisp)
+showM2sTable     = input.bool(true,  "Show M2S Summary Table",    group = grpDisp)
+showM3Table      = input.bool(false, "Show M3 Detail Table",      group = grpDisp)
+showConfMarkers  = input.bool(false, "Show Confirmation Markers", group = grpDisp)
 
 // M2S · MTF Structure Summary — seçilebilir zaman dilimleri (varsayılan M1..D1).
 grpMtf   = "M2S · MTF Structure Summary"
-mtfShow  = input.bool(true, "MTF özet tablosunu göster (sağ üst)", group = grpMtf)
 en1 = input.bool(true, "", inline = "mtf1", group = grpMtf)
 tf1 = input.timeframe("1",   "TF 1", inline = "mtf1", group = grpMtf)
 en2 = input.bool(true, "", inline = "mtf2", group = grpMtf)
@@ -350,7 +355,7 @@ f_trend_color(int tr) =>
 f_tag_color(string tag) =>
     bool bull = tag == "HH" or tag == "HL"
     bool bear = tag == "LH" or tag == "LL"
-    bull ? color.new(color.green, 20) : bear ? color.new(color.red, 20) : color.new(color.gray, 30)
+    bull ? color.new(color.green, 45) : bear ? color.new(color.red, 45) : color.new(color.gray, 60)
 
 f_engine_dir_str(Engine e) =>
     e.booted ? (e.dir == 1 ? "tepe arıyor" : "dip arıyor") : "bootstrap"
@@ -475,30 +480,29 @@ var Pivot mainLast = na
 var Pivot fastLast = na
 
 if not na(mainNew)
-    if showMain
-        if not na(mainLast)
-            line.new(mainLast.bidx, mainLast.price, mainNew.bidx, mainNew.price,
-                 xloc = xloc.bar_index, color = color.new(color.gray, 20), width = 2)
+    if showMainZz and not na(mainLast)
+        line.new(mainLast.bidx, mainLast.price, mainNew.bidx, mainNew.price,
+             xloc = xloc.bar_index, color = color.new(color.gray, 45), width = 1)
+    if showStructLabels
         label.new(mainNew.bidx, mainNew.price, mainTag,
              xloc = xloc.bar_index,
              yloc = mainNew.kind == 1 ? yloc.abovebar : yloc.belowbar,
              style = mainNew.kind == 1 ? label.style_label_down : label.style_label_up,
-             color = f_tag_color(mainTag), textcolor = color.white, size = size.small)
+             color = f_tag_color(mainTag), textcolor = color.new(color.white, 10), size = size.tiny)
     mainLast := mainNew
 
 if not na(fastNew)
-    if showFast
-        if not na(fastLast)
-            line.new(fastLast.bidx, fastLast.price, fastNew.bidx, fastNew.price,
-                 xloc = xloc.bar_index, color = color.new(color.teal, 50),
-                 width = 1, style = line.style_dashed)
+    if showFastZz and not na(fastLast)
+        line.new(fastLast.bidx, fastLast.price, fastNew.bidx, fastNew.price,
+             xloc = xloc.bar_index, color = color.new(color.teal, 55),
+             width = 1, style = line.style_dashed)
     fastLast := fastNew
 
 // --- M3: XABCD adayının çizimi -----------------------------------------------
 // Her yeni MAIN pivotunda (yeni D) önceki XABCD çizimi silinip yenisi çizilir;
 // yalnızca geçerli (alternans + kronoloji) dizi çizilir. Mevcut zigzag ile
 // karışmaması için noktalı mavi segmentler + X/A/B/C/D harf etiketleri kullanılır.
-if not na(xabNew) and xabNew.valid and showXabcd
+if not na(xabNew) and xabNew.valid and showXabcdLetters
     for ln in xabLines
         line.delete(ln)
     array.clear(xabLines)
@@ -506,24 +510,31 @@ if not na(xabNew) and xabNew.valid and showXabcd
         label.delete(lb)
     array.clear(xabLabels)
 
-    xcol = color.new(color.blue, 0)
+    xcol = color.new(color.blue, 20)
     array.push(xabLines, line.new(xabNew.X.bidx, xabNew.X.price, xabNew.A.bidx, xabNew.A.price, xloc = xloc.bar_index, color = xcol, width = 1, style = line.style_dotted))
     array.push(xabLines, line.new(xabNew.A.bidx, xabNew.A.price, xabNew.B.bidx, xabNew.B.price, xloc = xloc.bar_index, color = xcol, width = 1, style = line.style_dotted))
     array.push(xabLines, line.new(xabNew.B.bidx, xabNew.B.price, xabNew.C.bidx, xabNew.C.price, xloc = xloc.bar_index, color = xcol, width = 1, style = line.style_dotted))
     array.push(xabLines, line.new(xabNew.C.bidx, xabNew.C.price, xabNew.D.bidx, xabNew.D.price, xloc = xloc.bar_index, color = xcol, width = 1, style = line.style_dotted))
 
-    lcol = color.new(color.blue, 20)
-    array.push(xabLabels, label.new(xabNew.X.bidx, xabNew.X.price, "X", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny))
-    array.push(xabLabels, label.new(xabNew.A.bidx, xabNew.A.price, "A", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny))
-    array.push(xabLabels, label.new(xabNew.B.bidx, xabNew.B.price, "B", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny))
-    array.push(xabLabels, label.new(xabNew.C.bidx, xabNew.C.price, "C", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny))
-    array.push(xabLabels, label.new(xabNew.D.bidx, xabNew.D.price, "D", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny))
+    // Dikey offset: XABCD harflerini pivotun DIŞINA it (M2 yapı etiketiyle çakışmasın).
+    lcol = color.new(color.blue, 10)
+    off  = nz(atr, 0.0) * 1.2
+    yX   = xabNew.X.price + (xabNew.X.kind == 1 ? off : -off)
+    yA   = xabNew.A.price + (xabNew.A.kind == 1 ? off : -off)
+    yB   = xabNew.B.price + (xabNew.B.kind == 1 ? off : -off)
+    yC   = xabNew.C.price + (xabNew.C.kind == 1 ? off : -off)
+    yD   = xabNew.D.price + (xabNew.D.kind == 1 ? off : -off)
+    array.push(xabLabels, label.new(xabNew.X.bidx, yX, "X", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny))
+    array.push(xabLabels, label.new(xabNew.A.bidx, yA, "A", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny))
+    array.push(xabLabels, label.new(xabNew.B.bidx, yB, "B", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny))
+    array.push(xabLabels, label.new(xabNew.C.bidx, yC, "C", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny))
+    array.push(xabLabels, label.new(xabNew.D.bidx, yD, "D", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny))
 
 // Onay-barı işaretleri (strateji girişinin en erken yapılabileceği bar).
-plotshape(showMain and not na(mainNew), title = "MAIN confirmed",
+plotshape(showConfMarkers and not na(mainNew), title = "MAIN confirmed",
      style = shape.circle, location = location.belowbar,
      color = color.new(color.gray, 0), size = size.tiny)
-plotshape(showFast and not na(fastNew), title = "FAST confirmed",
+plotshape(showConfMarkers and not na(fastNew), title = "FAST confirmed",
      style = shape.circle, location = location.abovebar,
      color = color.new(color.teal, 0), size = size.tiny)
 
@@ -537,7 +548,8 @@ plotshape(showFast and not na(fastNew), title = "FAST confirmed",
 // =============================================================================
 var table t = table.new(position.top_left, 2, 10, border_width = 1)
 
-if barstate.islast
+if barstate.islast and showM12Table
+    booted  = mainEng.booted
     hiCls   = marketStruct.highClass == 1 ? "HH" : marketStruct.highClass == -1 ? "LH" : "EQH/-"
     loCls   = marketStruct.lowClass == 1 ? "HL" : marketStruct.lowClass == -1 ? "LL" : "EQL/-"
     hiStr   = marketStruct.haveHigh ? hiCls + " @ " + str.tostring(marketStruct.lastHigh, format.mintick) : "-"
@@ -545,6 +557,8 @@ if barstate.islast
     chgStr  = na(marketStruct.lastChangeConfIdx) ? "-" : str.tostring(marketStruct.lastChangeConfIdx)
     cntStr  = "M:" + str.tostring(array.size(mainPivots)) + " / F:" + str.tostring(array.size(fastPivots))
     dirStr  = f_engine_dir_str(mainEng) + " / " + f_engine_dir_str(fastEng)
+    trTxt   = booted ? f_trend_str(marketStruct.trend) : "BOOTSTRAP"
+    trBg    = booted ? f_trend_color(marketStruct.trend) : color.new(color.gray, 0)
 
     // MAIN son pivot ayrıntısı (M1 denetimi)
     hasM    = not na(mainLast)
@@ -555,7 +569,7 @@ if barstate.islast
     table.cell(t, 1, 0, "", bgcolor = color.gray)
 
     table.cell(t, 0, 1, "Trend state")
-    table.cell(t, 1, 1, f_trend_str(marketStruct.trend), bgcolor = f_trend_color(marketStruct.trend), text_color = color.white)
+    table.cell(t, 1, 1, trTxt, bgcolor = trBg, text_color = color.white)
 
     table.cell(t, 0, 2, "Son yapı değişimi (confIdx)")
     table.cell(t, 1, 2, chgStr)
@@ -587,7 +601,7 @@ if barstate.islast
 // =============================================================================
 var table t3 = table.new(position.bottom_right, 2, 8, border_width = 1)
 
-if barstate.islast
+if barstate.islast and showM3Table
     hasX   = not na(lastXabcd)
     vldStr = hasX ? (lastXabcd.valid ? "EVET" : "HAYIR") : "-"
     dirX   = hasX ? (lastXabcd.isBullish ? "BULLISH (D=dip)" : "BEARISH (D=tepe)") : "-"
@@ -622,51 +636,76 @@ if barstate.islast
     table.cell(t3, 1, 7, barStr)
 
 // =============================================================================
-// M2S · MTF çağrıları — her TF için M1+M2 sonucu (repaint-safe)
-//   lookahead_off + f_tf_compute içindeki [1] onaylı-bar offset'i birlikte.
-//   request.security global scope'ta çağrılır (koşulsuz; 6 çağrı << 40 limiti).
+// M2S · MTF çağrıları — her TF için M1+M2 sonucu (repaint-safe + realtime-safe)
+// -----------------------------------------------------------------------------
+// KÖK NEDEN DÜZELTMESİ: request.security ile grafik TF'inden DÜŞÜK bir TF istemek,
+// yüksek-TF grafiklerde (30m/1h/4h/1D) grafik barı başına çok sayıda intrabar
+// üzerinden stateful motoru çalıştırır -> hesap limiti aşılır -> RUNTIME HATASI ->
+// o barın TÜM çıktısı (tüm tablolar) iptal olur. Çözüm: grafik TF'inden DÜŞÜK olan
+// TF'ler için security ÇAĞRILMAZ; o satır "LTF N/A" gösterilir (talep #7).
+// request.security'nin repaint mekaniği (lookahead_off + onaylı-bar) AYNEN korunur;
+// yalnızca düşük-TF çağrıları atlanır.
 // =============================================================================
-[mtfTr1, mtfTg1, mtfPt1] = request.security(syminfo.tickerid, tf1, f_tf_compute(), lookahead = barmerge.lookahead_off)
-[mtfTr2, mtfTg2, mtfPt2] = request.security(syminfo.tickerid, tf2, f_tf_compute(), lookahead = barmerge.lookahead_off)
-[mtfTr3, mtfTg3, mtfPt3] = request.security(syminfo.tickerid, tf3, f_tf_compute(), lookahead = barmerge.lookahead_off)
-[mtfTr4, mtfTg4, mtfPt4] = request.security(syminfo.tickerid, tf4, f_tf_compute(), lookahead = barmerge.lookahead_off)
-[mtfTr5, mtfTg5, mtfPt5] = request.security(syminfo.tickerid, tf5, f_tf_compute(), lookahead = barmerge.lookahead_off)
-[mtfTr6, mtfTg6, mtfPt6] = request.security(syminfo.tickerid, tf6, f_tf_compute(), lookahead = barmerge.lookahead_off)
+chSec  = timeframe.in_seconds()
+tf1Low = timeframe.in_seconds(tf1) < chSec
+tf2Low = timeframe.in_seconds(tf2) < chSec
+tf3Low = timeframe.in_seconds(tf3) < chSec
+tf4Low = timeframe.in_seconds(tf4) < chSec
+tf5Low = timeframe.in_seconds(tf5) < chSec
+tf6Low = timeframe.in_seconds(tf6) < chSec
+
+// Düşük-TF'i grafik TF'ine SABİTLE: request hep >= grafik TF olur -> intrabar
+// patlaması ve timeout yok. Bu satırların sonucu tabloda "LTF N/A" gösterilir,
+// KULLANILMAZ. request.security global scope'ta, koşulsuz kalır (6 çağrı << 40).
+et1 = tf1Low ? timeframe.period : tf1
+et2 = tf2Low ? timeframe.period : tf2
+et3 = tf3Low ? timeframe.period : tf3
+et4 = tf4Low ? timeframe.period : tf4
+et5 = tf5Low ? timeframe.period : tf5
+et6 = tf6Low ? timeframe.period : tf6
+
+[mTr1, mTg1, mPt1] = request.security(syminfo.tickerid, et1, f_tf_compute(), lookahead = barmerge.lookahead_off)
+[mTr2, mTg2, mPt2] = request.security(syminfo.tickerid, et2, f_tf_compute(), lookahead = barmerge.lookahead_off)
+[mTr3, mTg3, mPt3] = request.security(syminfo.tickerid, et3, f_tf_compute(), lookahead = barmerge.lookahead_off)
+[mTr4, mTg4, mPt4] = request.security(syminfo.tickerid, et4, f_tf_compute(), lookahead = barmerge.lookahead_off)
+[mTr5, mTg5, mPt5] = request.security(syminfo.tickerid, et5, f_tf_compute(), lookahead = barmerge.lookahead_off)
+[mTr6, mTg6, mPt6] = request.security(syminfo.tickerid, et6, f_tf_compute(), lookahead = barmerge.lookahead_off)
 
 // =============================================================================
-// M2S · Özet tablosu (SAĞ ÜST) — tek tabloda tüm seçili TF'ler
-//   Sütunlar: TF | Trend (renkli) | Son etiket | Son pivot zamanı
+// M2S · Kompakt özet tablosu (SAĞ ÜST) — sütunlar: TF | Trend | Structure
+//   Ayrıntılı debug verileri (zaman, confIdx, theta, sayaç, motor yönü) BURADA
+//   GÖSTERİLMEZ; onlar yalnızca M1+M2 / M3 detay tablolarında.
 //   Repaint-safe desen: nesne global scope'ta bir kez, hücreler son barda.
 // =============================================================================
-var table tm = table.new(position.top_right, 4, 7, border_width = 1)
+var table tm = table.new(position.top_right, 3, 7, border_width = 1)
 
-if barstate.islast and mtfShow
-    // Başlık
-    table.cell(tm, 0, 0, "M2S · TF",     bgcolor = color.new(color.blue, 0), text_color = color.white)
-    table.cell(tm, 1, 0, "Trend",        bgcolor = color.new(color.blue, 0), text_color = color.white)
-    table.cell(tm, 2, 0, "Son etiket",   bgcolor = color.new(color.blue, 0), text_color = color.white)
-    table.cell(tm, 3, 0, "Son pivot",    bgcolor = color.new(color.blue, 0), text_color = color.white)
+if barstate.islast and showM2sTable
+    table.cell(tm, 0, 0, "TF",        bgcolor = color.new(color.blue, 0), text_color = color.white)
+    table.cell(tm, 1, 0, "Trend",     bgcolor = color.new(color.blue, 0), text_color = color.white)
+    table.cell(tm, 2, 0, "Structure", bgcolor = color.new(color.blue, 0), text_color = color.white)
 
-    tfs = array.from(tf1, tf2, tf3, tf4, tf5, tf6)
-    ens = array.from(en1, en2, en3, en4, en5, en6)
-    trs = array.from(mtfTr1, mtfTr2, mtfTr3, mtfTr4, mtfTr5, mtfTr6)
-    tgs = array.from(mtfTg1, mtfTg2, mtfTg3, mtfTg4, mtfTg5, mtfTg6)
-    pts = array.from(mtfPt1, mtfPt2, mtfPt3, mtfPt4, mtfPt5, mtfPt6)
+    tfs  = array.from(tf1, tf2, tf3, tf4, tf5, tf6)
+    ens  = array.from(en1, en2, en3, en4, en5, en6)
+    lows = array.from(tf1Low, tf2Low, tf3Low, tf4Low, tf5Low, tf6Low)
+    trs  = array.from(mTr1, mTr2, mTr3, mTr4, mTr5, mTr6)
+    tgs  = array.from(mTg1, mTg2, mTg3, mTg4, mTg5, mTg6)
 
     for i = 0 to 5
         r     = i + 1
         tfLbl = array.get(tfs, i)
-        if array.get(ens, i)
+        if not array.get(ens, i)
+            table.cell(tm, 0, r, tfLbl,   text_color = color.gray)
+            table.cell(tm, 1, r, "off",   text_color = color.gray)
+            table.cell(tm, 2, r, "-",     text_color = color.gray)
+        else if array.get(lows, i)
+            table.cell(tm, 0, r, tfLbl,     text_color = color.gray)
+            table.cell(tm, 1, r, "LTF N/A", text_color = color.gray)
+            table.cell(tm, 2, r, "-",       text_color = color.gray)
+        else
             trv = array.get(trs, i)
             tgv = array.get(tgs, i)
-            ptv = array.get(pts, i)
-            ptStr = na(ptv) ? "-" : str.format_time(ptv, "yy-MM-dd HH:mm", syminfo.timezone)
+            trTxt = na(trv) ? "N/A" : f_trend_str(trv)
+            trBg  = na(trv) ? color.new(color.gray, 0) : f_trend_color(trv)
             table.cell(tm, 0, r, tfLbl)
-            table.cell(tm, 1, r, f_trend_str(trv), bgcolor = f_trend_color(trv), text_color = color.white)
-            table.cell(tm, 2, r, f_tag_decode(tgv))
-            table.cell(tm, 3, r, ptStr)
-        else
-            table.cell(tm, 0, r, tfLbl, text_color = color.gray)
-            table.cell(tm, 1, r, "kapalı", text_color = color.gray)
-            table.cell(tm, 2, r, "-", text_color = color.gray)
-            table.cell(tm, 3, r, "-", text_color = color.gray)
+            table.cell(tm, 1, r, trTxt, bgcolor = trBg, text_color = color.white)
+            table.cell(tm, 2, r, na(tgv) ? "N/A" : f_tag_decode(tgv))
