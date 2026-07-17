@@ -388,11 +388,13 @@ f_build_xabcd(array<Pivot> buf) =>
 // M2S · MTF Structure Summary (çok-zaman-dilimli yapı özeti)
 // -----------------------------------------------------------------------------
 // Seçilebilir TF'lerde M1+M2'yi request.security ile çalıştırır ve tek özet
-// tabloda toplar. REPAINT YOK:
+// tabloda toplar. REPAINT YOK ve REALTIME-GÜVENLİ:
 //   - request.security tarafında  lookahead = barmerge.lookahead_off,
-//   - f_tf_compute BİR ÖNCEKİ KAPANMIŞ HTF barının değerlerini döndürür
-//     (prevTrend/prevTag/prevPt). Bu, "[1] onaylı-bar" offsetinin ta kendisidir:
-//     forming (kapanmamış) HTF barı hiçbir zaman gösterilmez.
+//   - motor YALNIZCA onaylanmış (kapanmış) HTF barında ilerler
+//     (if barstate.isconfirmed) — forming (kapanmamış) HTF barı HİÇ işlenmez.
+//     Bu, "[1] onaylı-bar" garantisidir: canlı barda motor çalışmaz, dönen değer
+//     son KAPANMIŞ HTF barına aittir. (Önceki sürüm forming barı işliyordu; bu,
+//     canlı barda runtime hatasına yol açıp tüm tabloların iptaline neden oluyordu.)
 // Yalnızca özet/görsel üretir; entry/exit/alarm veya dış filtre YOK. M1/M2
 // mantığı DEĞİŞMEDEN, aynı fonksiyonlarla her TF bağlamında çalışır.
 // =============================================================================
@@ -405,24 +407,22 @@ f_tag_decode(int c) =>
     c == 1 ? "HH" : c == 2 ? "HL" : c == 3 ? "LH" : c == 4 ? "LL" : c == 5 ? "EQH" : c == 6 ? "EQL" : c == 7 ? "H1" : c == 8 ? "L1" : "-"
 
 // request.security bağlamında (hedef TF) M1+M2'yi çalıştırır.
-// DÖNÜŞ: [trend, sonEtiketKodu, sonPivotZamanı] — hepsi BİR ÖNCEKİ kapanmış
-// HTF barına ait ([1] offset). var state, security bağlamında TF başına ayrı yaşar.
+// DÖNÜŞ: [trend, sonEtiketKodu, sonPivotZamanı] — hepsi son KAPANMIŞ HTF barına
+// ait. var state, security bağlamında TF başına ayrı yaşar.
 f_tf_compute() =>
     var Engine    e           = f_engine_new()
     var Structure s           = f_structure_new()
     var int       lastTagCode = 0
     var int       lastPivotT  = na
-    // [1] offset: bu barı işlemeden ÖNCE, bir önceki (kapanmış) barın anlık görüntüsü.
-    int prevTrend = s.trend
-    int prevTag   = lastTagCode
-    int prevPt    = lastPivotT
-    // Bu HTF barını işle (yalnızca OHLC + ATR; M1 motoru + M2 yapısı).
-    float a  = ta.atr(atrLen)
-    Pivot np = f_engine_step(e, mainK, mainMinBars, a)
-    if not na(np)
-        lastTagCode := f_tag_code(f_structure_update(s, np))
-        lastPivotT  := np.ptime
-    [prevTrend, prevTag, prevPt]
+    // Motor YALNIZCA kapanmış HTF barında ilerler -> forming bar işlenmez
+    // (realtime runtime hatası engellenir; repaint yok).
+    if barstate.isconfirmed
+        float a  = ta.atr(atrLen)
+        Pivot np = f_engine_step(e, mainK, mainMinBars, a)
+        if not na(np)
+            lastTagCode := f_tag_code(f_structure_update(s, np))
+            lastPivotT  := np.ptime
+    [s.trend, lastTagCode, lastPivotT]
 
 // =============================================================================
 // Örnekleme + ring buffer + akış
