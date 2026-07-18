@@ -24,6 +24,11 @@
 
 strategy("MTF Confluence Strategy (M1+M2+M3+M2S)", overlay = true, pyramiding = 0, max_lines_count = 500, max_labels_count = 500)
 
+// Ana-grafik pane ÇIPASI: fiyat ölçeğine bağlı görünmez (tam şeffaf) bir plot.
+// overlay=true script'in AYRI pane yerine ANA fiyat grafiğine oturmasını güçlendirir;
+// böylece tablolar (force_overlay desteklemez) ana grafikte görünür. Görsel etkisi yok.
+plot(close, "pane anchor", color = color.new(color.gray, 100), editable = false)
+
 // =============================================================================
 // Tipler
 // =============================================================================
