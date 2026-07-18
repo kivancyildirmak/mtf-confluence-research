@@ -364,6 +364,13 @@ f_tag_color(string tag) =>
 f_engine_dir_str(Engine e) =>
     e.booted ? (e.dir == 1 ? "tepe arıyor" : "dip arıyor") : "bootstrap"
 
+// Basit sağ-boşluk dolgusu (label panelinde kolonları kabaca hizalamak için).
+f_pad(string s, int w) =>
+    string r = s
+    while str.length(r) < w
+        r := r + " "
+    r
+
 // =============================================================================
 // M3 · XABCD Builder (yalnızca onaylanmış MAIN pivotlarından)
 // -----------------------------------------------------------------------------
@@ -681,12 +688,15 @@ et6 = tf6Low ? timeframe.period : tf6
 //   GÖSTERİLMEZ; onlar yalnızca M1+M2 / M3 detay tablolarında.
 //   Repaint-safe desen: nesne global scope'ta bir kez, hücreler son barda.
 // =============================================================================
-var table tm = table.new(position.top_right, 3, 7, border_width = 1)
+// force_overlay LABEL paneli (tablo YERİNE). Pine tabloları force_overlay
+// desteklemediği ve script ayrı pane'e düşebildiği için, özet tek çok-satırlı
+// label olarak çizilir; force_overlay=true ile ANA fiyat grafiğinde KESİN görünür.
+// Son bara 2 bar sağdan, son barın high'ına yakın konumlanır; her son barda
+// silinip yeniden çizilir (birikmez).
+var label m2sPanel = na
 
 if barstate.islast and showM2sTable
-    table.cell(tm, 0, 0, "TF",        bgcolor = color.new(color.blue, 0), text_color = color.white)
-    table.cell(tm, 1, 0, "Trend",     bgcolor = color.new(color.blue, 0), text_color = color.white)
-    table.cell(tm, 2, 0, "Structure", bgcolor = color.new(color.blue, 0), text_color = color.white)
+    label.delete(m2sPanel)
 
     tfs  = array.from(tf1, tf2, tf3, tf4, tf5, tf6)
     ens  = array.from(en1, en2, en3, en4, en5, en6)
@@ -694,22 +704,25 @@ if barstate.islast and showM2sTable
     trs  = array.from(mTr1, mTr2, mTr3, mTr4, mTr5, mTr6)
     tgs  = array.from(mTg1, mTg2, mTg3, mTg4, mTg5, mTg6)
 
+    string txt = "M2S · MTF Structure Summary\n" + f_pad("TF", 7) + f_pad("Trend", 8) + "Structure"
     for i = 0 to 5
-        r     = i + 1
         tfLbl = array.get(tfs, i)
+        string trTxt = ""
+        string sgTxt = ""
         if not array.get(ens, i)
-            table.cell(tm, 0, r, tfLbl,   text_color = color.gray)
-            table.cell(tm, 1, r, "off",   text_color = color.gray)
-            table.cell(tm, 2, r, "-",     text_color = color.gray)
+            trTxt := "off"
+            sgTxt := "-"
         else if array.get(lows, i)
-            table.cell(tm, 0, r, tfLbl,     text_color = color.gray)
-            table.cell(tm, 1, r, "LTF N/A", text_color = color.gray)
-            table.cell(tm, 2, r, "-",       text_color = color.gray)
+            trTxt := "LTF N/A"
+            sgTxt := "-"
         else
             trv = array.get(trs, i)
             tgv = array.get(tgs, i)
-            trTxt = na(trv) ? "N/A" : f_trend_str(trv)
-            trBg  = na(trv) ? color.new(color.gray, 0) : f_trend_color(trv)
-            table.cell(tm, 0, r, tfLbl)
-            table.cell(tm, 1, r, trTxt, bgcolor = trBg, text_color = color.white)
-            table.cell(tm, 2, r, na(tgv) ? "N/A" : f_tag_decode(tgv))
+            trTxt := na(trv) ? "N/A" : f_trend_str(trv)
+            sgTxt := na(tgv) ? "N/A" : f_tag_decode(tgv)
+        txt := txt + "\n" + f_pad(tfLbl, 7) + f_pad(trTxt, 8) + sgTxt
+
+    m2sPanel := label.new(bar_index + 2, high, txt, xloc = xloc.bar_index, yloc = yloc.price,
+         style = label.style_label_left, textalign = text.align_left,
+         color = color.new(color.black, 15), textcolor = color.white, size = size.normal,
+         force_overlay = true)
