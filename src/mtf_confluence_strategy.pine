@@ -22,8 +22,7 @@
 //     EMA/RSI/MACD/hacim/momentum KULLANILMAZ.
 // =============================================================================
 
-strategy("MTF Confluence Strategy (M1+M2+M3+M2S)", overlay = true, pyramiding = 0,
-     max_lines_count = 500, max_labels_count = 500)
+strategy("MTF Confluence Strategy (M1+M2+M3+M2S)", overlay = true, pyramiding = 0, max_lines_count = 500, max_labels_count = 500)
 
 // =============================================================================
 // Tipler
@@ -482,20 +481,20 @@ var Pivot fastLast = na
 if not na(mainNew)
     if showMainZz and not na(mainLast)
         line.new(mainLast.bidx, mainLast.price, mainNew.bidx, mainNew.price,
-             xloc = xloc.bar_index, color = color.new(color.gray, 45), width = 1)
+             xloc = xloc.bar_index, color = color.new(color.gray, 45), width = 1, force_overlay = true)
     if showStructLabels
         label.new(mainNew.bidx, mainNew.price, mainTag,
              xloc = xloc.bar_index,
              yloc = mainNew.kind == 1 ? yloc.abovebar : yloc.belowbar,
              style = mainNew.kind == 1 ? label.style_label_down : label.style_label_up,
-             color = f_tag_color(mainTag), textcolor = color.new(color.white, 10), size = size.tiny)
+             color = f_tag_color(mainTag), textcolor = color.new(color.white, 10), size = size.tiny, force_overlay = true)
     mainLast := mainNew
 
 if not na(fastNew)
     if showFastZz and not na(fastLast)
         line.new(fastLast.bidx, fastLast.price, fastNew.bidx, fastNew.price,
              xloc = xloc.bar_index, color = color.new(color.teal, 55),
-             width = 1, style = line.style_dashed)
+             width = 1, style = line.style_dashed, force_overlay = true)
     fastLast := fastNew
 
 // --- M3: XABCD adayının çizimi -----------------------------------------------
@@ -511,10 +510,10 @@ if not na(xabNew) and xabNew.valid and showXabcdLetters
     array.clear(xabLabels)
 
     xcol = color.new(color.blue, 20)
-    array.push(xabLines, line.new(xabNew.X.bidx, xabNew.X.price, xabNew.A.bidx, xabNew.A.price, xloc = xloc.bar_index, color = xcol, width = 1, style = line.style_dotted))
-    array.push(xabLines, line.new(xabNew.A.bidx, xabNew.A.price, xabNew.B.bidx, xabNew.B.price, xloc = xloc.bar_index, color = xcol, width = 1, style = line.style_dotted))
-    array.push(xabLines, line.new(xabNew.B.bidx, xabNew.B.price, xabNew.C.bidx, xabNew.C.price, xloc = xloc.bar_index, color = xcol, width = 1, style = line.style_dotted))
-    array.push(xabLines, line.new(xabNew.C.bidx, xabNew.C.price, xabNew.D.bidx, xabNew.D.price, xloc = xloc.bar_index, color = xcol, width = 1, style = line.style_dotted))
+    array.push(xabLines, line.new(xabNew.X.bidx, xabNew.X.price, xabNew.A.bidx, xabNew.A.price, xloc = xloc.bar_index, color = xcol, width = 1, style = line.style_dotted, force_overlay = true))
+    array.push(xabLines, line.new(xabNew.A.bidx, xabNew.A.price, xabNew.B.bidx, xabNew.B.price, xloc = xloc.bar_index, color = xcol, width = 1, style = line.style_dotted, force_overlay = true))
+    array.push(xabLines, line.new(xabNew.B.bidx, xabNew.B.price, xabNew.C.bidx, xabNew.C.price, xloc = xloc.bar_index, color = xcol, width = 1, style = line.style_dotted, force_overlay = true))
+    array.push(xabLines, line.new(xabNew.C.bidx, xabNew.C.price, xabNew.D.bidx, xabNew.D.price, xloc = xloc.bar_index, color = xcol, width = 1, style = line.style_dotted, force_overlay = true))
 
     // Dikey offset: XABCD harflerini pivotun DIŞINA it (M2 yapı etiketiyle çakışmasın).
     lcol = color.new(color.blue, 10)
@@ -524,19 +523,19 @@ if not na(xabNew) and xabNew.valid and showXabcdLetters
     yB   = xabNew.B.price + (xabNew.B.kind == 1 ? off : -off)
     yC   = xabNew.C.price + (xabNew.C.kind == 1 ? off : -off)
     yD   = xabNew.D.price + (xabNew.D.kind == 1 ? off : -off)
-    array.push(xabLabels, label.new(xabNew.X.bidx, yX, "X", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny))
-    array.push(xabLabels, label.new(xabNew.A.bidx, yA, "A", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny))
-    array.push(xabLabels, label.new(xabNew.B.bidx, yB, "B", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny))
-    array.push(xabLabels, label.new(xabNew.C.bidx, yC, "C", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny))
-    array.push(xabLabels, label.new(xabNew.D.bidx, yD, "D", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny))
+    array.push(xabLabels, label.new(xabNew.X.bidx, yX, "X", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny, force_overlay = true))
+    array.push(xabLabels, label.new(xabNew.A.bidx, yA, "A", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny, force_overlay = true))
+    array.push(xabLabels, label.new(xabNew.B.bidx, yB, "B", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny, force_overlay = true))
+    array.push(xabLabels, label.new(xabNew.C.bidx, yC, "C", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny, force_overlay = true))
+    array.push(xabLabels, label.new(xabNew.D.bidx, yD, "D", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny, force_overlay = true))
 
 // Onay-barı işaretleri (strateji girişinin en erken yapılabileceği bar).
 plotshape(showConfMarkers and not na(mainNew), title = "MAIN confirmed",
      style = shape.circle, location = location.belowbar,
-     color = color.new(color.gray, 0), size = size.tiny)
+     color = color.new(color.gray, 0), size = size.tiny, force_overlay = true)
 plotshape(showConfMarkers and not na(fastNew), title = "FAST confirmed",
      style = shape.circle, location = location.abovebar,
-     color = color.new(color.teal, 0), size = size.tiny)
+     color = color.new(color.teal, 0), size = size.tiny, force_overlay = true)
 
 // =============================================================================
 // Birleşik denetim tablosu (M1 + M2)
