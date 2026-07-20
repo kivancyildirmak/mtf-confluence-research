@@ -1,27 +1,24 @@
 //@version=6
 // =============================================================================
-// HARMONIC PREDICTION ENGINE — D noktası oluşmadan olası D seviyelerini projekte eder
+// HARMONIC PREDICTION ENGINE — D oluşmadan olası D fiyatlarını geleceğe projekte eder
 // -----------------------------------------------------------------------------
-// Bu sürüm ARTIK bir harmonic pattern GÖSTERİCİSİ değildir. Tek amacı:
-//   Son 4 confirmed pivot (X, A, B, C) oluştuğunda, HENÜZ D OLUŞMADAN, olası D
-//   fiyatlarını Fibonacci oranlarıyla GELECEĞE projekte etmek.
+// Bu proje ARTIK geçmiş harmonic pattern'ları gösteren bir indikatör DEĞİLDİR.
+// Tek amaç: son confirmed X-A-B-C yapısından, D HENÜZ OLUŞMADAN, olası D fiyatlarını
+// Fibonacci ile GELECEĞE SABİT projeksiyon çizgileri olarak göstermek.
 //
-// GRAFİKTE YALNIZCA: X, A, B, C harfleri + geleceğe uzanan D projeksiyon çizgileri.
-//   Tablo YOK · debug YOK · trend YOK · HH/HL/LH/LL YOK · zigzag YOK · pattern adı YOK.
+// GRAFİKTE YALNIZCA: X/A/B/C harfleri + C barından sağa uzanan D projeksiyon
+//   çizgileri + her çizginin Fibonacci oran etiketi. Başka HİÇBİR şey yok:
+//   tablo/M2S/trend/HH-HL-LH-LL/zigzag/debug/pattern adı/PRZ/confidence/entry-exit YOK.
 //
-// KORUNAN ALTYAPI (yalnızca prediction'ı besler; ÇİZİLMEZ):
-//   - Repaint-safe "Dual-Tracker Confirmed Deviation ZigZag" pivot motoru.
-//   - Confirmed pivot mantığı + Pivot veri yapısı + ring buffer.
-//   (M2 yapı / M3 XABCD / M2S MTF katmanları bu sürümde ÇAĞRILMAZ; git geçmişinde
-//    korunur. Prediction chart-TF pivotlarını kullanır; MTF filtreleme ileride.)
+// KORUNAN ALTYAPI (yalnızca prediction'ı besler; ÇİZİLMEZ): repaint-safe
+//   "Dual-Tracker Confirmed Deviation ZigZag" pivot motoru + Pivot veri yapısı +
+//   ring buffer + yalnızca barstate.isconfirmed içinde state ilerletme.
 //
-// REPAINT YOK: pivotlar yalnızca KAPANMIŞ barlarda onaylanır; prediction yalnızca
-//   yeni confirmed pivot (C) anında BİR KEZ hesaplanır ve sonra DEĞİŞMEZ. Lookahead
-//   kullanılmaz. Eklenmez: harmonic isimleri, PRZ, confidence, strategy, entry/exit,
-//   alarm, backtest.
+// Kod sonundaki AÇIKLAMA bloğu: XABC doğrulaması, prediction üretim anı, XA/BC
+//   formülleri ve neden repaint olmadığı.
 // =============================================================================
 
-indicator("Harmonic Prediction Engine", overlay = true, max_lines_count = 100, max_labels_count = 100)
+indicator("Harmonic Prediction Engine", overlay = true, max_lines_count = 500, max_labels_count = 500)
 
 // =============================================================================
 // Girdiler
@@ -30,15 +27,25 @@ atrLen      = input.int(14,  "ATR uzunluğu",              minval = 1, group = "
 pivK        = input.float(3.0, "Pivot sapma eşiği (× ATR)", minval = 0.1, step = 0.1, group = "Pivot Engine")
 pivMinBars  = input.int(8,     "Pivot minimum bar",         minval = 1, group = "Pivot Engine")
 
-projLen     = input.int(60, "Projeksiyon uzunluğu (bar)", minval = 5, group = "Prediction")
-colXA       = input.color(color.new(color.aqua,   0), "XA retracement rengi", group = "Prediction")
-colBC       = input.color(color.new(color.orange, 0), "BC extension rengi",   group = "Prediction")
+grpPred     = "Prediction"
+projLen     = input.int(50, "Projeksiyon uzunluğu (bar)", minval = 5, group = grpPred)
+histMode    = input.string("Latest only", "Historical predictions", options = ["Latest only", "Keep last 5", "Keep last 10"], group = grpPred)
+colXA       = input.color(color.aqua,   "XA çizgi rengi", group = grpPred)
+colBC       = input.color(color.orange, "BC çizgi rengi", group = grpPred)
+showPrice   = input.bool(false, "Etikette fiyatı da göster", group = grpPred)
+
+grpFilt     = "XABC Geçerlilik Filtreleri"
+abXaMin     = input.float(0.25, "AB/XA min", step = 0.01, group = grpFilt)
+abXaMax     = input.float(0.90, "AB/XA max", step = 0.01, group = grpFilt)
+bcAbMin     = input.float(0.30, "BC/AB min", step = 0.01, group = grpFilt)
+bcAbMax     = input.float(2.00, "BC/AB max", step = 0.01, group = grpFilt)
+
+keepCount = histMode == "Keep last 5" ? 5 : histMode == "Keep last 10" ? 10 : 1
 
 // =============================================================================
 // Veri yapıları (KORUNAN ALTYAPI)
 // =============================================================================
 // Onaylanmış pivot. kind: +1 = HIGH (tepe), -1 = LOW (dip).
-// bidx: pivotun gerçekleştiği bar_index (sabit). confIdx: onaylandığı bar_index.
 type Pivot
     float price
     int   bidx
@@ -47,7 +54,7 @@ type Pivot
     int   confIdx
     float theta
 
-// Pivot motoru durumu (state machine). Bkz. f_engine_step yorumu.
+// Pivot motoru durumu (state machine).
 type Engine
     bool  init
     bool  booted
@@ -60,6 +67,11 @@ type Engine
     int   oppIdx
     int   oppTime
     float oppTheta
+
+// Bir prediction grubunun tüm çizim nesneleri (grup bazlı silme için).
+type PredGroup
+    array<line>  lines
+    array<label> labels
 
 // =============================================================================
 // Repaint-safe pivot motoru (KORUNAN ALTYAPI — davranış değişmedi)
@@ -202,6 +214,50 @@ f_engine_step(Engine e, float k, int minBars, float atr) =>
     result
 
 // =============================================================================
+// Prediction yardımcıları
+// =============================================================================
+
+// XABC geçerlilik kontrolü (oranlar GRAFİKTE gösterilmez; yalnızca filtre).
+f_xabc_valid(Pivot X, Pivot A, Pivot B, Pivot C) =>
+    bool chrono = X.bidx < A.bidx and A.bidx < B.bidx and B.bidx < C.bidx
+    bool alt    = X.kind != A.kind and A.kind != B.kind and B.kind != C.kind
+    bool form   = (X.kind == -1 and A.kind == 1 and B.kind == -1 and C.kind == 1) or (X.kind == 1 and A.kind == -1 and B.kind == 1 and C.kind == -1)
+    float xa = math.abs(A.price - X.price)
+    float ab = math.abs(B.price - A.price)
+    float bc = math.abs(C.price - B.price)
+    bool legs = xa > 0 and ab > 0 and bc > 0
+    bool ratios = false
+    if legs
+        float abXa = ab / xa
+        float bcAb = bc / ab
+        ratios := abXa >= abXaMin and abXa <= abXaMax and bcAb >= bcAbMin and bcAb <= bcAbMax
+    chrono and alt and form and legs and ratios
+
+// Bir pivotu harf etiketiyle işaretler ve label'ı döndürür.
+f_mark(int bidx, float price, string txt) =>
+    label.new(bidx, price, txt, xloc = xloc.bar_index, style = label.style_label_center,
+         color = color.new(color.gray, 25), textcolor = color.white, size = size.small,
+         force_overlay = true)
+
+// Bir D seviyesi için projeksiyon çizgisi + oran etiketi (gruba eklenir).
+f_proj(PredGroup g, int x1, int x2, float d, float r, color col, string suffix) =>
+    array.push(g.lines, line.new(x1, d, x2, d, xloc = xloc.bar_index, color = col, width = 1, force_overlay = true))
+    string txt = str.tostring(r, "#.###") + " " + suffix + (showPrice ? "  " + str.tostring(d, format.mintick) : "")
+    array.push(g.labels, label.new(x2, d, txt, xloc = xloc.bar_index, style = label.style_label_left,
+         color = color.new(col, 80), textcolor = col, size = size.tiny, force_overlay = true))
+
+// Bir prediction grubunun tüm nesnelerini güvenle siler.
+f_group_delete(PredGroup g) =>
+    if array.size(g.lines) > 0
+        for ln in g.lines
+            line.delete(ln)
+        array.clear(g.lines)
+    if array.size(g.labels) > 0
+        for lb in g.labels
+            label.delete(lb)
+        array.clear(g.labels)
+
+// =============================================================================
 // Motor örneği + confirmed pivot ring buffer (KORUNAN ALTYAPI, çizilmez)
 // =============================================================================
 var Engine        pivEng = f_engine_new()
@@ -220,44 +276,20 @@ if barstate.isconfirmed
             array.shift(pivots)
 
 // =============================================================================
-// PREDICTION ENGINE — olası D seviyelerini projekte et
+// PREDICTION ENGINE
 // -----------------------------------------------------------------------------
-// Fibonacci oranları:
-//   XA retracement: A - r*(A-X)   |   BC extension: C - r*(C-B)
-// (Her iki formül de D'yi doğru yönde üretir; pivotlar zaten alternatiftir.)
-// Prediction yalnızca YENİ confirmed pivot (yeni C) anında BİR KEZ hesaplanır;
-// eski çizimler silinir, sadece en son aktif prediction gösterilir. Repaint yok.
+// Fibonacci oranları. Formüller (yön-bağımsız):
+//   XA projection: D = A - r*(A-X)   |   BC projection: D = C - r*(C-B)
+// Sonuç MUTLAKA yön filtresinden geçer:
+//   L-H-L-H (X dip)  -> yalnızca D < C    |   H-L-H-L (X tepe) -> yalnızca D > C
 // =============================================================================
 var array<float> xaRatios = array.from(0.786, 0.886, 1.000, 1.130, 1.272, 1.618)
 var array<float> bcRatios = array.from(1.272, 1.414, 1.618, 2.000, 2.240, 2.618, 3.140, 3.618)
 
-var array<line>  predLines  = array.new<line>()
-var array<label> predLabels = array.new<label>()
+// Aktif prediction grupları (en yeni sonda). Grup bazlı saklanır/silinir.
+var array<PredGroup> groups = array.new<PredGroup>()
 
-f_pred_clear() =>
-    if array.size(predLines) > 0
-        for ln in predLines
-            line.delete(ln)
-        array.clear(predLines)
-    if array.size(predLabels) > 0
-        for lb in predLabels
-            label.delete(lb)
-        array.clear(predLabels)
-
-// Bir pivot noktasını harf etiketiyle işaretle.
-f_mark(int bidx, float price, string txt) =>
-    label.new(bidx, price, txt, xloc = xloc.bar_index, style = label.style_label_center,
-         color = color.new(color.gray, 25), textcolor = color.white, size = size.small,
-         force_overlay = true)
-
-// Bir D seviyesi için projeksiyon çizgisi + oran etiketi (C barından sağa uzanır).
-f_proj(int x1, int x2, float d, float r, color col, string suffix) =>
-    array.push(predLines, line.new(x1, d, x2, d, xloc = xloc.bar_index, color = col, width = 1, force_overlay = true))
-    array.push(predLabels, label.new(x2, d, str.tostring(r, "#.###") + " " + suffix, xloc = xloc.bar_index,
-         style = label.style_label_left, color = color.new(col, 80), textcolor = col, size = size.tiny,
-         force_overlay = true))
-
-// Yeni confirmed pivot (C) geldiğinde ve elde en az 4 pivot varsa: hesapla + çiz.
+// Yeni confirmed pivot (yeni C) geldiğinde: doğrula, hesapla, çiz (bir kez).
 if not na(newPiv) and array.size(pivots) >= 4
     int n = array.size(pivots)
     Pivot X = array.get(pivots, n - 4)
@@ -265,27 +297,69 @@ if not na(newPiv) and array.size(pivots) >= 4
     Pivot B = array.get(pivots, n - 2)
     Pivot C = array.get(pivots, n - 1)
 
-    f_pred_clear()
+    if f_xabc_valid(X, A, B, C)
+        // Yapı yönü: L-H-L-H (X dip) -> D aşağı (D<C) ; H-L-H-L (X tepe) -> D yukarı (D>C).
+        bool wantDown = X.kind == -1
 
-    // X A B C harfleri (yalnızca bunlar + projeksiyonlar çizilir)
-    array.push(predLabels, f_mark(X.bidx, X.price, "X"))
-    array.push(predLabels, f_mark(A.bidx, A.price, "A"))
-    array.push(predLabels, f_mark(B.bidx, B.price, "B"))
-    array.push(predLabels, f_mark(C.bidx, C.price, "C"))
+        PredGroup g = PredGroup.new(array.new<line>(), array.new<label>())
 
-    float xaDelta = A.price - X.price
-    float bcDelta = C.price - B.price
-    int   x1 = C.bidx
-    int   x2 = C.bidx + projLen
+        // X A B C harfleri (yalnızca bunlar + geçerli projeksiyonlar).
+        array.push(g.labels, f_mark(X.bidx, X.price, "X"))
+        array.push(g.labels, f_mark(A.bidx, A.price, "A"))
+        array.push(g.labels, f_mark(B.bidx, B.price, "B"))
+        array.push(g.labels, f_mark(C.bidx, C.price, "C"))
 
-    // XA retracement tabanlı olası D seviyeleri
-    for i = 0 to array.size(xaRatios) - 1
-        float r = array.get(xaRatios, i)
-        float d = A.price - r * xaDelta
-        f_proj(x1, x2, d, r, colXA, "XA")
+        float xaDelta = A.price - X.price
+        float bcDelta = C.price - B.price
+        int   x1 = C.bidx
+        int   x2 = C.bidx + projLen
 
-    // BC extension tabanlı olası D seviyeleri
-    for i = 0 to array.size(bcRatios) - 1
-        float r = array.get(bcRatios, i)
-        float d = C.price - r * bcDelta
-        f_proj(x1, x2, d, r, colBC, "BC")
+        // XA retracement tabanlı D seviyeleri (yön filtresi ile).
+        for i = 0 to array.size(xaRatios) - 1
+            float r = array.get(xaRatios, i)
+            float d = A.price - r * xaDelta
+            bool ok = wantDown ? d < C.price : d > C.price
+            if ok
+                f_proj(g, x1, x2, d, r, colXA, "XA")
+
+        // BC extension tabanlı D seviyeleri (yön filtresi ile).
+        for i = 0 to array.size(bcRatios) - 1
+            float r = array.get(bcRatios, i)
+            float d = C.price - r * bcDelta
+            bool ok = wantDown ? d < C.price : d > C.price
+            if ok
+                f_proj(g, x1, x2, d, r, colBC, "BC")
+
+        // Grubu ekle; historical moda göre eski grupları sil.
+        array.push(groups, g)
+        while array.size(groups) > keepCount
+            PredGroup old = array.shift(groups)
+            f_group_delete(old)
+
+// =============================================================================
+// AÇIKLAMA
+// -----------------------------------------------------------------------------
+// XABC nasıl doğrulanır (f_xabc_valid):
+//   - kronoloji: X.bidx < A.bidx < B.bidx < C.bidx
+//   - alternasyon + biçim: dizi tam olarak L-H-L-H veya H-L-H-L
+//   - leg>0: |A-X|, |B-A|, |C-B| > 0
+//   - oran filtreleri: AB/XA ∈ [abXaMin,abXaMax], BC/AB ∈ [bcAbMin,bcAbMax]
+//   Geçersizse hiçbir prediction çizilmez. Oranlar grafikte gösterilmez.
+//
+// Prediction ne zaman üretilir:
+//   Yalnızca YENİ confirmed pivot (yeni C) geldiği bar-close event'inde, bir kez.
+//   Üretim ve çizim AYNI event'te olur. Yeni pivot yoksa aktif prediction yeniden
+//   hesaplanmaz. D'nin gerçekten oluşması beklenmez.
+//
+// XA / BC formülleri (yön-bağımsız), sonra yön filtresi:
+//   D_XA = A - r*(A-X) ;  D_BC = C - r*(C-B)
+//   L-H-L-H -> yalnızca D < C ;  H-L-H-L -> yalnızca D > C.
+//
+// Neden repaint olmaz:
+//   - Motor yalnızca barstate.isconfirmed (KAPANMIŞ bar) içinde ilerler; pivot
+//     onaylanınca bidx/price sabittir.
+//   - Prediction confirmed C anında bir kez hesaplanır; X/A/B/C ve D fiyatları
+//     ile başlangıç barları sonradan yeniden hesaplanmaz/taşınmaz.
+//   - request.security ve lookahead KULLANILMAZ; geleceği bilen hesap yoktur.
+//   - Historical gruplar bir daha güncellenmez; yalnızca (pruning'de) silinir.
+// =============================================================================
