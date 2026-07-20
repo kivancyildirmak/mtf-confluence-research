@@ -1,44 +1,44 @@
 //@version=6
 // =============================================================================
-// MTF Confluence System — ANA STRATEJİ DOSYASI (single-file architecture)
+// HARMONIC PREDICTION ENGINE — D noktası oluşmadan olası D seviyelerini projekte eder
 // -----------------------------------------------------------------------------
-// Tüm modüller bu TEK strategy dosyasında fonksiyon olarak yaşar. Kod tekrarı
-// yoktur; çekirdek başka dosyaya kopyalanmaz.
+// Bu sürüm ARTIK bir harmonic pattern GÖSTERİCİSİ değildir. Tek amacı:
+//   Son 4 confirmed pivot (X, A, B, C) oluştuğunda, HENÜZ D OLUŞMADAN, olası D
+//   fiyatlarını Fibonacci oranlarıyla GELECEĞE projekte etmek.
 //
-// Uygulanan modüller:
-//   M1 · Pivot Engine (Confirmed ZigZag) — Main + Fast, iki bağımsız motor.
-//   M2 · Market Structure — onaylı MAIN pivotlarından HH/HL/LH/LL + trend state.
-//   M3 · XABCD Builder — ardışık 5 onaylı MAIN pivotundan X-A-B-C-D adayı (yapısal).
-//   M2S· MTF Structure Summary — seçilebilir TF'lerde M1+M2 özeti (repaint-safe).
+// GRAFİKTE YALNIZCA: X, A, B, C harfleri + geleceğe uzanan D projeksiyon çizgileri.
+//   Tablo YOK · debug YOK · trend YOK · HH/HL/LH/LL YOK · zigzag YOK · pattern adı YOK.
 //
-// Sıradaki modüller (henüz eklenmedi): M4 Harmonic, M5 MTF Confluence,
-//   M6 HTF Veto, M7 Weighted Score, M8 Risk, M9 Signal/Backtest.
+// KORUNAN ALTYAPI (yalnızca prediction'ı besler; ÇİZİLMEZ):
+//   - Repaint-safe "Dual-Tracker Confirmed Deviation ZigZag" pivot motoru.
+//   - Confirmed pivot mantığı + Pivot veri yapısı + ring buffer.
+//   (M2 yapı / M3 XABCD / M2S MTF katmanları bu sürümde ÇAĞRILMAZ; git geçmişinde
+//    korunur. Prediction chart-TF pivotlarını kullanır; MTF filtreleme ileride.)
 //
-// KISITLAR:
-//   - Yalnızca LONG (ileride). Şimdilik hiçbir entry/exit/alarm YOK.
-//   - REPAINT YOK: tüm state yalnızca KAPANMIŞ barlarda (barstate.isconfirmed)
-//     ilerler; pivotlar onay sonrası sabittir.
-//   - Yasaklı gösterge / dış filtre YOK: yalnızca OHLC geometrisi + ATR.
-//     EMA/RSI/MACD/hacim/momentum KULLANILMAZ.
+// REPAINT YOK: pivotlar yalnızca KAPANMIŞ barlarda onaylanır; prediction yalnızca
+//   yeni confirmed pivot (C) anında BİR KEZ hesaplanır ve sonra DEĞİŞMEZ. Lookahead
+//   kullanılmaz. Eklenmez: harmonic isimleri, PRZ, confidence, strategy, entry/exit,
+//   alarm, backtest.
 // =============================================================================
 
-strategy("MTF Confluence Strategy (M1+M2+M3+M2S)", overlay = true, pyramiding = 0, max_lines_count = 500, max_labels_count = 500)
-
-// Ana-grafik pane ÇIPASI: fiyat ölçeğine bağlı görünmez (tam şeffaf) bir plot.
-// overlay=true script'in AYRI pane yerine ANA fiyat grafiğine oturmasını güçlendirir;
-// böylece tablolar (force_overlay desteklemez) ana grafikte görünür. Görsel etkisi yok.
-plot(close, "pane anchor", color = color.new(color.gray, 100), editable = false)
+indicator("Harmonic Prediction Engine", overlay = true, max_lines_count = 100, max_labels_count = 100)
 
 // =============================================================================
-// Tipler
+// Girdiler
 // =============================================================================
+atrLen      = input.int(14,  "ATR uzunluğu",              minval = 1, group = "Pivot Engine")
+pivK        = input.float(3.0, "Pivot sapma eşiği (× ATR)", minval = 0.1, step = 0.1, group = "Pivot Engine")
+pivMinBars  = input.int(8,     "Pivot minimum bar",         minval = 1, group = "Pivot Engine")
 
-// --- M1: Onaylanmış pivot kaydı. kind: +1 = HIGH (tepe), -1 = LOW (dip). ------
-// bidx   : pivotun GERÇEKLEŞTİĞİ bar_index (geçmişte, sabit).
-// confIdx: pivotun BİLİNDİĞİ/onaylandığı bar_index (bidx'ten büyük/eşit).
-// theta  : onayı sağlayan, aday barında DONDURULMUŞ sapma eşiği (k*ATR).
-// NOT: gelecekte strateji girişleri YALNIZCA confIdx barında veya SONRASINDA
-// yapılabilir; asla bidx'te değil (aksi repaint olur).
+projLen     = input.int(60, "Projeksiyon uzunluğu (bar)", minval = 5, group = "Prediction")
+colXA       = input.color(color.new(color.aqua,   0), "XA retracement rengi", group = "Prediction")
+colBC       = input.color(color.new(color.orange, 0), "BC extension rengi",   group = "Prediction")
+
+// =============================================================================
+// Veri yapıları (KORUNAN ALTYAPI)
+// =============================================================================
+// Onaylanmış pivot. kind: +1 = HIGH (tepe), -1 = LOW (dip).
+// bidx: pivotun gerçekleştiği bar_index (sabit). confIdx: onaylandığı bar_index.
 type Pivot
     float price
     int   bidx
@@ -47,12 +47,7 @@ type Pivot
     int   confIdx
     float theta
 
-// --- M1: Motor durumu (state machine) ----------------------------------------
-//   init  : ilk (ATR'li) bar görüldü mü?
-//   booted: yön belirlendi mi? (bootstrap tamamlandı mı?)
-//   dir   : +1 => TEPE arıyoruz, -1 => DİP arıyoruz.
-//   cur*  : aranan yöndeki aday uç + curTheta (aday barında donmuş eşik)
-//   opp*  : ters uç takipçisi (geri çekilme) + oppTheta
+// Pivot motoru durumu (state machine). Bkz. f_engine_step yorumu.
 type Engine
     bool  init
     bool  booted
@@ -66,110 +61,19 @@ type Engine
     int   oppTime
     float oppTheta
 
-// --- M2: Piyasa yapısı durumu — YALNIZCA onaylanmış MAIN pivotlarından --------
-//   highClass: +1 = HH, -1 = LH, 0 = yok/EQH
-//   lowClass : +1 = HL, -1 = LL, 0 = yok/EQL
-//   trend    : +1 = UP, -1 = DOWN, 0 = RANGE
-//   lastChangeConfIdx: trend'in en son DEĞİŞTİĞİ pivotun confIdx'i
-type Structure
-    bool  haveHigh
-    bool  haveLow
-    float lastHigh
-    int   lastHighIdx
-    float lastLow
-    int   lastLowIdx
-    int   highClass
-    int   lowClass
-    int   trend
-    int   lastChangeConfIdx
-
-// --- M3: XABCD adayı — ardışık 5 onaylı MAIN pivotundan (X,A,B,C,D) -----------
-//   valid    : alternans + kronolojik sıra sağlanıyor mu? (geçerli 5-pivot dizisi)
-//   isBullish: D bir DİP mi? (yükseliş tamamlanması D'de olur)
-//   dir      : +1 = bullish (D dip), -1 = bearish (D tepe)
-//   *Len     : leg fiyat büyüklüğü |Δprice|;  *Bars: leg bar açıklığı (Δbidx)
-type Xabcd
-    Pivot X
-    Pivot A
-    Pivot B
-    Pivot C
-    Pivot D
-    bool  valid
-    bool  isBullish
-    int   dir
-    float xaLen
-    float abLen
-    float bcLen
-    float cdLen
-    int   xaBars
-    int   abBars
-    int   bcBars
-    int   cdBars
-
 // =============================================================================
-// Girdiler
+// Repaint-safe pivot motoru (KORUNAN ALTYAPI — davranış değişmedi)
+// -----------------------------------------------------------------------------
+// "Dual-Tracker Confirmed Deviation ZigZag": bir uç, fiyat ondan (dondurulmuş)
+// theta = k*ATR kadar TERS çekildiğinde VE en az minBars kapanmış bar geçince
+// KESİNLEŞİR. Konservatif bar-içi kural: aynı mumda hem yeni ekstrem hem ters
+// sapma oluşursa o barda onay verilmez. Yalnızca KAPANMIŞ barlarda çağrılır.
 // =============================================================================
-atrLen      = input.int(14,  "ATR uzunluğu",              minval = 1, group = "Genel")
-
-grpMain     = "MAIN motor (yapısal)"
-mainK       = input.float(3.0, "MAIN sapma eşiği (× ATR)", minval = 0.1, step = 0.1, group = grpMain)
-mainMinBars = input.int(8,     "MAIN minimum bar",         minval = 1, group = grpMain)
-
-grpFast     = "FAST motor (taktik)"
-fastK       = input.float(1.0, "FAST sapma eşiği (× ATR)", minval = 0.1, step = 0.1, group = grpFast)
-fastMinBars = input.int(3,     "FAST minimum bar",         minval = 1, group = grpFast)
-
-// --- Display: yalnızca GÖRSEL katmanı aç/kapar; hesaplama & state daima çalışır -
-grpDisp          = "Display"
-showMainZz       = input.bool(true,  "Show MAIN ZigZag",          group = grpDisp)
-showFastZz       = input.bool(false, "Show FAST ZigZag / dots",   group = grpDisp)
-showStructLabels = input.bool(true,  "Show Structure Labels",     group = grpDisp)
-showXabcdLetters = input.bool(false, "Show XABCD Letters",        group = grpDisp)
-showM12Table     = input.bool(false, "Show M1+M2 Detail Table",   group = grpDisp)
-showM2sTable     = input.bool(true,  "Show M2S Summary Table",    group = grpDisp)
-showM3Table      = input.bool(false, "Show M3 Detail Table",      group = grpDisp)
-showConfMarkers  = input.bool(false, "Show Confirmation Markers", group = grpDisp)
-
-// --- Performance Diagnostics: HESAP katmanlarını GERÇEKTEN devre dışı bırakır ---
-// (Display'den farklı: bunlar çizimi değil, hesabı kapatır.)
-grpPerf     = "Performance Diagnostics"
-enableM2S   = input.bool(true,  "Enable M2S Calculations", group = grpPerf)
-enableM3    = input.bool(true,  "Enable M3 Calculations",  group = grpPerf)
-enableFast  = input.bool(false, "Enable FAST Engine",      group = grpPerf)
-lightMTF    = input.bool(true,  "Lightweight MTF Mode",    group = grpPerf)
-mtfBars     = input.int(1500, "  Lightweight MTF: max geçmiş bar (calc_bars_count)", minval = 200, maxval = 20000, group = grpPerf)
-
-// M2S · MTF Structure Summary — seçilebilir zaman dilimleri (varsayılan M1..D1).
-grpMtf   = "M2S · MTF Structure Summary"
-en1 = input.bool(true, "", inline = "mtf1", group = grpMtf)
-tf1 = input.timeframe("1",   "TF 1", inline = "mtf1", group = grpMtf)
-en2 = input.bool(true, "", inline = "mtf2", group = grpMtf)
-tf2 = input.timeframe("5",   "TF 2", inline = "mtf2", group = grpMtf)
-en3 = input.bool(true, "", inline = "mtf3", group = grpMtf)
-tf3 = input.timeframe("15",  "TF 3", inline = "mtf3", group = grpMtf)
-en4 = input.bool(true, "", inline = "mtf4", group = grpMtf)
-tf4 = input.timeframe("60",  "TF 4", inline = "mtf4", group = grpMtf)
-en5 = input.bool(true, "", inline = "mtf5", group = grpMtf)
-tf5 = input.timeframe("240", "TF 5", inline = "mtf5", group = grpMtf)
-en6 = input.bool(true, "", inline = "mtf6", group = grpMtf)
-tf6 = input.timeframe("1D",  "TF 6", inline = "mtf6", group = grpMtf)
-
-// =============================================================================
-// M1 · Pivot Engine (KABUL EDİLMİŞ — davranış değişmedi)
-// =============================================================================
-
-// Yeni, sıfırlanmış bir motor üretir.
 f_engine_new() =>
     Engine.new(init = false, booted = false, dir = 0,
          curPrice = na, curIdx = na, curTime = na, curTheta = na,
          oppPrice = na, oppIdx = na, oppTime = na, oppTheta = na)
 
-// Bir motoru tek bar ileri adımlar. Pivot ONAYLANDIYSA onu döndürür, yoksa na.
-// State doğrudan `e` üzerinde mutasyona uğrar. Yalnızca KAPANMIŞ barlarda çağır.
-//
-// KONSERVATİF BAR-İÇİ KURAL: bir mumun içinde high/low sırası bilinmez. AYNI mumda
-// hem yeni ekstrem hem ters sapma oluşursa, o ekstremi kullanan onay O BARDA
-// VERİLMEZ (normal modda 'else' dalı; bootstrap'ta 'not newHigh'/'not newLow').
 f_engine_step(Engine e, float k, int minBars, float atr) =>
     Pivot result = na
 
@@ -298,556 +202,90 @@ f_engine_step(Engine e, float k, int minBars, float atr) =>
     result
 
 // =============================================================================
-// M2 · Market Structure (yalnızca MAIN onaylı pivotlarından)
+// Motor örneği + confirmed pivot ring buffer (KORUNAN ALTYAPI, çizilmez)
 // =============================================================================
-
-f_structure_new() =>
-    Structure.new(haveHigh = false, haveLow = false,
-         lastHigh = na, lastHighIdx = na, lastLow = na, lastLowIdx = na,
-         highClass = 0, lowClass = 0, trend = 0, lastChangeConfIdx = na)
-
-// Yeni bir onaylı MAIN pivotu yapıya işler ve o pivota bir etiket döndürür:
-//   TEPE: "HH"/"LH"/"EQH"/"H1"      DİP: "HL"/"LL"/"EQL"/"L1"
-// Trend her güncellemede highClass+lowClass bileşiminden türetilir. Trend
-// DEĞİŞTİYSE, değişimi tetikleyen pivotun confIdx'i saklanır.
-// (Bu fonksiyon yalnızca yeni MAIN pivot onaylandığında çağrılır -> trend
-//  değişimi de yalnızca o anda oluşur.)
-f_structure_update(Structure s, Pivot p) =>
-    string tag = na
-
-    if p.kind == 1
-        if not s.haveHigh
-            tag         := "H1"
-            s.highClass := 0
-        else if p.price > s.lastHigh
-            tag         := "HH"
-            s.highClass := 1
-        else if p.price < s.lastHigh
-            tag         := "LH"
-            s.highClass := -1
-        else
-            tag         := "EQH"
-            s.highClass := 0
-        s.lastHigh    := p.price
-        s.lastHighIdx := p.bidx
-        s.haveHigh    := true
-    else
-        if not s.haveLow
-            tag        := "L1"
-            s.lowClass := 0
-        else if p.price > s.lastLow
-            tag        := "HL"
-            s.lowClass := 1
-        else if p.price < s.lastLow
-            tag        := "LL"
-            s.lowClass := -1
-        else
-            tag        := "EQL"
-            s.lowClass := 0
-        s.lastLow    := p.price
-        s.lastLowIdx := p.bidx
-        s.haveLow    := true
-
-    // Trend: UP ancak HH+HL; DOWN ancak LH+LL; aksi RANGE.
-    int  oldTrend = s.trend
-    bool up       = s.highClass == 1  and s.lowClass == 1
-    bool down     = s.highClass == -1 and s.lowClass == -1
-    int  newTrend = up ? 1 : down ? -1 : 0
-    if newTrend != oldTrend
-        s.lastChangeConfIdx := p.confIdx
-    s.trend := newTrend
-    tag
-
-// --- Görsel/tablo yardımcıları (algoritma dışı) ------------------------------
-f_trend_str(int tr) =>
-    tr == 1 ? "UP" : tr == -1 ? "DOWN" : "RANGE"
-
-f_trend_color(int tr) =>
-    tr == 1 ? color.new(color.green, 0) : tr == -1 ? color.new(color.red, 0) : color.new(color.gray, 0)
-
-f_tag_color(string tag) =>
-    bool bull = tag == "HH" or tag == "HL"
-    bool bear = tag == "LH" or tag == "LL"
-    bull ? color.new(color.green, 45) : bear ? color.new(color.red, 45) : color.new(color.gray, 60)
-
-f_engine_dir_str(Engine e) =>
-    e.booted ? (e.dir == 1 ? "tepe arıyor" : "dip arıyor") : "bootstrap"
-
-// =============================================================================
-// M3 · XABCD Builder (yalnızca onaylanmış MAIN pivotlarından)
-// -----------------------------------------------------------------------------
-// Son 5 ardışık MAIN pivotunu X-A-B-C-D olarak alır (D = en yeni onaylı pivot).
-// YALNIZCA yapısal bilgi üretir: pivot alternansı, kronolojik sıra, yön ve leg
-// uzunlukları; ayrıca 5-pivot dizisinin geçerliliği. Harmonik desen adı, Fibonacci
-// uygunluğu, entry/exit veya alarm YOKTUR (bunlar M4+ modüllerine aittir).
-// =============================================================================
-f_build_xabcd(array<Pivot> buf) =>
-    Xabcd res = na
-    int n = array.size(buf)
-    if n >= 5
-        Pivot X = array.get(buf, n - 5)
-        Pivot A = array.get(buf, n - 4)
-        Pivot B = array.get(buf, n - 3)
-        Pivot C = array.get(buf, n - 2)
-        Pivot D = array.get(buf, n - 1)
-        // Alternans: ardışık pivot türleri farklı olmalı (H,L,H,L,H veya L,H,L,H,L).
-        bool alt = X.kind != A.kind and A.kind != B.kind and B.kind != C.kind and C.kind != D.kind
-        // Kronolojik sıra: bidx kesin artan olmalı.
-        bool chrono = X.bidx < A.bidx and A.bidx < B.bidx and B.bidx < C.bidx and C.bidx < D.bidx
-        bool ok   = alt and chrono
-        bool bull = D.kind == -1     // D bir DİP ise bullish tamamlanma yönelimi
-        res := Xabcd.new(X, A, B, C, D, ok, bull, bull ? 1 : -1,
-             math.abs(A.price - X.price), math.abs(B.price - A.price),
-             math.abs(C.price - B.price), math.abs(D.price - C.price),
-             A.bidx - X.bidx, B.bidx - A.bidx, C.bidx - B.bidx, D.bidx - C.bidx)
-    res
-
-// =============================================================================
-// M2S · MTF Structure Summary (çok-zaman-dilimli yapı özeti)
-// -----------------------------------------------------------------------------
-// Seçilebilir TF'lerde M1+M2'yi request.security ile çalıştırır ve tek özet
-// tabloda toplar. REPAINT YOK ve REALTIME-GÜVENLİ:
-//   - request.security tarafında  lookahead = barmerge.lookahead_off,
-//   - motor YALNIZCA onaylanmış (kapanmış) HTF barında ilerler
-//     (if barstate.isconfirmed) — forming (kapanmamış) HTF barı HİÇ işlenmez.
-//     Bu, "[1] onaylı-bar" garantisidir: canlı barda motor çalışmaz, dönen değer
-//     son KAPANMIŞ HTF barına aittir. (Önceki sürüm forming barı işliyordu; bu,
-//     canlı barda runtime hatasına yol açıp tüm tabloların iptaline neden oluyordu.)
-// Yalnızca özet/görsel üretir; entry/exit/alarm veya dış filtre YOK. M1/M2
-// mantığı DEĞİŞMEDEN, aynı fonksiyonlarla her TF bağlamında çalışır.
-// =============================================================================
-
-// Yapı etiketini int'e kodla (request.security tuple'ında string taşımamak için).
-f_tag_code(string tg) =>
-    tg == "HH" ? 1 : tg == "HL" ? 2 : tg == "LH" ? 3 : tg == "LL" ? 4 : tg == "EQH" ? 5 : tg == "EQL" ? 6 : tg == "H1" ? 7 : tg == "L1" ? 8 : 0
-
-f_tag_decode(int c) =>
-    c == 1 ? "HH" : c == 2 ? "HL" : c == 3 ? "LH" : c == 4 ? "LL" : c == 5 ? "EQH" : c == 6 ? "EQL" : c == 7 ? "H1" : c == 8 ? "L1" : "-"
-
-// HAFİF MTF çekirdeği — request.security bağlamında YALNIZCA Trend + son yapı
-// etiketini üretir. Burada line/label/table, XABCD, ring buffer, sayaç YOKTUR;
-// sadece M1 MAIN motoru + M2 yapısı çalışır. Bu fonksiyon YALNIZCA gerçekten
-// gereken satırlar için (grafik TF'inden YÜKSEK + açık) çağrılır; kapalı/LTF/
-// chart-TF satırları için hiç çağrılmaz (ağır hesap tamamen atlanır).
-// DÖNÜŞ: [trend, sonEtiketKodu] — son KAPANMIŞ HTF barına ait (repaint yok).
-f_mtf_structure_compute() =>
-    var Engine    e           = f_engine_new()
-    var Structure s           = f_structure_new()
-    var int       lastTagCode = 0
-    // Motor YALNIZCA kapanmış HTF barında ilerler (forming bar işlenmez; repaint yok).
-    if barstate.isconfirmed
-        float a  = ta.atr(atrLen)
-        Pivot np = f_engine_step(e, mainK, mainMinBars, a)
-        if not na(np)
-            lastTagCode := f_tag_code(f_structure_update(s, np))
-    [s.trend, lastTagCode]
-
-// Grafik (chart-TF) için son yapı etiketi kodunu marketStruct'tan yeniden kurar
-// (chart-TF satırında security'yi TEKRAR çalıştırmadan mevcut motoru kullanmak için).
-f_chart_last_tag_code(Structure s) =>
-    int code = 0
-    if s.haveHigh or s.haveLow
-        bool highNewer = not s.haveLow or (s.haveHigh and s.lastHighIdx >= s.lastLowIdx)
-        if highNewer
-            code := s.highClass == 1 ? 1 : s.highClass == -1 ? 3 : 5   // HH / LH / EQH
-        else
-            code := s.lowClass == 1 ? 2 : s.lowClass == -1 ? 4 : 6     // HL / LL / EQL
-    code
-
-// =============================================================================
-// Örnekleme + ring buffer + akış
-// =============================================================================
-var Engine    mainEng = f_engine_new()
-var Engine    fastEng = f_engine_new()
-var Structure marketStruct = f_structure_new()
-
-var array<Pivot> mainPivots = array.new<Pivot>()
-var array<Pivot> fastPivots = array.new<Pivot>()
-
-// M3 durumu: en son geçerli/aday XABCD + çizim tamponları.
-var Xabcd        lastXabcd = na
-var array<line>  xabLines  = array.new<line>()
-var array<label> xabLabels = array.new<label>()
-
-BUFFER_MAX = 32
-
-f_push(array<Pivot> buf, Pivot p) =>
-    array.push(buf, p)
-    if array.size(buf) > BUFFER_MAX
-        array.shift(buf)
+var Engine        pivEng = f_engine_new()
+var array<Pivot>  pivots = array.new<Pivot>()
+BUFFER_MAX = 16
 
 atr = ta.atr(atrLen)
 
-// REPAINT GÜVENLİĞİ: state yalnızca bar kapanınca ilerler.
-Pivot  mainNew = na
-Pivot  fastNew = na
-string mainTag = na
-Xabcd  xabNew  = na
+// REPAINT GÜVENLİĞİ: motor yalnızca KAPANMIŞ barda ilerler.
+Pivot newPiv = na
 if barstate.isconfirmed
-    mainNew := f_engine_step(mainEng, mainK, mainMinBars, atr)          // MAIN: her zaman
-    if enableFast
-        fastNew := f_engine_step(fastEng, fastK, fastMinBars, atr)      // FAST: yalnızca açıksa
-    if not na(mainNew)
-        f_push(mainPivots, mainNew)
-        mainTag := f_structure_update(marketStruct, mainNew)            // M2: yalnızca MAIN
-        if enableM3                                                     // M3: yalnızca açıksa + yeni D
-            xabNew := f_build_xabcd(mainPivots)
-            if not na(xabNew)
-                lastXabcd := xabNew
-    if not na(fastNew)
-        f_push(fastPivots, fastNew)
+    newPiv := f_engine_step(pivEng, pivK, pivMinBars, atr)
+    if not na(newPiv)
+        array.push(pivots, newPiv)
+        if array.size(pivots) > BUFFER_MAX
+            array.shift(pivots)
 
 // =============================================================================
-// Görsel doğrulama
-//   - MAIN zigzag + yapı etiketi (HH/HL/LH/LL) pivotun bidx barında.
-//   - FAST zigzag (taktik, etiketsiz).
-//   - Onay barında (confIdx) küçük daireler.
-// =============================================================================
-var Pivot mainLast = na
-var Pivot fastLast = na
-
-if not na(mainNew)
-    if showMainZz and not na(mainLast)
-        line.new(mainLast.bidx, mainLast.price, mainNew.bidx, mainNew.price,
-             xloc = xloc.bar_index, color = color.new(color.gray, 45), width = 1, force_overlay = true)
-    if showStructLabels
-        label.new(mainNew.bidx, mainNew.price, mainTag,
-             xloc = xloc.bar_index,
-             yloc = mainNew.kind == 1 ? yloc.abovebar : yloc.belowbar,
-             style = mainNew.kind == 1 ? label.style_label_down : label.style_label_up,
-             color = f_tag_color(mainTag), textcolor = color.new(color.white, 10), size = size.tiny, force_overlay = true)
-    mainLast := mainNew
-
-if not na(fastNew)
-    if showFastZz and not na(fastLast)
-        line.new(fastLast.bidx, fastLast.price, fastNew.bidx, fastNew.price,
-             xloc = xloc.bar_index, color = color.new(color.teal, 55),
-             width = 1, style = line.style_dashed, force_overlay = true)
-    fastLast := fastNew
-
-// --- M3: XABCD adayının çizimi -----------------------------------------------
-// Her yeni MAIN pivotunda (yeni D) önceki XABCD çizimi silinip yenisi çizilir;
-// yalnızca geçerli (alternans + kronoloji) dizi çizilir. Mevcut zigzag ile
-// karışmaması için noktalı mavi segmentler + X/A/B/C/D harf etiketleri kullanılır.
-if not na(xabNew) and xabNew.valid and showXabcdLetters
-    for ln in xabLines
-        line.delete(ln)
-    array.clear(xabLines)
-    for lb in xabLabels
-        label.delete(lb)
-    array.clear(xabLabels)
-
-    xcol = color.new(color.blue, 20)
-    array.push(xabLines, line.new(xabNew.X.bidx, xabNew.X.price, xabNew.A.bidx, xabNew.A.price, xloc = xloc.bar_index, color = xcol, width = 1, style = line.style_dotted, force_overlay = true))
-    array.push(xabLines, line.new(xabNew.A.bidx, xabNew.A.price, xabNew.B.bidx, xabNew.B.price, xloc = xloc.bar_index, color = xcol, width = 1, style = line.style_dotted, force_overlay = true))
-    array.push(xabLines, line.new(xabNew.B.bidx, xabNew.B.price, xabNew.C.bidx, xabNew.C.price, xloc = xloc.bar_index, color = xcol, width = 1, style = line.style_dotted, force_overlay = true))
-    array.push(xabLines, line.new(xabNew.C.bidx, xabNew.C.price, xabNew.D.bidx, xabNew.D.price, xloc = xloc.bar_index, color = xcol, width = 1, style = line.style_dotted, force_overlay = true))
-
-    // Dikey offset: XABCD harflerini pivotun DIŞINA it (M2 yapı etiketiyle çakışmasın).
-    lcol = color.new(color.blue, 10)
-    off  = nz(atr, 0.0) * 1.2
-    yX   = xabNew.X.price + (xabNew.X.kind == 1 ? off : -off)
-    yA   = xabNew.A.price + (xabNew.A.kind == 1 ? off : -off)
-    yB   = xabNew.B.price + (xabNew.B.kind == 1 ? off : -off)
-    yC   = xabNew.C.price + (xabNew.C.kind == 1 ? off : -off)
-    yD   = xabNew.D.price + (xabNew.D.kind == 1 ? off : -off)
-    array.push(xabLabels, label.new(xabNew.X.bidx, yX, "X", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny, force_overlay = true))
-    array.push(xabLabels, label.new(xabNew.A.bidx, yA, "A", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny, force_overlay = true))
-    array.push(xabLabels, label.new(xabNew.B.bidx, yB, "B", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny, force_overlay = true))
-    array.push(xabLabels, label.new(xabNew.C.bidx, yC, "C", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny, force_overlay = true))
-    array.push(xabLabels, label.new(xabNew.D.bidx, yD, "D", xloc = xloc.bar_index, style = label.style_label_center, color = lcol, textcolor = color.white, size = size.tiny, force_overlay = true))
-
-// Onay-barı işaretleri (strateji girişinin en erken yapılabileceği bar).
-plotshape(showConfMarkers and not na(mainNew), title = "MAIN confirmed",
-     style = shape.circle, location = location.belowbar,
-     color = color.new(color.gray, 0), size = size.tiny, force_overlay = true)
-plotshape(showConfMarkers and not na(fastNew), title = "FAST confirmed",
-     style = shape.circle, location = location.abovebar,
-     color = color.new(color.teal, 0), size = size.tiny, force_overlay = true)
-
-// =============================================================================
-// Birleşik denetim tablosu (M1 + M2)
-//   Tablo NESNESİ global scope'ta KOŞULSUZ ve `var` ile bir kez oluşturulur;
-//   böylece normal grafikte de her zaman görünür (barstate/Replay'e bağlı değil).
-//   Yalnızca HÜCRE içerikleri `if barstate.islast` içinde güncellenir.
-//   table.clear() kullanılmaz.
-//   KONUM: top_LEFT — sağ üst artık M2S özet tablosuna ayrıldı (içerik/mantık aynı).
-// =============================================================================
-var table t = table.new(position.top_left, 2, 10, border_width = 1)
-
-if barstate.islast and showM12Table
-    booted  = mainEng.booted
-    hiCls   = marketStruct.highClass == 1 ? "HH" : marketStruct.highClass == -1 ? "LH" : "EQH/-"
-    loCls   = marketStruct.lowClass == 1 ? "HL" : marketStruct.lowClass == -1 ? "LL" : "EQL/-"
-    hiStr   = marketStruct.haveHigh ? hiCls + " @ " + str.tostring(marketStruct.lastHigh, format.mintick) : "-"
-    loStr   = marketStruct.haveLow  ? loCls + " @ " + str.tostring(marketStruct.lastLow, format.mintick) : "-"
-    chgStr  = na(marketStruct.lastChangeConfIdx) ? "-" : str.tostring(marketStruct.lastChangeConfIdx)
-    cntStr  = "M:" + str.tostring(array.size(mainPivots)) + " / F:" + str.tostring(array.size(fastPivots))
-    dirStr  = f_engine_dir_str(mainEng) + " / " + f_engine_dir_str(fastEng)
-    trTxt   = booted ? f_trend_str(marketStruct.trend) : "BOOTSTRAP"
-    trBg    = booted ? f_trend_color(marketStruct.trend) : color.new(color.gray, 0)
-
-    // MAIN son pivot ayrıntısı (M1 denetimi)
-    hasM    = not na(mainLast)
-    pivStr  = hasM ? (mainLast.kind == 1 ? "TEPE" : "DİP") + " bidx " + str.tostring(mainLast.bidx) + " -> conf " + str.tostring(mainLast.confIdx) + " (gec " + str.tostring(mainLast.confIdx - mainLast.bidx) + ")" : "-"
-    thStr   = hasM ? str.tostring(mainLast.theta, format.mintick) : "-"
-
-    table.cell(t, 0, 0, "MTF · M1+M2", bgcolor = color.gray, text_color = color.white)
-    table.cell(t, 1, 0, "", bgcolor = color.gray)
-
-    table.cell(t, 0, 1, "Trend state")
-    table.cell(t, 1, 1, trTxt, bgcolor = trBg, text_color = color.white)
-
-    table.cell(t, 0, 2, "Son yapı değişimi (confIdx)")
-    table.cell(t, 1, 2, chgStr)
-
-    table.cell(t, 0, 3, "Son TEPE")
-    table.cell(t, 1, 3, hiStr)
-
-    table.cell(t, 0, 4, "Son DİP")
-    table.cell(t, 1, 4, loStr)
-
-    table.cell(t, 0, 5, "highClass / lowClass")
-    table.cell(t, 1, 5, str.tostring(marketStruct.highClass) + " / " + str.tostring(marketStruct.lowClass))
-
-    table.cell(t, 0, 6, "Pivot sayısı (M/F)")
-    table.cell(t, 1, 6, cntStr)
-
-    table.cell(t, 0, 7, "Motor yön (M/F)")
-    table.cell(t, 1, 7, dirStr)
-
-    table.cell(t, 0, 8, "MAIN son pivot")
-    table.cell(t, 1, 8, pivStr)
-
-    table.cell(t, 0, 9, "MAIN theta (sabit)")
-    table.cell(t, 1, 9, thStr)
-
-// =============================================================================
-// M3 denetim tablosu — AYRI tablo (mevcut M1+M2 tablosu DEĞİŞTİRİLMEDİ)
-//   Aynı repaint-safe desen: nesne global scope'ta bir kez, hücreler son barda.
-// =============================================================================
-var table t3 = table.new(position.bottom_right, 2, 8, border_width = 1)
-
-if barstate.islast and showM3Table
-    hasX   = not na(lastXabcd)
-    vldStr = hasX ? (lastXabcd.valid ? "EVET" : "HAYIR") : "-"
-    dirX   = hasX ? (lastXabcd.isBullish ? "BULLISH (D=dip)" : "BEARISH (D=tepe)") : "-"
-    kndStr = hasX ? (lastXabcd.X.kind == 1 ? "H" : "L") + (lastXabcd.A.kind == 1 ? "H" : "L") + (lastXabcd.B.kind == 1 ? "H" : "L") + (lastXabcd.C.kind == 1 ? "H" : "L") + (lastXabcd.D.kind == 1 ? "H" : "L") : "-"
-    seqStr = hasX ? str.tostring(lastXabcd.X.bidx) + "," + str.tostring(lastXabcd.A.bidx) + "," + str.tostring(lastXabcd.B.bidx) + "," + str.tostring(lastXabcd.C.bidx) + "," + str.tostring(lastXabcd.D.bidx) : "-"
-    lenStr = hasX ? str.tostring(lastXabcd.xaLen, format.mintick) + "/" + str.tostring(lastXabcd.abLen, format.mintick) + "/" + str.tostring(lastXabcd.bcLen, format.mintick) + "/" + str.tostring(lastXabcd.cdLen, format.mintick) : "-"
-    barStr = hasX ? str.tostring(lastXabcd.xaBars) + "/" + str.tostring(lastXabcd.abBars) + "/" + str.tostring(lastXabcd.bcBars) + "/" + str.tostring(lastXabcd.cdBars) : "-"
-    rdyStr = array.size(mainPivots) >= 5 ? "EVET (" + str.tostring(array.size(mainPivots)) + ")" : "HAYIR (" + str.tostring(array.size(mainPivots)) + ")"
-
-    table.cell(t3, 0, 0, "M3 · XABCD", bgcolor = color.new(color.blue, 0), text_color = color.white)
-    table.cell(t3, 1, 0, "", bgcolor = color.new(color.blue, 0))
-
-    table.cell(t3, 0, 1, "5-pivot hazır")
-    table.cell(t3, 1, 1, rdyStr)
-
-    table.cell(t3, 0, 2, "Geçerli dizi")
-    table.cell(t3, 1, 2, vldStr)
-
-    table.cell(t3, 0, 3, "Yön")
-    table.cell(t3, 1, 3, dirX)
-
-    table.cell(t3, 0, 4, "Pivot türleri (X..D)")
-    table.cell(t3, 1, 4, kndStr)
-
-    table.cell(t3, 0, 5, "Pivot barları (bidx)")
-    table.cell(t3, 1, 5, seqStr)
-
-    table.cell(t3, 0, 6, "Leg uzunluk XA/AB/BC/CD")
-    table.cell(t3, 1, 6, lenStr)
-
-    table.cell(t3, 0, 7, "Leg bar XA/AB/BC/CD")
-    table.cell(t3, 1, 7, barStr)
-
-// =============================================================================
-// M2S · MTF çağrıları — PERFORMANS-OPTİMİZE (repaint-safe + realtime-safe)
+// PREDICTION ENGINE — olası D seviyelerini projekte et
 // -----------------------------------------------------------------------------
-// AĞIR security motoru YALNIZCA şu satırlar için çalışır:
-//   M2S açık (enableM2S) + satır açık (enX) + TF grafikten YÜKSEK.
-// Böylece:
-//   - Grafik TF'inden DÜŞÜK satırlar (LTF)  -> security YOK, "LTF N/A".
-//   - Grafik TF'ine EŞİT satır (chart-TF)   -> security YOK, mevcut grafik
-//     motorunun (marketStruct) sonucu yeniden kullanılır (tekrar hesap yok).
-//   - Kapalı satırlar                        -> security YOK.
-// request.security koşullu (v6 dinamik istek) çağrılır -> gereksiz istek hiç
-// yapılmaz. Yüksek-TF istekleri doğası gereği AZ bar içerir (hızlı). Lightweight
-// modda calc_bars_count ile geçmiş de sınırlanır. Repaint mekaniği (lookahead_off
-// + onaylı-bar) AYNEN korunur.
+// Fibonacci oranları:
+//   XA retracement: A - r*(A-X)   |   BC extension: C - r*(C-B)
+// (Her iki formül de D'yi doğru yönde üretir; pivotlar zaten alternatiftir.)
+// Prediction yalnızca YENİ confirmed pivot (yeni C) anında BİR KEZ hesaplanır;
+// eski çizimler silinir, sadece en son aktif prediction gösterilir. Repaint yok.
 // =============================================================================
-chSec  = timeframe.in_seconds()
-tf1Sec = timeframe.in_seconds(tf1)
-tf2Sec = timeframe.in_seconds(tf2)
-tf3Sec = timeframe.in_seconds(tf3)
-tf4Sec = timeframe.in_seconds(tf4)
-tf5Sec = timeframe.in_seconds(tf5)
-tf6Sec = timeframe.in_seconds(tf6)
+var array<float> xaRatios = array.from(0.786, 0.886, 1.000, 1.130, 1.272, 1.618)
+var array<float> bcRatios = array.from(1.272, 1.414, 1.618, 2.000, 2.240, 2.618, 3.140, 3.618)
 
-tf1Low = tf1Sec < chSec
-tf2Low = tf2Sec < chSec
-tf3Low = tf3Sec < chSec
-tf4Low = tf4Sec < chSec
-tf5Low = tf5Sec < chSec
-tf6Low = tf6Sec < chSec
+var array<line>  predLines  = array.new<line>()
+var array<label> predLabels = array.new<label>()
 
-tf1Chart = tf1Sec == chSec
-tf2Chart = tf2Sec == chSec
-tf3Chart = tf3Sec == chSec
-tf4Chart = tf4Sec == chSec
-tf5Chart = tf5Sec == chSec
-tf6Chart = tf6Sec == chSec
+f_pred_clear() =>
+    if array.size(predLines) > 0
+        for ln in predLines
+            line.delete(ln)
+        array.clear(predLines)
+    if array.size(predLabels) > 0
+        for lb in predLabels
+            label.delete(lb)
+        array.clear(predLabels)
 
-run1 = enableM2S and en1 and not tf1Low and not tf1Chart
-run2 = enableM2S and en2 and not tf2Low and not tf2Chart
-run3 = enableM2S and en3 and not tf3Low and not tf3Chart
-run4 = enableM2S and en4 and not tf4Low and not tf4Chart
-run5 = enableM2S and en5 and not tf5Low and not tf5Chart
-run6 = enableM2S and en6 and not tf6Low and not tf6Chart
+// Bir pivot noktasını harf etiketiyle işaretle.
+f_mark(int bidx, float price, string txt) =>
+    label.new(bidx, price, txt, xloc = xloc.bar_index, style = label.style_label_center,
+         color = color.new(color.gray, 25), textcolor = color.white, size = size.small,
+         force_overlay = true)
 
-// Lightweight MTF: geçmişi sınırla (calc_bars_count). Kapalıysa 0 = tüm geçmiş.
-cbc = lightMTF ? mtfBars : 0
+// Bir D seviyesi için projeksiyon çizgisi + oran etiketi (C barından sağa uzanır).
+f_proj(int x1, int x2, float d, float r, color col, string suffix) =>
+    array.push(predLines, line.new(x1, d, x2, d, xloc = xloc.bar_index, color = col, width = 1, force_overlay = true))
+    array.push(predLabels, label.new(x2, d, str.tostring(r, "#.###") + " " + suffix, xloc = xloc.bar_index,
+         style = label.style_label_left, color = color.new(col, 80), textcolor = col, size = size.tiny,
+         force_overlay = true))
 
-int mTr1 = na
-int mTg1 = na
-int mTr2 = na
-int mTg2 = na
-int mTr3 = na
-int mTg3 = na
-int mTr4 = na
-int mTg4 = na
-int mTr5 = na
-int mTg5 = na
-int mTr6 = na
-int mTg6 = na
+// Yeni confirmed pivot (C) geldiğinde ve elde en az 4 pivot varsa: hesapla + çiz.
+if not na(newPiv) and array.size(pivots) >= 4
+    int n = array.size(pivots)
+    Pivot X = array.get(pivots, n - 4)
+    Pivot A = array.get(pivots, n - 3)
+    Pivot B = array.get(pivots, n - 2)
+    Pivot C = array.get(pivots, n - 1)
 
-// KOŞULLU request.security: yalnızca gerçekten gereken (run) satırlar için.
-if run1
-    [a, b] = request.security(syminfo.tickerid, tf1, f_mtf_structure_compute(), lookahead = barmerge.lookahead_off, calc_bars_count = cbc)
-    mTr1 := a
-    mTg1 := b
-if run2
-    [a, b] = request.security(syminfo.tickerid, tf2, f_mtf_structure_compute(), lookahead = barmerge.lookahead_off, calc_bars_count = cbc)
-    mTr2 := a
-    mTg2 := b
-if run3
-    [a, b] = request.security(syminfo.tickerid, tf3, f_mtf_structure_compute(), lookahead = barmerge.lookahead_off, calc_bars_count = cbc)
-    mTr3 := a
-    mTg3 := b
-if run4
-    [a, b] = request.security(syminfo.tickerid, tf4, f_mtf_structure_compute(), lookahead = barmerge.lookahead_off, calc_bars_count = cbc)
-    mTr4 := a
-    mTg4 := b
-if run5
-    [a, b] = request.security(syminfo.tickerid, tf5, f_mtf_structure_compute(), lookahead = barmerge.lookahead_off, calc_bars_count = cbc)
-    mTr5 := a
-    mTg5 := b
-if run6
-    [a, b] = request.security(syminfo.tickerid, tf6, f_mtf_structure_compute(), lookahead = barmerge.lookahead_off, calc_bars_count = cbc)
-    mTr6 := a
-    mTg6 := b
+    f_pred_clear()
 
-// chart-TF satırları için grafik motoru sonucu (security'siz yeniden kullanım).
-chTrend   = marketStruct.trend
-chTagCode = f_chart_last_tag_code(marketStruct)
+    // X A B C harfleri (yalnızca bunlar + projeksiyonlar çizilir)
+    array.push(predLabels, f_mark(X.bidx, X.price, "X"))
+    array.push(predLabels, f_mark(A.bidx, A.price, "A"))
+    array.push(predLabels, f_mark(B.bidx, B.price, "B"))
+    array.push(predLabels, f_mark(C.bidx, C.price, "C"))
 
-// =============================================================================
-// M2S · Özet TABLOSU (SAĞ ÜST) — gerçek `table` nesnesi (label DEĞİL).
-//   - table nesnesi global scope'ta KOŞULSUZ, `var` ile BİR KEZ oluşturulur;
-//     hiçbir LABEL kotasına bağlı DEĞİLDİR.
-//   - Hücreler her son barda (barstate.islast) DOĞRUDAN yeniden yazılır
-//     (table.clear() yok). Bir TF verisi na olsa bile satır ATLANMAZ; hücreye N/A.
-//   - Row 0: DATA-BAĞIMSIZ görünürlük testi (hiçbir security/pivot/trend/structure
-//     koşuluna bağlı DEĞİL) -> tablonun render olduğunu kanıtlar.
-//   Renkler: UP=yeşil/beyaz, DOWN=kırmızı/beyaz, RANGE=turuncu/koyu;
-//            HH-HL yeşil ton, LH-LL kırmızı ton; N/A & LTF N/A gri;
-//            Consensus Bullish=yeşil, Bearish=kırmızı, Mixed=turuncu.
-// =============================================================================
-var table m2sTable = table.new(position.top_right, 3, 9, frame_width = 1, border_width = 1, frame_color = color.gray, border_color = color.new(color.gray, 60))
+    float xaDelta = A.price - X.price
+    float bcDelta = C.price - B.price
+    int   x1 = C.bidx
+    int   x2 = C.bidx + projLen
 
-if barstate.islast
-    // (6) DATA-BAĞIMSIZ görünürlük testi — hiçbir koşula bağlı değil.
-    table.cell(m2sTable, 0, 0, "M2S",            bgcolor = color.new(color.blue, 0), text_color = color.white)
-    table.cell(m2sTable, 1, 0, timeframe.period, bgcolor = color.new(color.blue, 0), text_color = color.white)
-    table.cell(m2sTable, 2, 0, "VISIBLE",        bgcolor = color.new(color.blue, 0), text_color = color.white)
+    // XA retracement tabanlı olası D seviyeleri
+    for i = 0 to array.size(xaRatios) - 1
+        float r = array.get(xaRatios, i)
+        float d = A.price - r * xaDelta
+        f_proj(x1, x2, d, r, colXA, "XA")
 
-    // Sütun başlıkları.
-    table.cell(m2sTable, 0, 1, "TF",     bgcolor = color.new(color.gray, 20), text_color = color.white)
-    table.cell(m2sTable, 1, 1, "Trend",  bgcolor = color.new(color.gray, 20), text_color = color.white)
-    table.cell(m2sTable, 2, 1, "Struct", bgcolor = color.new(color.gray, 20), text_color = color.white)
-
-    tfs    = array.from(tf1, tf2, tf3, tf4, tf5, tf6)
-    ens    = array.from(en1, en2, en3, en4, en5, en6)
-    lows   = array.from(tf1Low, tf2Low, tf3Low, tf4Low, tf5Low, tf6Low)
-    charts = array.from(tf1Chart, tf2Chart, tf3Chart, tf4Chart, tf5Chart, tf6Chart)
-    trs    = array.from(mTr1, mTr2, mTr3, mTr4, mTr5, mTr6)
-    tgs    = array.from(mTg1, mTg2, mTg3, mTg4, mTg5, mTg6)
-
-    int upCnt = 0
-    int dnCnt = 0
-
-    for i = 0 to 5
-        int    row     = i + 2
-        tfLbl          = array.get(tfs, i)
-        bool   en      = array.get(ens, i)
-        bool   lo      = array.get(lows, i)
-        bool   ch      = array.get(charts, i)
-        int    rowTr   = na
-        int    rowSg   = na
-        string trTxt   = ""
-        string sgTxt   = ""
-        bool   special = false
-        if not en
-            trTxt := "off"
-            sgTxt := "-"
-            special := true
-        else if lo
-            trTxt := "LTF N/A"
-            sgTxt := "-"
-            special := true
-        else if ch
-            rowTr := chTrend
-            rowSg := chTagCode
-            trTxt := f_trend_str(chTrend)
-            sgTxt := f_tag_decode(chTagCode)
-        else if not enableM2S
-            trTxt := "M2S off"
-            sgTxt := "-"
-            special := true
-        else
-            trv = array.get(trs, i)
-            tgv = array.get(tgs, i)
-            if na(trv)
-                trTxt := "N/A"
-                special := true
-            else
-                rowTr := trv
-                trTxt := f_trend_str(trv)
-            if na(tgv)
-                sgTxt := "N/A"
-            else
-                rowSg := tgv
-                sgTxt := f_tag_decode(tgv)
-
-        if not na(rowTr)
-            if rowTr == 1
-                upCnt += 1
-            else if rowTr == -1
-                dnCnt += 1
-
-        color trBg = special or na(rowTr) ? color.new(color.gray, 45) : rowTr == 1 ? color.new(color.green, 0) : rowTr == -1 ? color.new(color.red, 0) : color.new(color.orange, 15)
-        color trTx = (not special and not na(rowTr) and rowTr == 0) ? color.black : color.white
-        color sgBg = na(rowSg) ? color.new(color.gray, 45) : (rowSg == 1 or rowSg == 2) ? color.new(color.green, 35) : (rowSg == 3 or rowSg == 4) ? color.new(color.red, 35) : color.new(color.gray, 50)
-
-        table.cell(m2sTable, 0, row, tfLbl, bgcolor = color.new(color.black, 25), text_color = color.white)
-        table.cell(m2sTable, 1, row, trTxt, bgcolor = trBg, text_color = trTx)
-        table.cell(m2sTable, 2, row, sgTxt, bgcolor = sgBg, text_color = color.white)
-
-    // (5) Consensus satırı — açık & gerçek trend'i olan satırların oydaşması.
-    string consTxt = (upCnt > 0 and dnCnt == 0) ? "Bullish" : (dnCnt > 0 and upCnt == 0) ? "Bearish" : (upCnt == 0 and dnCnt == 0) ? "-" : "Mixed"
-    color  consBg  = consTxt == "Bullish" ? color.new(color.green, 0) : consTxt == "Bearish" ? color.new(color.red, 0) : consTxt == "Mixed" ? color.new(color.orange, 0) : color.new(color.gray, 45)
-    color  consTx  = consTxt == "Mixed" ? color.black : color.white
-    table.cell(m2sTable, 0, 8, "Cons.", bgcolor = color.new(color.gray, 10), text_color = color.white)
-    table.cell(m2sTable, 1, 8, consTxt, bgcolor = consBg, text_color = consTx)
-    table.cell(m2sTable, 2, 8, "U" + str.tostring(upCnt) + " D" + str.tostring(dnCnt), bgcolor = color.new(color.gray, 10), text_color = color.white)
+    // BC extension tabanlı olası D seviyeleri
+    for i = 0 to array.size(bcRatios) - 1
+        float r = array.get(bcRatios, i)
+        float d = C.price - r * bcDelta
+        f_proj(x1, x2, d, r, colBC, "BC")
