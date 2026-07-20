@@ -130,6 +130,15 @@ showM2sTable     = input.bool(true,  "Show M2S Summary Table",    group = grpDis
 showM3Table      = input.bool(false, "Show M3 Detail Table",      group = grpDisp)
 showConfMarkers  = input.bool(false, "Show Confirmation Markers", group = grpDisp)
 
+// --- Performance Diagnostics: HESAP katmanlarını GERÇEKTEN devre dışı bırakır ---
+// (Display'den farklı: bunlar çizimi değil, hesabı kapatır.)
+grpPerf     = "Performance Diagnostics"
+enableM2S   = input.bool(true,  "Enable M2S Calculations", group = grpPerf)
+enableM3    = input.bool(true,  "Enable M3 Calculations",  group = grpPerf)
+enableFast  = input.bool(false, "Enable FAST Engine",      group = grpPerf)
+lightMTF    = input.bool(true,  "Lightweight MTF Mode",    group = grpPerf)
+mtfBars     = input.int(1500, "  Lightweight MTF: max geçmiş bar (calc_bars_count)", minval = 200, maxval = 20000, group = grpPerf)
+
 // M2S · MTF Structure Summary — seçilebilir zaman dilimleri (varsayılan M1..D1).
 grpMtf   = "M2S · MTF Structure Summary"
 en1 = input.bool(true, "", inline = "mtf1", group = grpMtf)
@@ -422,23 +431,35 @@ f_tag_code(string tg) =>
 f_tag_decode(int c) =>
     c == 1 ? "HH" : c == 2 ? "HL" : c == 3 ? "LH" : c == 4 ? "LL" : c == 5 ? "EQH" : c == 6 ? "EQL" : c == 7 ? "H1" : c == 8 ? "L1" : "-"
 
-// request.security bağlamında (hedef TF) M1+M2'yi çalıştırır.
-// DÖNÜŞ: [trend, sonEtiketKodu, sonPivotZamanı] — hepsi son KAPANMIŞ HTF barına
-// ait. var state, security bağlamında TF başına ayrı yaşar.
-f_tf_compute() =>
+// HAFİF MTF çekirdeği — request.security bağlamında YALNIZCA Trend + son yapı
+// etiketini üretir. Burada line/label/table, XABCD, ring buffer, sayaç YOKTUR;
+// sadece M1 MAIN motoru + M2 yapısı çalışır. Bu fonksiyon YALNIZCA gerçekten
+// gereken satırlar için (grafik TF'inden YÜKSEK + açık) çağrılır; kapalı/LTF/
+// chart-TF satırları için hiç çağrılmaz (ağır hesap tamamen atlanır).
+// DÖNÜŞ: [trend, sonEtiketKodu] — son KAPANMIŞ HTF barına ait (repaint yok).
+f_mtf_structure_compute() =>
     var Engine    e           = f_engine_new()
     var Structure s           = f_structure_new()
     var int       lastTagCode = 0
-    var int       lastPivotT  = na
-    // Motor YALNIZCA kapanmış HTF barında ilerler -> forming bar işlenmez
-    // (realtime runtime hatası engellenir; repaint yok).
+    // Motor YALNIZCA kapanmış HTF barında ilerler (forming bar işlenmez; repaint yok).
     if barstate.isconfirmed
         float a  = ta.atr(atrLen)
         Pivot np = f_engine_step(e, mainK, mainMinBars, a)
         if not na(np)
             lastTagCode := f_tag_code(f_structure_update(s, np))
-            lastPivotT  := np.ptime
-    [s.trend, lastTagCode, lastPivotT]
+    [s.trend, lastTagCode]
+
+// Grafik (chart-TF) için son yapı etiketi kodunu marketStruct'tan yeniden kurar
+// (chart-TF satırında security'yi TEKRAR çalıştırmadan mevcut motoru kullanmak için).
+f_chart_last_tag_code(Structure s) =>
+    int code = 0
+    if s.haveHigh or s.haveLow
+        bool highNewer = not s.haveLow or (s.haveHigh and s.lastHighIdx >= s.lastLowIdx)
+        if highNewer
+            code := s.highClass == 1 ? 1 : s.highClass == -1 ? 3 : 5   // HH / LH / EQH
+        else
+            code := s.lowClass == 1 ? 2 : s.lowClass == -1 ? 4 : 6     // HL / LL / EQL
+    code
 
 // =============================================================================
 // Örnekleme + ring buffer + akış
@@ -470,14 +491,16 @@ Pivot  fastNew = na
 string mainTag = na
 Xabcd  xabNew  = na
 if barstate.isconfirmed
-    mainNew := f_engine_step(mainEng, mainK, mainMinBars, atr)
-    fastNew := f_engine_step(fastEng, fastK, fastMinBars, atr)
+    mainNew := f_engine_step(mainEng, mainK, mainMinBars, atr)          // MAIN: her zaman
+    if enableFast
+        fastNew := f_engine_step(fastEng, fastK, fastMinBars, atr)      // FAST: yalnızca açıksa
     if not na(mainNew)
         f_push(mainPivots, mainNew)
-        mainTag := f_structure_update(marketStruct, mainNew)   // M2: yalnızca MAIN
-        xabNew  := f_build_xabcd(mainPivots)                    // M3: yalnızca MAIN, yeni D geldiğinde
-        if not na(xabNew)
-            lastXabcd := xabNew
+        mainTag := f_structure_update(marketStruct, mainNew)            // M2: yalnızca MAIN
+        if enableM3                                                     // M3: yalnızca açıksa + yeni D
+            xabNew := f_build_xabcd(mainPivots)
+            if not na(xabNew)
+                lastXabcd := xabNew
     if not na(fastNew)
         f_push(fastPivots, fastNew)
 
@@ -647,40 +670,94 @@ if barstate.islast and showM3Table
     table.cell(t3, 1, 7, barStr)
 
 // =============================================================================
-// M2S · MTF çağrıları — her TF için M1+M2 sonucu (repaint-safe + realtime-safe)
+// M2S · MTF çağrıları — PERFORMANS-OPTİMİZE (repaint-safe + realtime-safe)
 // -----------------------------------------------------------------------------
-// KÖK NEDEN DÜZELTMESİ: request.security ile grafik TF'inden DÜŞÜK bir TF istemek,
-// yüksek-TF grafiklerde (30m/1h/4h/1D) grafik barı başına çok sayıda intrabar
-// üzerinden stateful motoru çalıştırır -> hesap limiti aşılır -> RUNTIME HATASI ->
-// o barın TÜM çıktısı (tüm tablolar) iptal olur. Çözüm: grafik TF'inden DÜŞÜK olan
-// TF'ler için security ÇAĞRILMAZ; o satır "LTF N/A" gösterilir (talep #7).
-// request.security'nin repaint mekaniği (lookahead_off + onaylı-bar) AYNEN korunur;
-// yalnızca düşük-TF çağrıları atlanır.
+// AĞIR security motoru YALNIZCA şu satırlar için çalışır:
+//   M2S açık (enableM2S) + satır açık (enX) + TF grafikten YÜKSEK.
+// Böylece:
+//   - Grafik TF'inden DÜŞÜK satırlar (LTF)  -> security YOK, "LTF N/A".
+//   - Grafik TF'ine EŞİT satır (chart-TF)   -> security YOK, mevcut grafik
+//     motorunun (marketStruct) sonucu yeniden kullanılır (tekrar hesap yok).
+//   - Kapalı satırlar                        -> security YOK.
+// request.security koşullu (v6 dinamik istek) çağrılır -> gereksiz istek hiç
+// yapılmaz. Yüksek-TF istekleri doğası gereği AZ bar içerir (hızlı). Lightweight
+// modda calc_bars_count ile geçmiş de sınırlanır. Repaint mekaniği (lookahead_off
+// + onaylı-bar) AYNEN korunur.
 // =============================================================================
 chSec  = timeframe.in_seconds()
-tf1Low = timeframe.in_seconds(tf1) < chSec
-tf2Low = timeframe.in_seconds(tf2) < chSec
-tf3Low = timeframe.in_seconds(tf3) < chSec
-tf4Low = timeframe.in_seconds(tf4) < chSec
-tf5Low = timeframe.in_seconds(tf5) < chSec
-tf6Low = timeframe.in_seconds(tf6) < chSec
+tf1Sec = timeframe.in_seconds(tf1)
+tf2Sec = timeframe.in_seconds(tf2)
+tf3Sec = timeframe.in_seconds(tf3)
+tf4Sec = timeframe.in_seconds(tf4)
+tf5Sec = timeframe.in_seconds(tf5)
+tf6Sec = timeframe.in_seconds(tf6)
 
-// Düşük-TF'i grafik TF'ine SABİTLE: request hep >= grafik TF olur -> intrabar
-// patlaması ve timeout yok. Bu satırların sonucu tabloda "LTF N/A" gösterilir,
-// KULLANILMAZ. request.security global scope'ta, koşulsuz kalır (6 çağrı << 40).
-et1 = tf1Low ? timeframe.period : tf1
-et2 = tf2Low ? timeframe.period : tf2
-et3 = tf3Low ? timeframe.period : tf3
-et4 = tf4Low ? timeframe.period : tf4
-et5 = tf5Low ? timeframe.period : tf5
-et6 = tf6Low ? timeframe.period : tf6
+tf1Low = tf1Sec < chSec
+tf2Low = tf2Sec < chSec
+tf3Low = tf3Sec < chSec
+tf4Low = tf4Sec < chSec
+tf5Low = tf5Sec < chSec
+tf6Low = tf6Sec < chSec
 
-[mTr1, mTg1, mPt1] = request.security(syminfo.tickerid, et1, f_tf_compute(), lookahead = barmerge.lookahead_off)
-[mTr2, mTg2, mPt2] = request.security(syminfo.tickerid, et2, f_tf_compute(), lookahead = barmerge.lookahead_off)
-[mTr3, mTg3, mPt3] = request.security(syminfo.tickerid, et3, f_tf_compute(), lookahead = barmerge.lookahead_off)
-[mTr4, mTg4, mPt4] = request.security(syminfo.tickerid, et4, f_tf_compute(), lookahead = barmerge.lookahead_off)
-[mTr5, mTg5, mPt5] = request.security(syminfo.tickerid, et5, f_tf_compute(), lookahead = barmerge.lookahead_off)
-[mTr6, mTg6, mPt6] = request.security(syminfo.tickerid, et6, f_tf_compute(), lookahead = barmerge.lookahead_off)
+tf1Chart = tf1Sec == chSec
+tf2Chart = tf2Sec == chSec
+tf3Chart = tf3Sec == chSec
+tf4Chart = tf4Sec == chSec
+tf5Chart = tf5Sec == chSec
+tf6Chart = tf6Sec == chSec
+
+run1 = enableM2S and en1 and not tf1Low and not tf1Chart
+run2 = enableM2S and en2 and not tf2Low and not tf2Chart
+run3 = enableM2S and en3 and not tf3Low and not tf3Chart
+run4 = enableM2S and en4 and not tf4Low and not tf4Chart
+run5 = enableM2S and en5 and not tf5Low and not tf5Chart
+run6 = enableM2S and en6 and not tf6Low and not tf6Chart
+
+// Lightweight MTF: geçmişi sınırla (calc_bars_count). Kapalıysa 0 = tüm geçmiş.
+cbc = lightMTF ? mtfBars : 0
+
+int mTr1 = na
+int mTg1 = na
+int mTr2 = na
+int mTg2 = na
+int mTr3 = na
+int mTg3 = na
+int mTr4 = na
+int mTg4 = na
+int mTr5 = na
+int mTg5 = na
+int mTr6 = na
+int mTg6 = na
+
+// KOŞULLU request.security: yalnızca gerçekten gereken (run) satırlar için.
+if run1
+    [a, b] = request.security(syminfo.tickerid, tf1, f_mtf_structure_compute(), lookahead = barmerge.lookahead_off, calc_bars_count = cbc)
+    mTr1 := a
+    mTg1 := b
+if run2
+    [a, b] = request.security(syminfo.tickerid, tf2, f_mtf_structure_compute(), lookahead = barmerge.lookahead_off, calc_bars_count = cbc)
+    mTr2 := a
+    mTg2 := b
+if run3
+    [a, b] = request.security(syminfo.tickerid, tf3, f_mtf_structure_compute(), lookahead = barmerge.lookahead_off, calc_bars_count = cbc)
+    mTr3 := a
+    mTg3 := b
+if run4
+    [a, b] = request.security(syminfo.tickerid, tf4, f_mtf_structure_compute(), lookahead = barmerge.lookahead_off, calc_bars_count = cbc)
+    mTr4 := a
+    mTg4 := b
+if run5
+    [a, b] = request.security(syminfo.tickerid, tf5, f_mtf_structure_compute(), lookahead = barmerge.lookahead_off, calc_bars_count = cbc)
+    mTr5 := a
+    mTg5 := b
+if run6
+    [a, b] = request.security(syminfo.tickerid, tf6, f_mtf_structure_compute(), lookahead = barmerge.lookahead_off, calc_bars_count = cbc)
+    mTr6 := a
+    mTg6 := b
+
+// chart-TF satırları için grafik motoru sonucu (security'siz yeniden kullanım).
+chTrend   = marketStruct.trend
+chTagCode = f_chart_last_tag_code(marketStruct)
 
 // =============================================================================
 // M2S · Kompakt özet tablosu (SAĞ ÜST) — sütunlar: TF | Trend | Structure
@@ -698,22 +775,34 @@ var label m2sPanel = na
 if barstate.islast and showM2sTable
     label.delete(m2sPanel)
 
-    tfs  = array.from(tf1, tf2, tf3, tf4, tf5, tf6)
-    ens  = array.from(en1, en2, en3, en4, en5, en6)
-    lows = array.from(tf1Low, tf2Low, tf3Low, tf4Low, tf5Low, tf6Low)
-    trs  = array.from(mTr1, mTr2, mTr3, mTr4, mTr5, mTr6)
-    tgs  = array.from(mTg1, mTg2, mTg3, mTg4, mTg5, mTg6)
+    tfs    = array.from(tf1, tf2, tf3, tf4, tf5, tf6)
+    ens    = array.from(en1, en2, en3, en4, en5, en6)
+    lows   = array.from(tf1Low, tf2Low, tf3Low, tf4Low, tf5Low, tf6Low)
+    charts = array.from(tf1Chart, tf2Chart, tf3Chart, tf4Chart, tf5Chart, tf6Chart)
+    trs    = array.from(mTr1, mTr2, mTr3, mTr4, mTr5, mTr6)
+    tgs    = array.from(mTg1, mTg2, mTg3, mTg4, mTg5, mTg6)
 
-    string txt = "M2S · MTF Structure Summary\n" + f_pad("TF", 7) + f_pad("Trend", 8) + "Structure"
+    string hdr = enableM2S ? "M2S · MTF Structure Summary" : "M2S · MTF (calc OFF)"
+    string txt = hdr + "\n" + f_pad("TF", 7) + f_pad("Trend", 8) + "Structure"
     for i = 0 to 5
-        tfLbl = array.get(tfs, i)
+        tfLbl   = array.get(tfs, i)
+        bool en = array.get(ens, i)
+        bool lo = array.get(lows, i)
+        bool ch = array.get(charts, i)
         string trTxt = ""
         string sgTxt = ""
-        if not array.get(ens, i)
+        if not en
             trTxt := "off"
             sgTxt := "-"
-        else if array.get(lows, i)
+        else if lo
             trTxt := "LTF N/A"
+            sgTxt := "-"
+        else if ch
+            // chart-TF: grafik motorundan yeniden kullan (security yok)
+            trTxt := f_trend_str(chTrend)
+            sgTxt := f_tag_decode(chTagCode)
+        else if not enableM2S
+            trTxt := "M2S off"
             sgTxt := "-"
         else
             trv = array.get(trs, i)
