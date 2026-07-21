@@ -1,19 +1,20 @@
 //@version=6
 // =============================================================================
-// HARMONIC PREDICTION ENGINE — olası D bölgesini kümelenmiş TEK hedef olarak gösterir
+// HARMONIC PREDICTION ENGINE — Cluster/Confluence Engine ile "Most Probable D Target"
 // -----------------------------------------------------------------------------
-// Amaç: son confirmed X-A-B-C yapısından, D HENÜZ OLUŞMADAN, olası D fiyatlarını
-// Fibonacci ile hesapla; ham seviyeleri ÇİZME. Bunun yerine birbirine yakın
-// seviyeleri fiyat toleransına göre KÜMELENDİR ve en güçlü kümeyi
-// "Most Probable D Target" olarak TEK KUTU halinde göster (Primary; opsiyonel
-// Secondary). Varsayılan yalnızca Primary.
+// Mimari korunur: repaint-safe pivot motoru, confirmed pivot mantığı, Historical
+// Predictions, XABC doğrulaması ve projection hesapları AYNEN. Ham Fibonacci
+// projection'ları KULLANICIYA ÇİZİLMEZ. Bunun yerine tüm XA/BC seviyeleri içeride
+// hesaplanır, fiyat yakınlığına göre KÜMELENİR, ağırlıklı skorlanır ve en olası D
+// bölgesi TEK KUTU (Primary; opsiyonel Secondary) olarak gösterilir.
+//
+// ÖNEMLİ: Bu hedef bir TRADE SİNYALİ DEĞİLDİR; yalnızca D'nin oluşmasının en olası
+//   fiyat bölgesidir. Fiyat bölgeyi geçebilir/trend sürebilir — bu başarısızlık
+//   değildir. Entry/exit/stop/TP/strategy bu modülün DIŞINDADIR.
 //
 // GRAFİKTE YALNIZCA: X/A/B/C harfleri + Primary (ve istenirse Secondary) D Target
-//   kutusu. Ham XA/BC çizgileri, tablo, trend, HH/HL, zigzag, debug, pattern adı YOK.
-//
-// KORUNAN ALTYAPI (çizilmez): repaint-safe "Dual-Tracker Confirmed Deviation
-//   ZigZag" pivot motoru + Pivot veri yapısı + ring buffer + yalnızca
-//   barstate.isconfirmed içinde state ilerletme. request.security / lookahead YOK.
+//   kutusu. Ham çizgi, tablo, trend, HH/HL, zigzag, debug, pattern adı YOK.
+//   request.security / lookahead YOK.
 // =============================================================================
 
 indicator("Harmonic Prediction Engine", overlay = true, max_labels_count = 200, max_boxes_count = 100)
@@ -25,11 +26,12 @@ atrLen      = input.int(14,  "ATR uzunluğu",              minval = 1, group = "
 pivK        = input.float(3.0, "Pivot sapma eşiği (× ATR)", minval = 0.1, step = 0.1, group = "Pivot Engine")
 pivMinBars  = input.int(8,     "Pivot minimum bar",         minval = 1, group = "Pivot Engine")
 
-grpPred     = "Prediction"
+grpPred     = "Prediction / Cluster"
 projLen     = input.int(50, "Kutu uzunluğu (bar)",        minval = 5, group = grpPred)
 histMode    = input.string("Latest only", "Historical predictions", options = ["Latest only", "Keep last 5", "Keep last 10"], group = grpPred)
 clusterTol  = input.float(0.5, "Küme toleransı (× ATR)",  minval = 0.05, step = 0.05, group = grpPred)
 showSecond  = input.bool(false, "Secondary D Target göster", group = grpPred)
+showSources = input.bool(false, "Kutuda kaynakları göster (XA/BC ratio)", group = grpPred)
 colPrimary  = input.color(color.new(color.lime,   0), "Primary kutu rengi",   group = grpPred)
 colSecond   = input.color(color.new(color.orange, 0), "Secondary kutu rengi", group = grpPred)
 
@@ -66,6 +68,12 @@ type Engine
     int   oppIdx
     int   oppTime
     float oppTheta
+
+// Tek bir ham projeksiyon seviyesi. src: 0 = XA, 1 = BC.
+type Proj
+    float price
+    int   src
+    float ratio
 
 // Bir prediction grubunun çizim nesneleri (grup bazlı silme için).
 type PredGroup
@@ -213,7 +221,7 @@ f_engine_step(Engine e, float k, int minBars, float atr) =>
     result
 
 // =============================================================================
-// Prediction yardımcıları
+// Prediction / Cluster yardımcıları
 // =============================================================================
 
 // XABC geçerlilik kontrolü (oranlar GRAFİKTE gösterilmez; yalnızca filtre).
@@ -232,35 +240,66 @@ f_xabc_valid(Pivot X, Pivot A, Pivot B, Pivot C) =>
         ratios := abXa >= abXaMin and abXa <= abXaMax and bcAb >= bcAbMin and bcAb <= bcAbMax
     chrono and alt and form and legs and ratios
 
-// En güçlü kümeyi bulur: her aday merkez için tol içindeki üye sayısını sayar;
-// en çok üyeli (eşitlikte en dar aralıklı) kümeyi döndürür. `used`=true olanlar
-// (önceki kümeye ait) atlanır. DÖNÜŞ: [merkezIndex, üyeSayısı, altFiyat, üstFiyat].
-f_cluster(array<float> dvals, array<bool> used, float tol) =>
+// En YÜKSEK SKORLU kümeyi bulur (used=true olanlar hariç). Skor = ağırlıklı:
+//   + farklı ratio sayısı (aynı ratio tekrarına ekstra yok)
+//   + XA ve BC birlikte varsa mix bonusu (+2)  (yalnız-BC / yalnız-XA daha düşük)
+//   + sıkılık bonusu: 2*(1 - spread/tol)  (üyeler ne kadar yakınsa o kadar yüksek)
+// DÖNÜŞ: [merkezIndex, skor, altFiyat, üstFiyat].
+f_best_cluster(array<Proj> projs, array<bool> used, float tol) =>
+    int   nD = array.size(projs)
     int   bestIdx = -1
-    int   bestCnt = 0
-    float bestLo  = na
-    float bestHi  = na
-    int   nD = array.size(dvals)
+    float bestScore = -1.0
+    float bestLo = na
+    float bestHi = na
     for i = 0 to nD - 1
         if not array.get(used, i)
-            float center = array.get(dvals, i)
-            int   cnt = 0
-            float lo  = na
-            float hi  = na
+            float center = array.get(projs, i).price
+            float lo = na
+            float hi = na
+            bool  hasXA = false
+            bool  hasBC = false
+            int   distinct = 0
             for j = 0 to nD - 1
                 if not array.get(used, j)
-                    float dj = array.get(dvals, j)
-                    if math.abs(dj - center) <= tol
-                        cnt += 1
-                        lo := na(lo) ? dj : math.min(lo, dj)
-                        hi := na(hi) ? dj : math.max(hi, dj)
-            bool better = cnt > bestCnt or (cnt == bestCnt and not na(hi) and not na(bestHi) and (hi - lo) < (bestHi - bestLo))
-            if better
-                bestIdx := i
-                bestCnt := cnt
-                bestLo  := lo
-                bestHi  := hi
-    [bestIdx, bestCnt, bestLo, bestHi]
+                    Proj pj = array.get(projs, j)
+                    if math.abs(pj.price - center) <= tol
+                        lo := na(lo) ? pj.price : math.min(lo, pj.price)
+                        hi := na(hi) ? pj.price : math.max(hi, pj.price)
+                        if pj.src == 0
+                            hasXA := true
+                        else
+                            hasBC := true
+                        bool firstOfRatio = true
+                        for k = 0 to j - 1
+                            if not array.get(used, k)
+                                Proj pk = array.get(projs, k)
+                                if math.abs(pk.price - center) <= tol and pk.ratio == pj.ratio
+                                    firstOfRatio := false
+                                    break
+                        if firstOfRatio
+                            distinct += 1
+            float spread = na(hi) ? 0.0 : hi - lo
+            float tight  = tol > 0 ? math.max(0.0, 1.0 - spread / tol) : 0.0
+            float score  = distinct + (hasXA and hasBC ? 2.0 : 0.0) + 2.0 * tight
+            if score > bestScore
+                bestIdx   := i
+                bestScore := score
+                bestLo    := lo
+                bestHi    := hi
+    [bestIdx, bestScore, bestLo, bestHi]
+
+// Merkez etrafındaki (tol içi, used olmayan) üyeleri işaretler ve kaynak metnini
+// ("XA 0.886, BC 2.240") döndürür. Skorlama sonrası kutu metni + used için tek geçiş.
+f_cluster_src_and_mark(array<Proj> projs, array<bool> used, float tol, int centerIdx) =>
+    float center = array.get(projs, centerIdx).price
+    string s = ""
+    for j = 0 to array.size(projs) - 1
+        if not array.get(used, j)
+            Proj pj = array.get(projs, j)
+            if math.abs(pj.price - center) <= tol
+                s := s + (s == "" ? "" : ", ") + (pj.src == 0 ? "XA " : "BC ") + str.tostring(pj.ratio, "#.###")
+                array.set(used, j, true)
+    s
 
 // Bir pivotu harf etiketiyle işaretler ve label'ı döndürür.
 f_mark(int bidx, float price, string txt) =>
@@ -268,14 +307,15 @@ f_mark(int bidx, float price, string txt) =>
          color = color.new(color.gray, 25), textcolor = color.white, size = size.small,
          force_overlay = true)
 
-// Bir D-target kümesini kutu olarak çizer (C barından sağa uzanır) ve gruba ekler.
-f_target_box(PredGroup g, int x1, int x2, float lo, float hi, int cnt, string title, color col, float atrv) =>
+// D-target kümesini kutu olarak çizer (C barından sağa) ve gruba ekler.
+f_target_box(PredGroup g, int x1, int x2, float lo, float hi, float score, string title, color col, float atrv, string srcText) =>
     float pad = (hi - lo) < atrv * 0.05 ? atrv * 0.20 : 0.0
-    float mid = (lo + hi) / 2.0
+    string txt = title + "\n" + str.tostring(lo, format.mintick) + " – " + str.tostring(hi, format.mintick) + "\nScore " + str.tostring(score, "#.#")
+    if showSources and str.length(srcText) > 0
+        txt := txt + "\n" + srcText
     box b = box.new(x1, hi + pad, x2, lo - pad, border_color = col, bgcolor = color.new(col, 82),
-         text = title + "  " + str.tostring(mid, format.mintick) + "  (x" + str.tostring(cnt) + ")",
-         text_color = col, text_size = size.small, text_halign = text.align_left, text_valign = text.align_center,
-         force_overlay = true)
+         text = txt, text_color = col, text_size = size.small,
+         text_halign = text.align_left, text_valign = text.align_center, force_overlay = true)
     array.push(g.boxes, b)
 
 // Bir prediction grubunun tüm nesnelerini güvenle siler.
@@ -308,12 +348,13 @@ if barstate.isconfirmed
             array.shift(pivots)
 
 // =============================================================================
-// PREDICTION ENGINE — hesapla (ham çizme) -> kümelendir -> en güçlü hedef(ler)i çiz
+// PREDICTION + CLUSTER ENGINE
 // -----------------------------------------------------------------------------
 // XA projection: D = A - r*(A-X)   |   BC projection: D = C - r*(C-B)
 // Yön filtresi: L-H-L-H (X dip) yalnızca D<C ; H-L-H-L (X tepe) yalnızca D>C.
-// Geçerli D'ler bir havuza toplanır; ham çizilmez. Fiyat toleransına göre
-// kümelenir; en güçlü küme Primary, ikincisi (opsiyonel) Secondary olarak kutu.
+// Geçerli D'ler (price, src, ratio) havuza toplanır; HAM ÇİZİLMEZ. Fiyat
+// yakınlığına göre kümelenir, ağırlıklı skorlanır; en yüksek skor Primary,
+// ikinci Secondary (opsiyonel). Kutu = küme aralığı + skor.
 // =============================================================================
 var array<float> xaRatios = array.from(0.786, 0.886, 1.000, 1.130, 1.272, 1.618)
 var array<float> bcRatios = array.from(1.272, 1.414, 1.618, 2.000, 2.240, 2.618, 3.140, 3.618)
@@ -332,54 +373,48 @@ if not na(newPiv) and array.size(pivots) >= 4
     if f_xabc_valid(X, A, B, C)
         bool wantDown = X.kind == -1   // L-H-L-H -> D aşağı ; H-L-H-L -> D yukarı
 
-        // 1) Geçerli D seviyelerini içeride topla (HAM ÇİZME).
-        array<float> dvals = array.new<float>()
+        // 1) Geçerli D seviyelerini (price, src, ratio) havuza topla (HAM ÇİZME).
+        array<Proj> projs = array.new<Proj>()
         float xaDelta = A.price - X.price
         float bcDelta = C.price - B.price
         for i = 0 to array.size(xaRatios) - 1
             float r = array.get(xaRatios, i)
             float d = A.price - r * xaDelta
             if (wantDown ? d < C.price : d > C.price)
-                array.push(dvals, d)
+                array.push(projs, Proj.new(d, 0, r))
         for i = 0 to array.size(bcRatios) - 1
             float r = array.get(bcRatios, i)
             float d = C.price - r * bcDelta
             if (wantDown ? d < C.price : d > C.price)
-                array.push(dvals, d)
+                array.push(projs, Proj.new(d, 1, r))
 
-        if array.size(dvals) > 0
-            // 2) Kümelendir.
+        if array.size(projs) > 0
             float tol = clusterTol * atr
-            array<bool> used = array.new<bool>(array.size(dvals), false)
-            [pIdx, pCnt, pLo, pHi] = f_cluster(dvals, used, tol)
+            array<bool> used = array.new<bool>(array.size(projs), false)
 
-            if pIdx >= 0 and pCnt > 0
+            // 2) Primary = en yüksek skorlu küme.
+            [pIdx, pScore, pLo, pHi] = f_best_cluster(projs, used, tol)
+            if pIdx >= 0
                 PredGroup g = PredGroup.new(array.new<label>(), array.new<box>())
                 int x1 = C.bidx
                 int x2 = C.bidx + projLen
 
-                // X A B C harfleri.
                 array.push(g.labels, f_mark(X.bidx, X.price, "X"))
                 array.push(g.labels, f_mark(A.bidx, A.price, "A"))
                 array.push(g.labels, f_mark(B.bidx, B.price, "B"))
                 array.push(g.labels, f_mark(C.bidx, C.price, "C"))
 
-                // 3) Primary D Target kutusu.
-                f_target_box(g, x1, x2, pLo, pHi, pCnt, "Primary D Target", colPrimary, atr)
+                string pSrc = f_cluster_src_and_mark(projs, used, tol, pIdx)
+                f_target_box(g, x1, x2, pLo, pHi, pScore, "Primary D Target", colPrimary, atr, pSrc)
 
-                // Primary üyelerini işaretle -> Secondary için hariç tut.
-                float pc = array.get(dvals, pIdx)
-                for j = 0 to array.size(dvals) - 1
-                    if math.abs(array.get(dvals, j) - pc) <= tol
-                        array.set(used, j, true)
-
-                // 4) Secondary D Target (opsiyonel).
+                // 3) Secondary = kalanların en yüksek skorlusu (opsiyonel).
                 if showSecond
-                    [sIdx, sCnt, sLo, sHi] = f_cluster(dvals, used, tol)
-                    if sIdx >= 0 and sCnt > 0
-                        f_target_box(g, x1, x2, sLo, sHi, sCnt, "Secondary D Target", colSecond, atr)
+                    [sIdx, sScore, sLo, sHi] = f_best_cluster(projs, used, tol)
+                    if sIdx >= 0 and sScore > 0
+                        string sSrc = f_cluster_src_and_mark(projs, used, tol, sIdx)
+                        f_target_box(g, x1, x2, sLo, sHi, sScore, "Secondary D Target", colSecond, atr, sSrc)
 
-                // 5) Grubu ekle; historical moda göre eski grupları sil.
+                // 4) Grubu ekle; historical moda göre eski grupları sil.
                 array.push(groups, g)
                 while array.size(groups) > keepCount
                     PredGroup old = array.shift(groups)
@@ -388,14 +423,15 @@ if not na(newPiv) and array.size(pivots) >= 4
 // =============================================================================
 // AÇIKLAMA
 // -----------------------------------------------------------------------------
-// XABC doğrulaması (f_xabc_valid): kronoloji + alternasyon + tam L-H-L-H/H-L-H-L
-//   biçimi + leg>0 + AB/XA ve BC/AB oran sınırları. Geçersizse hiçbir hedef çizilmez.
-// Üretim anı: yalnızca yeni confirmed pivot (yeni C) bar-close event'inde, bir kez;
-//   üretim ve çizim aynı event.
-// XA / BC formülleri: D_XA = A - r*(A-X) ; D_BC = C - r*(C-B). Yön filtresinden geçer.
-// Kümelendirme: geçerli D'ler ham çizilmez; tol = clusterTol*ATR içinde en çok üyeli
-//   küme Primary, kalanlardan en güçlüsü Secondary (opsiyonel). Kutu = küme aralığı.
+// XABC doğrulaması: kronoloji + alternasyon + tam L-H-L-H/H-L-H-L + leg>0 + AB/XA
+//   & BC/AB oran sınırları. Geçersizse hiçbir hedef çizilmez.
+// Üretim anı: yalnızca yeni confirmed pivot (yeni C) bar-close event'inde, bir kez.
+// Formüller: D_XA = A - r*(A-X) ; D_BC = C - r*(C-B). Yön filtresinden geçer.
+// Cluster skor (f_best_cluster): farklı ratio sayısı + (XA&BC mix bonusu +2) +
+//   2*(1 - spread/tol) sıkılık. Aynı ratio tekrarı ekstra puan almaz; yalnız-BC/
+//   yalnız-XA küme mix bonusu alamaz. En yüksek skor Primary, ikinci Secondary.
 // Neden repaint yok: motor yalnızca barstate.isconfirmed içinde ilerler; C onaylanınca
-//   X/A/B/C ve D fiyatları/kutu sınırları sabit; request.security/lookahead yok;
-//   historical gruplar bir daha güncellenmez, yalnızca (pruning'de) silinir.
+//   X/A/B/C ve küme sınırları/skoru sabit; request.security/lookahead yok; historical
+//   gruplar bir daha hesaplanmaz, yalnızca (pruning'de) silinir.
+// Bu hedef bir TRADE sinyali DEĞİLDİR; yalnızca D'nin en olası tamamlanma bölgesidir.
 // =============================================================================
