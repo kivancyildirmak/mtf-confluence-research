@@ -72,6 +72,7 @@ maxPerFamily   = input.int(2, "Maximum Results Per Feature Family", minval = 1, 
 showResearch   = input.bool(true, "Show Research Dashboard (alt orta)", group = grpRes)
 
 grpConf      = "Confidence Engine"
+confGain     = input.float(2.0, "Confidence spread (gain)", minval = 0.5, maxval = 5.0, step = 0.1, group = grpConf)
 showConfBox  = input.bool(true, "Kutuda Confidence göster", group = grpConf)
 showConf     = input.bool(true, "Show Confidence Dashboard (sol üst)", group = grpConf)
 
@@ -496,18 +497,23 @@ f_tdBin(float t) => na(t) ? 3 : t <= 1.0 ? 0 : t <= 2.0 ? 1 : t <= 4.0 ? 2 : 3
 f_xaBin(float x) => na(x) ? 0 : x < 3.0 ? 0 : x < 6.0 ? 1 : x < 10.0 ? 2 : 3
 f_bcBin(float r) => na(r) ? 0 : r < 0.382 ? 0 : r < 0.50 ? 1 : r < 0.618 ? 2 : r < 0.786 ? 3 : 4
 
-// CONFIDENCE: bir feature bucket'ının katkısı. Geçmiş lift'e, kanıta (N) ve ağırlığa
-// göre; N < minRel ise katkı YOK (düşük örneklem koruması). Katkı ±weight ile sınırlı.
-f_confContrib(int h, int f, int e, float baseline, float weight, int minRel, int minStrong) =>
-    int   n = h + f + e
-    float c = 0.0
-    if n >= minRel and (h + f) > 0 and not na(baseline)
-        float hr   = 100.0 * h / (h + f)
-        float lift = hr - baseline
-        float ev   = math.min(1.0, minStrong > 0 ? n / minStrong : 0.0)
-        c := weight * (lift / 10.0) * ev
-        c := math.max(-weight, math.min(weight, c))
-    c
+// CONFIDENCE v2 — evidence-weighted LOG-ODDS kanıt birikimi (Naive-Bayes tarzı).
+// Bir feature bucket'ının log-odds kaymasını (δ) ve kanıt ağırlığını (evidence-weighted
+// feature weight) döndürür: [wNum, wDen]. Bunlar dış tarafta ağırlıklı ORTALAMA'ya girer.
+//   δ  = clamp( logit(hitRate_bucket) - logit(baseline), ±dmax )   (tek feature domine edemez)
+//   ev = (h+f) / ((h+f)+K)   → düşük örneklem yumuşak biçimde sönümlenir (K = prior)
+//   wNum = wFeat*ev*δ , wDen = wFeat*ev
+// Veri yoksa (h+f=0) katkı 0. Additif "lift/10" sıkıştırması KALDIRILDI.
+f_confAcc(int h, int f, float p0, int K, float dmax, float wFeat) =>
+    float wn = 0.0
+    float wd = 0.0
+    if (h + f) >= 1 and not na(p0) and p0 > 0.0 and p0 < 1.0
+        float pb = math.max(0.02, math.min(0.98, h / (h + f)))
+        float d  = math.max(-dmax, math.min(dmax, math.log(pb / (1.0 - pb)) - math.log(p0 / (1.0 - p0))))
+        float ev = (h + f) / (float(h + f) + K)
+        wn := wFeat * ev * d
+        wd := wFeat * ev
+    [wn, wd]
 
 // Confidence kalibrasyon bini: 0:0-20 1:20-40 2:40-60 3:60-80 4:80-100.
 f_confBin(float conf) => na(conf) ? 2 : conf < 20 ? 0 : conf < 40 ? 1 : conf < 60 ? 2 : conf < 80 ? 3 : 4
@@ -1230,11 +1236,13 @@ if barstate.isconfirmed
                         float anTDistAtr = cATR > 0 ? anTDist / cATR : na
                         float anTDistXa  = anXaLen > 0 ? anTDist / anXaLen : na
 
-                        // 1e) CONFIDENCE — YALNIZCA GEÇMİŞ istatistikten (as-of-now; lookahead yok).
-                        //     Her feature'ın bucket'ı, o ana kadar ÇÖZÜLMÜŞ prediction'ların hit-rate
-                        //     lift'ine göre küçük katkı verir; ağırlıklar sabit; düşük N katkı vermez.
-                        //     Score DEĞİŞMEZ; Confidence ayrı, tamamen istatistikseldir.
-                        float confBase = (evHit + evFail) > 0 ? 100.0 * evHit / (evHit + evFail) : na
+                        // 1e) CONFIDENCE v2 — YALNIZCA GEÇMİŞ istatistikten (as-of-now; lookahead yok).
+                        //     Her feature bucket'ı log-odds kanıt kayması verir; bunların EVIDENCE
+                        //     ağırlıklı ORTALAMASI alınır (güçlü örneklem baskın, zayıf yok sayılır),
+                        //     gain ile keskinleştirilir ve sigmoid ile 0-100'e taşınır (kalibre olasılık
+                        //     tahmini). Score DEĞİŞMEZ; Confidence tamamen ayrı istatistikseldir.
+                        float p0f = (evHit + evFail) > 0 ? evHit / (evHit + evFail) : na
+                        float l0  = (not na(p0f) and p0f > 0.0 and p0f < 1.0) ? math.log(p0f / (1.0 - p0f)) : na
                         int   cDir = dir == 1 ? 0 : 1
                         int   cScB = f_scBin(pScore)
                         int   cSpB = f_spBin(pSupport)
@@ -1242,15 +1250,20 @@ if barstate.isconfirmed
                         int   cTdB = f_tdBin(anTDistAtr)
                         int   cXaB = f_xaBin(anXaAtr)
                         int   cBcB = f_bcBin(anBcAb)
-                        float confRaw = 0.0
-                        confRaw += f_confContrib(array.get(anSc_hit, cScB), array.get(anSc_fail, cScB), array.get(anSc_exp, cScB), confBase, 6.0, minReliableN, minStrongN)
-                        confRaw += f_confContrib(array.get(anSp_hit, cSpB), array.get(anSp_fail, cSpB), array.get(anSp_exp, cSpB), confBase, 5.0, minReliableN, minStrongN)
-                        confRaw += f_confContrib(array.get(anDir_hit, cDir), array.get(anDir_fail, cDir), array.get(anDir_exp, cDir), confBase, 3.0, minReliableN, minStrongN)
-                        confRaw += f_confContrib(array.get(anCw_hit, cCwB), array.get(anCw_fail, cCwB), array.get(anCw_exp, cCwB), confBase, 4.0, minReliableN, minStrongN)
-                        confRaw += f_confContrib(array.get(anTd_hit, cTdB), array.get(anTd_fail, cTdB), array.get(anTd_exp, cTdB), confBase, 5.0, minReliableN, minStrongN)
-                        confRaw += f_confContrib(array.get(anXa_hit, cXaB), array.get(anXa_fail, cXaB), array.get(anXa_exp, cXaB), confBase, 3.0, minReliableN, minStrongN)
-                        confRaw += f_confContrib(array.get(anBc_hit, cBcB), array.get(anBc_fail, cBcB), array.get(anBc_exp, cBcB), confBase, 2.0, minReliableN, minStrongN)
-                        float confidence = math.round(math.max(0.0, math.min(100.0, 50.0 + confRaw)))
+                        float cNum = 0.0
+                        float cDen = 0.0
+                        [n1, d1] = f_confAcc(array.get(anSc_hit, cScB), array.get(anSc_fail, cScB), p0f, minReliableN, 1.2, 6.0)
+                        [n2, d2] = f_confAcc(array.get(anSp_hit, cSpB), array.get(anSp_fail, cSpB), p0f, minReliableN, 1.2, 5.0)
+                        [n3, d3] = f_confAcc(array.get(anDir_hit, cDir), array.get(anDir_fail, cDir), p0f, minReliableN, 1.2, 3.0)
+                        [n4, d4] = f_confAcc(array.get(anCw_hit, cCwB), array.get(anCw_fail, cCwB), p0f, minReliableN, 1.2, 4.0)
+                        [n5, d5] = f_confAcc(array.get(anTd_hit, cTdB), array.get(anTd_fail, cTdB), p0f, minReliableN, 1.2, 5.0)
+                        [n6, d6] = f_confAcc(array.get(anXa_hit, cXaB), array.get(anXa_fail, cXaB), p0f, minReliableN, 1.2, 3.0)
+                        [n7, d7] = f_confAcc(array.get(anBc_hit, cBcB), array.get(anBc_fail, cBcB), p0f, minReliableN, 1.2, 2.0)
+                        cNum := n1 + n2 + n3 + n4 + n5 + n6 + n7
+                        cDen := d1 + d2 + d3 + d4 + d5 + d6 + d7
+                        float avgShift = cDen > 0 ? cNum / cDen : 0.0
+                        float confidence = na(l0) ? 50.0 : math.round(100.0 / (1.0 + math.exp(-(l0 + confGain * avgShift))))
+                        confidence := math.max(0.0, math.min(100.0, confidence))
 
                         // 1f) Çizim: kutu, oluştuğu (confirmed C) bardan sağa (Score + Confidence).
                         PredGroup g = PredGroup.new(array.new<label>(), array.new<box>())
