@@ -64,6 +64,13 @@ analyticsView = input.string("Evaluation Summary", "Analytics View", options = [
 minReliableN  = input.int(20, "Minimum Reliable Sample", minval = 1, group = grpAn)
 showAnalytics = input.bool(true, "Show Analytics Dashboard (sol üst)", group = grpAn)
 
+grpRes         = "Prediction Research"
+researchView   = input.string("Research Summary", "Research View", options = ["Research Summary", "Top Features", "Negative Features", "Top Combinations", "Stability", "Recommendations"], group = grpRes)
+minStrongN     = input.int(50, "Minimum Strong Sample", minval = 1, group = grpRes)
+coverageFloor  = input.float(10.0, "Coverage Floor (%)", minval = 0.0, step = 1.0, group = grpRes)
+maxPerFamily   = input.int(2, "Maximum Results Per Feature Family", minval = 1, group = grpRes)
+showResearch   = input.bool(true, "Show Research Dashboard (alt orta)", group = grpRes)
+
 // =============================================================================
 // Veri yapıları
 // =============================================================================
@@ -134,6 +141,22 @@ type PredRec
     float targetDistance
     float targetDistanceATR
     float targetDistanceXA
+
+// Research Engine aday temsili (yalnızca son barda, sıralama/sınıflandırma için).
+// fam: 0 Score 1 Support 2 Direction 3 ClusterWidth 4 TargetDist 5 XA 6 BC 7 Combo
+// Tekil adayda kindB = -1. kind kodları: 0 Score,1 Support,2 TargetDist,3 ClusterWidth,4 Direction.
+type Cand
+    int    fam
+    int    ord
+    string label
+    string cond2
+    int    kindA
+    int    lvlA
+    int    kindB
+    int    lvlB
+    int    hit
+    int    fail
+    int    exp
 
 // =============================================================================
 // Repaint-safe pivot motoru (KORUNAN ALTYAPI — davranış değişmedi)
@@ -630,6 +653,276 @@ var array<int> anBc_fail = array.from(0, 0, 0, 0, 0)
 var array<int> anBc_exp  = array.from(0, 0, 0, 0, 0)
 
 // -----------------------------------------------------------------------------
+// RESEARCH ENGINE — iki-feature kombinasyon sayaçları (sınırlı, incremental).
+// Kondisyon kind kodları: 0 Score(scBin>=lvl), 1 Support(spBin>=lvl),
+//   2 TargetDist(tdBin<=lvl), 3 ClusterWidth(cwBin<=lvl), 4 Direction(dBin==lvl).
+// Metadata bir kez (barstate.isfirst) kurulur; sayaçlar çözümde O(1) artırılır.
+// -----------------------------------------------------------------------------
+var array<int>    cbKindA = array.new<int>()
+var array<int>    cbLvlA  = array.new<int>()
+var array<int>    cbKindB = array.new<int>()
+var array<int>    cbLvlB  = array.new<int>()
+var array<string> cbFam   = array.new<string>()
+var array<int>    cbHit   = array.new<int>()
+var array<int>    cbFail  = array.new<int>()
+var array<int>    cbExp   = array.new<int>()
+
+// Kombinasyonlarda kullanılan eşik seviyeleri (bin indeksleri cinsinden).
+var array<int> lvScore = array.from(2, 3, 4, 5)   // Score >= 5.5/6.0/6.5/7.0
+var array<int> lvSup   = array.from(1, 2, 3)      // Support >= 3/4/5
+var array<int> lvTd    = array.from(0, 1, 2)      // Dist <= 1/2/4 ATR
+var array<int> lvCw    = array.from(0, 1, 2)      // Width <= 0.25/0.50/1.00
+var array<int> lvDir   = array.from(0, 1)         // Bullish / Bearish
+
+// =============================================================================
+// RESEARCH ENGINE yardımcıları (pasif; yalnızca mevcut sayaçları okur)
+// =============================================================================
+// Kondisyon üyeliği (prediction bin'lerinden). kind: 0 Score,1 Support,2 TD,3 CW,4 Dir.
+f_condMet(int kind, int lvl, int scB, int spB, int tdB, int cwB, int dB) =>
+    kind == 0 ? scB >= lvl : kind == 1 ? spB >= lvl : kind == 2 ? tdB <= lvl : kind == 3 ? cwB <= lvl : dB == lvl
+
+// Kondisyon etiketi (dashboard için).
+f_condLabel(int kind, int lvl) =>
+    kind == 0 ? "Sc>=" + (lvl == 2 ? "5.5" : lvl == 3 ? "6.0" : lvl == 4 ? "6.5" : "7.0") : kind == 1 ? "Sup>=" + str.tostring(lvl + 2) : kind == 2 ? "Dist<=" + (lvl == 0 ? "1" : lvl == 1 ? "2" : "4") + "A" : kind == 3 ? "Wid<=" + (lvl == 0 ? "0.25" : lvl == 1 ? "0.50" : "1.00") : (lvl == 0 ? "Bull" : "Bear")
+
+// 0..last kümülatif toplam (<= eşikleri için).
+f_cumUpTo(array<int> a, int last) =>
+    int s = 0
+    for i = 0 to last
+        s += array.get(a, i)
+    s
+
+// Bir tekil kondisyonun (kind,lvl) resolved sayacı [h,f,e].
+f_condCounts(int kind, int lvl) =>
+    int h = 0
+    int f = 0
+    int e = 0
+    if kind == 0
+        h := f_cumFrom(anSc_hit, lvl)
+        f := f_cumFrom(anSc_fail, lvl)
+        e := f_cumFrom(anSc_exp, lvl)
+    else if kind == 1
+        h := f_cumFrom(anSp_hit, lvl)
+        f := f_cumFrom(anSp_fail, lvl)
+        e := f_cumFrom(anSp_exp, lvl)
+    else if kind == 2
+        h := f_cumUpTo(anTd_hit, lvl)
+        f := f_cumUpTo(anTd_fail, lvl)
+        e := f_cumUpTo(anTd_exp, lvl)
+    else if kind == 3
+        h := f_cumUpTo(anCw_hit, lvl)
+        f := f_cumUpTo(anCw_fail, lvl)
+        e := f_cumUpTo(anCw_exp, lvl)
+    else
+        h := array.get(anDir_hit, lvl)
+        f := array.get(anDir_fail, lvl)
+        e := array.get(anDir_exp, lvl)
+    [h, f, e]
+
+// Bir aile için tüm (lvA × lvB) kombinasyonlarını metadata dizilerine ekler (bir kez).
+f_addFamily(int kindA, array<int> lvA, int kindB, array<int> lvB, string fam, array<int> kA, array<int> lA, array<int> kB, array<int> lB, array<string> fm, array<int> hh, array<int> ff, array<int> ee) =>
+    for ia = 0 to array.size(lvA) - 1
+        for ib = 0 to array.size(lvB) - 1
+            array.push(kA, kindA)
+            array.push(lA, array.get(lvA, ia))
+            array.push(kB, kindB)
+            array.push(lB, array.get(lvB, ib))
+            array.push(fm, fam)
+            array.push(hh, 0)
+            array.push(ff, 0)
+            array.push(ee, 0)
+
+// Türev metrikler (h,f,e + baseline + toplamlar). Lift = yüzde puan; oranlar ayrı.
+f_hitRateV(int h, int f) => (h + f) > 0 ? 100.0 * h / (h + f) : na
+f_liftV(int h, int f, float base100) => (h + f) > 0 ? (100.0 * h / (h + f) - base100) : na
+f_relLiftV(int h, int f, float base100) => (base100 > 0 and (h + f) > 0) ? (100.0 * h / (h + f)) / base100 - 1.0 : na
+f_covV(int h, int f, int e, int totRes) => totRes > 0 ? 100.0 * (h + f + e) / totRes : 0.0
+
+// Research Score (yalnızca sıralama; confidence DEĞİL). Normalize edilmiş.
+f_rScoreV(int h, int f, int e, float base100, int minStrong, int totRes) =>
+    int   n         = h + f + e
+    float lift      = f_liftV(h, f, base100)
+    float posLift   = na(lift) ? 0.0 : math.max(lift, 0.0)
+    float evidence  = math.min(1.0, minStrong > 0 ? n / minStrong : 0.0)
+    float covFrac   = totRes > 0 ? n / totRes : 0.0
+    float covFactor = math.min(1.0, covFrac / 0.5)
+    posLift * evidence * (0.5 + 0.5 * covFactor)
+
+// Sınıflandırma kodu (öncelik: LOW N > LOW COV > STRONG > PROMISING > NEGATIVE > NEUTRAL).
+// 4 LOWN, 5 LOWCOV, 2 STRONG, 1 PROMISING, 3 NEGATIVE, 0 NEUTRAL.
+f_classV(int h, int f, int e, float base100, int minRel, int minStrong, float covFloor, int totRes) =>
+    int   n    = h + f + e
+    float lift = f_liftV(h, f, base100)
+    float cov  = f_covV(h, f, e, totRes)
+    n < minRel ? 4 : cov < covFloor ? 5 : (not na(lift) and lift >= 8.0 and n >= minStrong) ? 2 : (not na(lift) and lift >= 5.0 and n >= minRel) ? 1 : (not na(lift) and lift <= -5.0 and n >= minRel) ? 3 : 0
+
+f_clsLabel(int c) => c == 2 ? "STRONG" : c == 1 ? "PROMISING" : c == 3 ? "NEGATIVE" : c == 4 ? "LOW N" : c == 5 ? "LOW COV" : "NEUTRAL"
+f_clsColor(int c) => c == 2 ? color.rgb(0, 90, 0) : c == 1 ? color.rgb(20, 70, 20) : c == 3 ? color.rgb(120, 0, 0) : c == 4 ? color.rgb(120, 70, 0) : c == 5 ? color.rgb(100, 60, 0) : color.rgb(60, 60, 60)
+f_liftColor(float lift) => na(lift) ? color.rgb(25, 25, 25) : lift > 1.0 ? color.rgb(0, 90, 0) : lift < -1.0 ? color.rgb(120, 0, 0) : color.rgb(60, 60, 60)
+f_liftStr(float lift) => na(lift) ? "—" : (lift >= 0 ? "+" : "") + str.tostring(lift, "#.#") + " pp"
+f_pctF(float v) => na(v) ? "—" : str.tostring(v, "#.#") + "%"
+
+// Komşu eşik kararlılığı (STABLE / MIXED / ISOLATED / —).
+f_stab3(float lp, float lc, float ln) =>
+    string res = "—"
+    if not na(lc)
+        int nb = 0
+        int same = 0
+        if not na(lp)
+            nb += 1
+            same += (lp > 0) == (lc > 0) ? 1 : 0
+        if not na(ln)
+            nb += 1
+            same += (ln > 0) == (lc > 0) ? 1 : 0
+        res := nb == 0 ? "—" : same == nb ? "STABLE" : (lc > 0 and same == 0) ? "ISOLATED" : "MIXED"
+    res
+
+// Research tablo renkleri.
+var color RES_HDR  = color.rgb(20, 20, 20)
+var color RES_SECT = color.rgb(45, 45, 45)
+var color RES_CELL = color.rgb(25, 25, 25)
+
+// 9 sütunlu başlık satırı.
+f_resHdr9(table t, int r, string h0, string h1, string h2, string h3, string h4, string h5, string h6, string h7, string h8) =>
+    table.cell(t, 0, r, h0, text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, h1, text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 2, r, h2, text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 3, r, h3, text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 4, r, h4, text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 5, r, h5, text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 6, r, h6, text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 7, r, h7, text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 8, r, h8, text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+
+// 9 sütunlu aday satırı: a b c | N Hit% Lift Cov RScore Class.
+f_resRow9(table t, int r, string a, string b, string c, int h, int f, int e, float base100, int totRes, int minRel, int minStrong, float covFloor) =>
+    int   n    = h + f + e
+    float hr   = f_hitRateV(h, f)
+    float lift = f_liftV(h, f, base100)
+    float cov  = f_covV(h, f, e, totRes)
+    float rs   = f_rScoreV(h, f, e, base100, minStrong, totRes)
+    int   cls  = f_classV(h, f, e, base100, minRel, minStrong, covFloor, totRes)
+    table.cell(t, 0, r, a, text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 1, r, b, text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 2, r, c, text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 3, r, str.tostring(n),            text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 4, r, f_pctF(hr),                 text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 5, r, f_liftStr(lift),            text_color = color.white, bgcolor = f_liftColor(lift), text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 6, r, f_pctF(cov),                text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 7, r, na(rs) ? "—" : str.tostring(rs, "#.##"), text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 8, r, f_clsLabel(cls),            text_color = color.white, bgcolor = f_clsColor(cls), text_size = size.small, text_halign = text.align_right)
+
+// Özet metrik satırı (label | value; kalan sütunlar doldurulur).
+f_resMetric(table t, int r, string lbl, string val) =>
+    table.cell(t, 0, r, lbl, text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, val, text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    for c = 2 to 8
+        table.cell(t, c, r, "", bgcolor = RES_CELL)
+
+// Tekil adayları Research Score'a göre sırala (pozitif lift, aile başına perFam sınırı).
+f_rankSingles(array<Cand> cs, int k, int perFam, float base100, int totRes, int minRel, int minStrong, float covFloor) =>
+    array<int> chosen = array.new<int>()
+    array<int> famCnt = array.new<int>(8, 0)
+    bool go = true
+    while array.size(chosen) < k and go
+        int   bestI = -1
+        float bestS = -1.0
+        for i = 0 to array.size(cs) - 1
+            if not array.includes(chosen, i)
+                Cand c = array.get(cs, i)
+                float lift = f_liftV(c.hit, c.fail, base100)
+                if not na(lift) and lift > 0 and array.get(famCnt, c.fam) < perFam
+                    float rs = f_rScoreV(c.hit, c.fail, c.exp, base100, minStrong, totRes)
+                    if rs > bestS
+                        bestS := rs
+                        bestI := i
+        if bestI < 0
+            go := false
+        else
+            array.push(chosen, bestI)
+            Cand cb = array.get(cs, bestI)
+            array.set(famCnt, cb.fam, array.get(famCnt, cb.fam) + 1)
+    chosen
+
+// Kombinasyonları guardrail + aile sınırı ile sırala.
+f_rankCombos(array<Cand> cs, int k, int perFam, float base100, int totRes, int minRel, int minStrong, float covFloor) =>
+    array<int> chosen = array.new<int>()
+    bool go = true
+    while array.size(chosen) < k and go
+        int   bestI = -1
+        float bestS = -1.0
+        for i = 0 to array.size(cs) - 1
+            if not array.includes(chosen, i)
+                Cand c = array.get(cs, i)
+                int   n    = c.hit + c.fail + c.exp
+                float lift = f_liftV(c.hit, c.fail, base100)
+                float cov  = f_covV(c.hit, c.fail, c.exp, totRes)
+                if n >= minRel and cov >= covFloor and not na(lift) and lift >= 5.0
+                    string fam = array.get(cbFam, c.ord)
+                    int cnt = 0
+                    for j = 0 to array.size(chosen) - 1
+                        if array.get(cbFam, array.get(cs, array.get(chosen, j)).ord) == fam
+                            cnt += 1
+                    if cnt < perFam
+                        float rs = f_rScoreV(c.hit, c.fail, c.exp, base100, minStrong, totRes)
+                        if rs > bestS
+                            bestS := rs
+                            bestI := i
+        if bestI < 0
+            go := false
+        else
+            array.push(chosen, bestI)
+    chosen
+
+// Negatif adayları (güvenilir örneklem, lift<0) en düşük lift'e göre sırala.
+f_rankNeg(array<Cand> cs, int k, float base100, int totRes, int minRel, float covFloor) =>
+    array<int> chosen = array.new<int>()
+    bool go = true
+    while array.size(chosen) < k and go
+        int   worstI = -1
+        float worstL = 1000000.0
+        for i = 0 to array.size(cs) - 1
+            if not array.includes(chosen, i)
+                Cand c = array.get(cs, i)
+                int   n    = c.hit + c.fail + c.exp
+                float lift = f_liftV(c.hit, c.fail, base100)
+                float cov  = f_covV(c.hit, c.fail, c.exp, totRes)
+                if n >= minRel and cov >= covFloor and not na(lift) and lift < 0.0 and lift < worstL
+                    worstL := lift
+                    worstI := i
+        if worstI < 0
+            go := false
+        else
+            array.push(chosen, worstI)
+    chosen
+
+// Bir threshold ailesinin komşu-eşik kararlılığını satır satır yazar; sonraki satırı döndürür.
+f_resStab(table t, int startR, int famCode, string famName, array<Cand> cs, float base100) =>
+    array<int> idx = array.new<int>()
+    for i = 0 to array.size(cs) - 1
+        if array.get(cs, i).fam == famCode
+            array.push(idx, i)
+    int r = startR
+    for m = 0 to array.size(idx) - 1
+        Cand  c  = array.get(cs, array.get(idx, m))
+        float lc = f_liftV(c.hit, c.fail, base100)
+        float lp = m > 0 ? f_liftV(array.get(cs, array.get(idx, m - 1)).hit, array.get(cs, array.get(idx, m - 1)).fail, base100) : na
+        float ln = m < array.size(idx) - 1 ? f_liftV(array.get(cs, array.get(idx, m + 1)).hit, array.get(cs, array.get(idx, m + 1)).fail, base100) : na
+        string stab = f_stab3(lp, lc, ln)
+        int n = c.hit + c.fail + c.exp
+        table.cell(t, 0, r, famName,          text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+        table.cell(t, 1, r, c.label,          text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+        table.cell(t, 2, r, str.tostring(n),  text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+        table.cell(t, 3, r, "", bgcolor = RES_CELL)
+        table.cell(t, 4, r, "", bgcolor = RES_CELL)
+        table.cell(t, 5, r, f_liftStr(lc),    text_color = color.white, bgcolor = f_liftColor(lc), text_size = size.small, text_halign = text.align_right)
+        table.cell(t, 6, r, "", bgcolor = RES_CELL)
+        table.cell(t, 7, r, "", bgcolor = RES_CELL)
+        table.cell(t, 8, r, stab,             text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+        r += 1
+    r
+
+// -----------------------------------------------------------------------------
 // Görüntüleme penceresi: kaç prediction ÇİZİLİ tutulacak (kayıt sayısını etkilemez).
 // Obje limitine (500) göre güvenli üst sınır hesaplanır.
 // -----------------------------------------------------------------------------
@@ -639,6 +932,16 @@ int capBox    = int(490 / boxesPer)
 int capLbl    = labelsPer > 0 ? int(490 / labelsPer) : 1000000
 int allCap    = math.min(capBox, capLbl)
 int maxDrawn  = histDisplay == "Latest only" ? 1 : histDisplay == "Last N predictions" ? math.min(histCount, allCap) : allCap
+
+// RESEARCH: kombinasyon metadata'sını bir kez kur (7 aile; toplam 68 kombinasyon).
+if barstate.isfirst and array.size(cbFam) == 0
+    f_addFamily(0, lvScore, 1, lvSup, "Sc+Sup",  cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
+    f_addFamily(0, lvScore, 2, lvTd,  "Sc+Dist", cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
+    f_addFamily(0, lvScore, 3, lvCw,  "Sc+Wid",  cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
+    f_addFamily(1, lvSup,   2, lvTd,  "Sup+Dist",cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
+    f_addFamily(1, lvSup,   3, lvCw,  "Sup+Wid", cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
+    f_addFamily(4, lvDir,   0, lvScore,"Dir+Sc", cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
+    f_addFamily(4, lvDir,   2, lvTd,  "Dir+Dist",cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
 
 // =============================================================================
 // ANA AKIŞ — yalnızca KAPANMIŞ (confirmed) barlarda; ileri doğru, bar bar.
@@ -729,6 +1032,16 @@ if barstate.isconfirmed
                     array.set(anTd_hitBars, tbin, array.get(anTd_hitBars, tbin) + p.barsAlive)
                 f_bump3(anXa_hit, anXa_fail, anXa_exp, f_xaBin(p.xaAtrMultiple), rs)
                 f_bump3(anBc_hit, anBc_fail, anBc_exp, f_bcBin(p.bcAbRatio), rs)
+
+                // ---- RESEARCH: iki-feature kombinasyon sayaçlarını incremental güncelle ----
+                int scB = f_scBin(p.score)
+                int spB = f_spBin(p.support)
+                int tdB = f_tdBin(p.targetDistanceATR)
+                int cwB = f_cwBin(p.normalizedClusterWidth)
+                int dB  = p.direction == 1 ? 0 : 1
+                for ci = 0 to array.size(cbFam) - 1
+                    if f_condMet(array.get(cbKindA, ci), array.get(cbLvlA, ci), scB, spB, tdB, cwB, dB) and f_condMet(array.get(cbKindB, ci), array.get(cbLvlB, ci), scB, spB, tdB, cwB, dB)
+                        f_bump3(cbHit, cbFail, cbExp, ci, rs)
 
                 array.remove(activeList, ai)
                 resolved := true
@@ -988,6 +1301,180 @@ if showAnalytics and barstate.islast
             f_anRow(ana, 5, "0.50 - 0.618",  array.get(anBc_hit, 2), array.get(anBc_fail, 2), array.get(anBc_exp, 2), totRes, base100, minReliableN, -1, -1)
             f_anRow(ana, 6, "0.618 - 0.786", array.get(anBc_hit, 3), array.get(anBc_fail, 3), array.get(anBc_exp, 3), totRes, base100, minReliableN, -1, -1)
             f_anRow(ana, 7, "> 0.786",       array.get(anBc_hit, 4), array.get(anBc_fail, 4), array.get(anBc_exp, 4), totRes, base100, minReliableN, -1, -1)
+
+// =============================================================================
+// PREDICTION RESEARCH DASHBOARD (alt orta; yalnızca son barda; tek görünüm)
+// =============================================================================
+var table res = na
+if showResearch and barstate.islast
+    if na(res)
+        res := table.new(position.bottom_center, 9, 22, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
+
+    int   totCreated = evTotal
+    int   totRes     = evHit + evFail + evExp
+    float base100    = (evHit + evFail) > 0 ? 100.0 * evHit / (evHit + evFail) : na
+    string baseStr   = na(base100) ? "—" : str.tostring(base100, "#.#") + "%"
+
+    // ---- Tekil aday listesi (mevcut analytics sayaçlarından) ----
+    array<Cand> singles = array.new<Cand>()
+    for li = 1 to 5
+        [h, f, e] = f_condCounts(0, li)
+        array.push(singles, Cand.new(0, li - 1, "Score>=" + (li == 1 ? "5.0" : li == 2 ? "5.5" : li == 3 ? "6.0" : li == 4 ? "6.5" : "7.0"), "", 0, li, -1, -1, h, f, e))
+    for li = 0 to 3
+        [h, f, e] = f_condCounts(1, li)
+        array.push(singles, Cand.new(1, li, "Support>=" + str.tostring(li + 2), "", 1, li, -1, -1, h, f, e))
+    for li = 0 to 1
+        [h, f, e] = f_condCounts(4, li)
+        array.push(singles, Cand.new(2, li, li == 0 ? "Bullish" : "Bearish", "", 4, li, -1, -1, h, f, e))
+    for li = 0 to 2
+        [h, f, e] = f_condCounts(3, li)
+        array.push(singles, Cand.new(3, li, "Width<=" + (li == 0 ? "0.25" : li == 1 ? "0.50" : "1.00"), "", 3, li, -1, -1, h, f, e))
+    for li = 0 to 2
+        [h, f, e] = f_condCounts(2, li)
+        array.push(singles, Cand.new(4, li, "Dist<=" + (li == 0 ? "1" : li == 1 ? "2" : "4") + "ATR", "", 2, li, -1, -1, h, f, e))
+    for li = 0 to 3
+        array.push(singles, Cand.new(5, li, li == 0 ? "XA<3" : li == 1 ? "XA3-6" : li == 2 ? "XA6-10" : "XA>10", "", -1, li, -1, -1, array.get(anXa_hit, li), array.get(anXa_fail, li), array.get(anXa_exp, li)))
+    for li = 0 to 4
+        string bl = li == 0 ? "BC<.382" : li == 1 ? "BC.382-.5" : li == 2 ? "BC.5-.618" : li == 3 ? "BC.618-.786" : "BC>.786"
+        array.push(singles, Cand.new(6, li, bl, "", -1, li, -1, -1, array.get(anBc_hit, li), array.get(anBc_fail, li), array.get(anBc_exp, li)))
+
+    // ---- Kombinasyon aday listesi (mevcut kombinasyon sayaçlarından) ----
+    array<Cand> combos = array.new<Cand>()
+    for ci = 0 to array.size(cbFam) - 1
+        array.push(combos, Cand.new(7, ci, f_condLabel(array.get(cbKindA, ci), array.get(cbLvlA, ci)), f_condLabel(array.get(cbKindB, ci), array.get(cbLvlB, ci)), array.get(cbKindA, ci), array.get(cbLvlA, ci), array.get(cbKindB, ci), array.get(cbLvlB, ci), array.get(cbHit, ci), array.get(cbFail, ci), array.get(cbExp, ci)))
+
+    // Başlık + bilgi satırı
+    table.cell(res, 0, 0, "PREDICTION RESEARCH · " + researchView, text_color = color.white, bgcolor = RES_HDR, text_size = size.normal, text_halign = text.align_left)
+    for c = 1 to 8
+        table.cell(res, c, 0, "", bgcolor = RES_HDR)
+    table.cell(res, 0, 1, "Baseline " + baseStr + " · Resolved " + str.tostring(totRes) + " · Çoklu test: sonuçlar KANIT değil, yalnız aday", text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    for c = 1 to 8
+        table.cell(res, c, 1, "", bgcolor = RES_CELL)
+
+    if researchView == "Research Summary"
+        int cntStrong    = 0
+        int cntPromising = 0
+        int cntNegative  = 0
+        int cntLowN      = 0
+        int   bestSingleI  = -1
+        float bestSingleRS = -1.0
+        float highRelLift  = na
+        for i = 0 to array.size(singles) - 1
+            Cand c = array.get(singles, i)
+            int cls = f_classV(c.hit, c.fail, c.exp, base100, minReliableN, minStrongN, coverageFloor, totRes)
+            cntStrong    += cls == 2 ? 1 : 0
+            cntPromising += cls == 1 ? 1 : 0
+            cntNegative  += cls == 3 ? 1 : 0
+            cntLowN      += cls == 4 ? 1 : 0
+            int   n    = c.hit + c.fail + c.exp
+            float lift = f_liftV(c.hit, c.fail, base100)
+            float cov  = f_covV(c.hit, c.fail, c.exp, totRes)
+            if n >= minReliableN and cov >= coverageFloor and not na(lift)
+                highRelLift := na(highRelLift) ? lift : math.max(highRelLift, lift)
+            float rs = f_rScoreV(c.hit, c.fail, c.exp, base100, minStrongN, totRes)
+            if not na(lift) and lift > 0 and rs > bestSingleRS
+                bestSingleRS := rs
+                bestSingleI  := i
+        int   bestComboI  = -1
+        float bestComboRS = -1.0
+        for i = 0 to array.size(combos) - 1
+            Cand c = array.get(combos, i)
+            int   n    = c.hit + c.fail + c.exp
+            float lift = f_liftV(c.hit, c.fail, base100)
+            float cov  = f_covV(c.hit, c.fail, c.exp, totRes)
+            if n >= minReliableN and cov >= coverageFloor and not na(lift) and lift >= 5.0
+                float rs = f_rScoreV(c.hit, c.fail, c.exp, base100, minStrongN, totRes)
+                if rs > bestComboRS
+                    bestComboRS := rs
+                    bestComboI  := i
+        string bestSingleStr = bestSingleI < 0 ? "—" : array.get(singles, bestSingleI).label + " (" + f_liftStr(f_liftV(array.get(singles, bestSingleI).hit, array.get(singles, bestSingleI).fail, base100)) + ")"
+        string bestComboStr  = bestComboI < 0 ? "—" : array.get(combos, bestComboI).label + "&" + array.get(combos, bestComboI).cond2 + " (" + f_liftStr(f_liftV(array.get(combos, bestComboI).hit, array.get(combos, bestComboI).fail, base100)) + ")"
+        float bestCov = bestSingleI < 0 ? na : f_covV(array.get(singles, bestSingleI).hit, array.get(singles, bestSingleI).fail, array.get(singles, bestSingleI).exp, totRes)
+        f_resMetric(res, 2,  "Baseline Hit Rate",     baseStr)
+        f_resMetric(res, 3,  "Total Predictions",     str.tostring(totCreated))
+        f_resMetric(res, 4,  "Resolved Predictions",  str.tostring(totRes))
+        f_resMetric(res, 5,  "Feature candidates",    str.tostring(array.size(singles)))
+        f_resMetric(res, 6,  "Combinations tested",   str.tostring(array.size(combos)))
+        f_resMetric(res, 7,  "Strong / Promising",    str.tostring(cntStrong) + " / " + str.tostring(cntPromising))
+        f_resMetric(res, 8,  "Negative / Low-N",      str.tostring(cntNegative) + " / " + str.tostring(cntLowN))
+        f_resMetric(res, 9,  "Best single feature",   bestSingleStr)
+        f_resMetric(res, 10, "Best combination",      bestComboStr)
+        f_resMetric(res, 11, "Highest reliable lift", f_liftStr(highRelLift))
+        f_resMetric(res, 12, "Coverage of best",      f_pctF(bestCov))
+    else if researchView == "Top Features"
+        f_resHdr9(res, 2, "#", "Feature", "Group", "N", "Hit%", "Lift", "Cov", "RScr", "Class")
+        array<int> top = f_rankSingles(singles, 5, maxPerFamily, base100, totRes, minReliableN, minStrongN, coverageFloor)
+        for m = 0 to array.size(top) - 1
+            Cand c = array.get(singles, array.get(top, m))
+            int cf = c.fam
+            string famN = cf == 0 ? "Score" : cf == 1 ? "Support" : cf == 2 ? "Direction" : cf == 3 ? "ClusterW" : cf == 4 ? "TargetD" : cf == 5 ? "XA" : "BC"
+            f_resRow9(res, 3 + m, str.tostring(m + 1), famN, c.label, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
+        if array.size(top) == 0
+            f_resMetric(res, 3, "No positive candidates", "—")
+    else if researchView == "Negative Features"
+        f_resHdr9(res, 2, "", "Feature", "Group", "N", "Hit%", "Lift", "Cov", "RScr", "Class")
+        array<int> neg = f_rankNeg(singles, 5, base100, totRes, minReliableN, coverageFloor)
+        for m = 0 to array.size(neg) - 1
+            Cand c = array.get(singles, array.get(neg, m))
+            int cf = c.fam
+            string famN = cf == 0 ? "Score" : cf == 1 ? "Support" : cf == 2 ? "Direction" : cf == 3 ? "ClusterW" : cf == 4 ? "TargetD" : cf == 5 ? "XA" : "BC"
+            f_resRow9(res, 3 + m, "", famN, c.label, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
+        if array.size(neg) == 0
+            f_resMetric(res, 3, "No reliable negatives", "—")
+    else if researchView == "Top Combinations"
+        f_resHdr9(res, 2, "#", "Cond1", "Cond2", "N", "Hit%", "Lift", "Cov", "RScr", "Class")
+        array<int> topc = f_rankCombos(combos, 5, maxPerFamily, base100, totRes, minReliableN, minStrongN, coverageFloor)
+        for m = 0 to array.size(topc) - 1
+            Cand c = array.get(combos, array.get(topc, m))
+            f_resRow9(res, 3 + m, str.tostring(m + 1), c.label, c.cond2, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
+        if array.size(topc) > 0
+            Cand c0 = array.get(combos, array.get(topc, 0))
+            float cLift = f_liftV(c0.hit, c0.fail, base100)
+            [h1, f1, e1] = f_condCounts(c0.kindA, c0.lvlA)
+            [h2, f2, e2] = f_condCounts(c0.kindB, c0.lvlB)
+            float l1 = f_liftV(h1, f1, base100)
+            float l2 = f_liftV(h2, f2, base100)
+            float comp = math.max(na(l1) ? -1000000.0 : l1, na(l2) ? -1000000.0 : l2)
+            float benefit = (na(cLift) or comp <= -1000000.0) ? na : cLift - comp
+            f_resMetric(res, 4 + array.size(topc), "Best Combo Benefit", f_liftStr(benefit))
+        if array.size(topc) == 0
+            f_resMetric(res, 3, "No combos pass guardrails", "—")
+    else if researchView == "Stability"
+        f_resHdr9(res, 2, "Family", "Group", "N", "", "", "Lift", "", "", "Stab")
+        int rr = 3
+        rr := f_resStab(res, rr, 0, "Score",    singles, base100)
+        rr := f_resStab(res, rr, 1, "Support",  singles, base100)
+        rr := f_resStab(res, rr, 4, "TargetD",  singles, base100)
+        rr := f_resStab(res, rr, 3, "ClusterW", singles, base100)
+    else
+        f_resHdr9(res, 2, "#", "Feature", "Group", "N", "Hit%", "Lift", "Cov", "RScr", "Class")
+        array<int> rec = f_rankSingles(singles, 3, maxPerFamily, base100, totRes, minReliableN, minStrongN, coverageFloor)
+        int shown = 0
+        int rrow  = 3
+        for m = 0 to array.size(rec) - 1
+            Cand c = array.get(singles, array.get(rec, m))
+            int cls = f_classV(c.hit, c.fail, c.exp, base100, minReliableN, minStrongN, coverageFloor, totRes)
+            if cls == 2 or cls == 1
+                int cf = c.fam
+                string famN = cf == 0 ? "Score" : cf == 1 ? "Support" : cf == 2 ? "Direction" : cf == 3 ? "ClusterW" : cf == 4 ? "TargetD" : cf == 5 ? "XA" : "BC"
+                f_resRow9(res, rrow, str.tostring(shown + 1), famN, c.label, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
+                rrow  += 1
+                shown += 1
+        f_resMetric(res, rrow, "Next step", "Forward test only — do not activate")
+        rrow += 1
+        table.cell(res, 0, rrow, "NOT SUPPORTED", text_color = color.yellow, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_left)
+        for c = 1 to 8
+            table.cell(res, c, rrow, "", bgcolor = RES_SECT)
+        rrow += 1
+        array<int> rej = f_rankNeg(singles, 3, base100, totRes, minReliableN, coverageFloor)
+        for m = 0 to array.size(rej) - 1
+            Cand c = array.get(singles, array.get(rej, m))
+            int cf = c.fam
+            string famN = cf == 0 ? "Score" : cf == 1 ? "Support" : cf == 2 ? "Direction" : cf == 3 ? "ClusterW" : cf == 4 ? "TargetD" : cf == 5 ? "XA" : "BC"
+            f_resRow9(res, rrow, "", famN, c.label, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
+            rrow += 1
+        if shown == 0 and array.size(rej) == 0
+            f_resMetric(res, rrow, "No candidates", "—")
 
 // =============================================================================
 // AÇIKLAMA
