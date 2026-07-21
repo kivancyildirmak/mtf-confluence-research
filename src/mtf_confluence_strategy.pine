@@ -59,6 +59,11 @@ maxActiveBars = input.int(50, "Maximum Active Bars", minval = 1, group = grpEval
 ambigMode     = input.string("Conservative", "Ambiguous Handling", options = ["Conservative", "Optimistic", "Ignore"], group = grpEval)
 showEval      = input.bool(true, "Evaluation dashboard göster (sağ üst)", group = grpEval)
 
+grpAn         = "Prediction Analytics"
+analyticsView = input.string("Evaluation Summary", "Analytics View", options = ["Evaluation Summary", "Score Thresholds", "Support Thresholds", "Direction", "Cluster Width", "Target Distance", "XA Scale", "BC Ratio"], group = grpAn)
+minReliableN  = input.int(20, "Minimum Reliable Sample", minval = 1, group = grpAn)
+showAnalytics = input.bool(true, "Show Analytics Dashboard (sol üst)", group = grpAn)
+
 // =============================================================================
 // Veri yapıları
 // =============================================================================
@@ -116,6 +121,19 @@ type PredRec
     int   barsAlive          // resolvedBar - creationBar
     float invalidationPrice  // FAILED seviyesi (snapshot; na = invalidation yok)
     float creationATR        // oluşum anındaki ATR (snapshot)
+    // --- Analytics snapshot alanları (oluşumda dondurulur, pasif; algoritmayı etkilemez) ---
+    float clusterSpread
+    float clusterTolerance
+    float normalizedClusterWidth
+    float xaLength
+    float bcLength
+    float xaAtrMultiple
+    float bcAtrMultiple
+    float abXaRatio
+    float bcAbRatio
+    float targetDistance
+    float targetDistanceATR
+    float targetDistanceXA
 
 // =============================================================================
 // Repaint-safe pivot motoru (KORUNAN ALTYAPI — davranış değişmedi)
@@ -436,6 +454,91 @@ f_evAnalyseRow(table t, int r, string lbl, int c, int h, int f, int e) =>
     table.cell(t, 5, r, f_pctS(h, h + f),  text_color = color.white, bgcolor = EV_RIGHT, text_size = size.small, text_halign = text.align_right)
 
 // =============================================================================
+// PREDICTION ANALYTICS yardımcıları (pasif; prediction/evaluation'a dokunmaz)
+// =============================================================================
+// Bucket / bin fonksiyonları (saf).
+f_scBin(float s) => s < 5.0 ? 0 : s < 5.5 ? 1 : s < 6.0 ? 2 : s < 6.5 ? 3 : s < 7.0 ? 4 : 5
+f_spBin(int sup) => sup <= 2 ? 0 : sup == 3 ? 1 : sup == 4 ? 2 : 3
+f_cwBin(float w) => na(w) ? 3 : w <= 0.25 ? 0 : w <= 0.50 ? 1 : w <= 1.00 ? 2 : 3
+f_tdBin(float t) => na(t) ? 3 : t <= 1.0 ? 0 : t <= 2.0 ? 1 : t <= 4.0 ? 2 : 3
+f_xaBin(float x) => na(x) ? 0 : x < 3.0 ? 0 : x < 6.0 ? 1 : x < 10.0 ? 2 : 3
+f_bcBin(float r) => na(r) ? 0 : r < 0.382 ? 0 : r < 0.50 ? 1 : r < 0.618 ? 2 : r < 0.786 ? 3 : 4
+
+// Bir üçlü (hit/fail/exp) sayaç dizisinde bucket b'yi rs sonucuna göre artırır.
+f_bump3(array<int> h, array<int> f, array<int> e, int b, int rs) =>
+    if rs == 1
+        array.set(h, b, array.get(h, b) + 1)
+    else if rs == 2
+        array.set(f, b, array.get(f, b) + 1)
+    else
+        array.set(e, b, array.get(e, b) + 1)
+
+// start bin'den sona kümülatif toplam (threshold tabloları için).
+f_cumFrom(array<int> a, int start) =>
+    int s = 0
+    for i = start to array.size(a) - 1
+        s += array.get(a, i)
+    s
+
+// Analytics renk paleti (task 14).
+var color ANA_TITLE = color.rgb(25, 25, 25)
+var color ANA_HDR   = color.rgb(50, 50, 50)
+var color ANA_CELL  = color.rgb(20, 20, 20)
+var color ANA_LEFT  = color.rgb(55, 55, 55)
+var color ANA_LOWN  = color.rgb(90, 70, 0)   // koyu sarı/kahve
+var color ANA_POS   = color.rgb(0, 90, 0)    // pozitif lift
+var color ANA_NEG   = color.rgb(120, 0, 0)   // negatif lift
+
+// Analytics sütun başlığı satırı (11 sütun).
+f_anHeader(table t, int r) =>
+    table.cell(t, 0,  r, "Group",   text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1,  r, "N",       text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 2,  r, "Hit",     text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 3,  r, "Fail",    text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 4,  r, "Exp",     text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 5,  r, "ResHit%", text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 6,  r, "Ovr%",    text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 7,  r, "Cov%",    text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 8,  r, "Lift",    text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 9,  r, "AvgH",    text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 10, r, "AvgF",    text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_right)
+
+// Analytics veri satırı. sumHit/sumFail < 0 => AvgH/AvgF sütunu boş. base100 na olabilir.
+f_anRow(table t, int r, string lbl, int h, int f, int e, int totRes, float base100, int minN, int sumHit, int sumFail) =>
+    int   n     = h + f + e
+    bool  lowN  = n < minN
+    color cb    = lowN ? ANA_LOWN : ANA_CELL
+    int   resDen = h + f
+    string resStr  = resDen > 0 ? str.tostring(100.0 * h / resDen, "#.#") + "%" + (lowN ? " LOW N" : "") : "—"
+    string ovStr   = n > 0 ? str.tostring(100.0 * h / n, "#.#") + "%" : "—"
+    string covStr  = totRes > 0 ? str.tostring(100.0 * n / totRes, "#.#") + "%" : "—"
+    float  lift    = resDen > 0 ? (100.0 * h / resDen - base100) : na
+    string liftStr = na(lift) ? "—" : (lift >= 0 ? "+" : "") + str.tostring(lift, "#.#") + " pp"
+    color  liftBg  = lowN ? ANA_LOWN : na(lift) ? ANA_CELL : lift > 0 ? ANA_POS : lift < 0 ? ANA_NEG : ANA_CELL
+    string ahStr   = sumHit  < 0 ? "" : (h > 0 ? str.tostring(sumHit  / h, "#.#") : "—")
+    string afStr   = sumFail < 0 ? "" : (f > 0 ? str.tostring(sumFail / f, "#.#") : "—")
+    color  ahBg    = sumHit  < 0 ? ANA_CELL : cb
+    color  afBg    = sumFail < 0 ? ANA_CELL : cb
+    table.cell(t, 0,  r, lbl,             text_color = color.white, bgcolor = ANA_LEFT, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1,  r, str.tostring(n), text_color = color.white, bgcolor = cb,     text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 2,  r, str.tostring(h), text_color = color.white, bgcolor = cb,     text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 3,  r, str.tostring(f), text_color = color.white, bgcolor = cb,     text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 4,  r, str.tostring(e), text_color = color.white, bgcolor = cb,     text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 5,  r, resStr,          text_color = color.white, bgcolor = cb,     text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 6,  r, ovStr,           text_color = color.white, bgcolor = cb,     text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 7,  r, covStr,          text_color = color.white, bgcolor = cb,     text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 8,  r, liftStr,         text_color = color.white, bgcolor = liftBg, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 9,  r, ahStr,           text_color = color.white, bgcolor = ahBg,   text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 10, r, afStr,           text_color = color.white, bgcolor = afBg,   text_size = size.small, text_halign = text.align_right)
+
+// Analytics özet metrik satırı (label | value; kalan sütunlar doldurulur).
+f_anMetric(table t, int r, string lbl, string val) =>
+    table.cell(t, 0, r, lbl, text_color = color.white, bgcolor = ANA_LEFT, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, val, text_color = color.white, bgcolor = ANA_CELL, text_size = size.small, text_halign = text.align_right)
+    for c = 2 to 10
+        table.cell(t, c, r, "", bgcolor = ANA_CELL)
+
+// =============================================================================
 // Motor örneği + confirmed pivot ring buffer (KORUNAN ALTYAPI, çizilmez)
 // =============================================================================
 var Engine        pivEng = f_engine_new()
@@ -489,6 +592,42 @@ var array<int> spCount = array.from(0, 0, 0, 0)
 var array<int> spHit   = array.from(0, 0, 0, 0)
 var array<int> spFail  = array.from(0, 0, 0, 0)
 var array<int> spExp   = array.from(0, 0, 0, 0)
+
+// -----------------------------------------------------------------------------
+// PREDICTION ANALYTICS sayaçları (incremental, çözüm anında O(1) güncellenir).
+// Yalnızca çözülen kayıtları (HIT/FAILED/EXPIRED) sınıflandırır; pasif.
+// -----------------------------------------------------------------------------
+// Score fine-bins: 0:<5.0 1:[5,5.5) 2:[5.5,6) 3:[6,6.5) 4:[6.5,7) 5:>=7
+var array<int> anSc_hit  = array.from(0, 0, 0, 0, 0, 0)
+var array<int> anSc_fail = array.from(0, 0, 0, 0, 0, 0)
+var array<int> anSc_exp  = array.from(0, 0, 0, 0, 0, 0)
+// Support bins: 0:2 1:3 2:4 3:5+
+var array<int> anSp_hit  = array.from(0, 0, 0, 0)
+var array<int> anSp_fail = array.from(0, 0, 0, 0)
+var array<int> anSp_exp  = array.from(0, 0, 0, 0)
+// Direction: 0:bull 1:bear (+ bars toplamları)
+var array<int> anDir_hit     = array.from(0, 0)
+var array<int> anDir_fail    = array.from(0, 0)
+var array<int> anDir_exp     = array.from(0, 0)
+var array<int> anDir_hitBars = array.from(0, 0)
+var array<int> anDir_failBars= array.from(0, 0)
+// Cluster width bins: 0:<=0.25 1:(0.25,0.50] 2:(0.50,1.00] 3:>1.00
+var array<int> anCw_hit  = array.from(0, 0, 0, 0)
+var array<int> anCw_fail = array.from(0, 0, 0, 0)
+var array<int> anCw_exp  = array.from(0, 0, 0, 0)
+// Target distance (ATR) bins: 0:<=1 1:(1,2] 2:(2,4] 3:>4 (+ hit bars)
+var array<int> anTd_hit     = array.from(0, 0, 0, 0)
+var array<int> anTd_fail    = array.from(0, 0, 0, 0)
+var array<int> anTd_exp     = array.from(0, 0, 0, 0)
+var array<int> anTd_hitBars = array.from(0, 0, 0, 0)
+// XA scale (ATR) bins: 0:<3 1:[3,6) 2:[6,10) 3:>=10
+var array<int> anXa_hit  = array.from(0, 0, 0, 0)
+var array<int> anXa_fail = array.from(0, 0, 0, 0)
+var array<int> anXa_exp  = array.from(0, 0, 0, 0)
+// BC/AB ratio bins: 0:<0.382 1:[0.382,0.50) 2:[0.50,0.618) 3:[0.618,0.786) 4:>=0.786
+var array<int> anBc_hit  = array.from(0, 0, 0, 0, 0)
+var array<int> anBc_fail = array.from(0, 0, 0, 0, 0)
+var array<int> anBc_exp  = array.from(0, 0, 0, 0, 0)
 
 // -----------------------------------------------------------------------------
 // Görüntüleme penceresi: kaç prediction ÇİZİLİ tutulacak (kayıt sayısını etkilemez).
@@ -573,6 +712,23 @@ if barstate.isconfirmed
                     array.set(scExp, sb,  array.get(scExp, sb)  + 1)
                     array.set(spExp, spb, array.get(spExp, spb) + 1)
                 evSumLifeBars += p.barsAlive
+
+                // ---- ANALYTICS incremental güncelleme (pasif; yalnızca çözülen kayıt) ----
+                f_bump3(anSc_hit, anSc_fail, anSc_exp, f_scBin(p.score), rs)
+                f_bump3(anSp_hit, anSp_fail, anSp_exp, f_spBin(p.support), rs)
+                int dbin = p.direction == 1 ? 0 : 1
+                f_bump3(anDir_hit, anDir_fail, anDir_exp, dbin, rs)
+                if rs == 1
+                    array.set(anDir_hitBars, dbin, array.get(anDir_hitBars, dbin) + p.barsAlive)
+                else if rs == 2
+                    array.set(anDir_failBars, dbin, array.get(anDir_failBars, dbin) + p.barsAlive)
+                f_bump3(anCw_hit, anCw_fail, anCw_exp, f_cwBin(p.normalizedClusterWidth), rs)
+                int tbin = f_tdBin(p.targetDistanceATR)
+                f_bump3(anTd_hit, anTd_fail, anTd_exp, tbin, rs)
+                if rs == 1
+                    array.set(anTd_hitBars, tbin, array.get(anTd_hitBars, tbin) + p.barsAlive)
+                f_bump3(anXa_hit, anXa_fail, anXa_exp, f_xaBin(p.xaAtrMultiple), rs)
+                f_bump3(anBc_hit, anBc_fail, anBc_exp, f_bcBin(p.bcAbRatio), rs)
 
                 array.remove(activeList, ai)
                 resolved := true
@@ -660,17 +816,35 @@ if barstate.isconfirmed
                             invalP := X.price
                         // "None" -> invalP = na (yalnız HIT/EXPIRED)
 
-                        // 1e) Snapshot kaydı — asla silinmez/yeniden hesaplanmaz. status = ACTIVE.
+                        // 1e) Analytics snapshot — oluşum anında dondurulan pasif özellikler.
+                        float anSpread   = pHi - pLo
+                        float anNormW    = anSpread / math.max(tol, syminfo.mintick)
+                        float anXaLen    = math.abs(X.price - A.price)
+                        float anBcLen    = math.abs(B.price - C.price)
+                        float anAbLen    = math.abs(B.price - A.price)
+                        float anXaAtr    = cATR > 0 ? anXaLen / cATR : na
+                        float anBcAtr    = cATR > 0 ? anBcLen / cATR : na
+                        float anAbXa     = anXaLen > 0 ? anAbLen / anXaLen : na
+                        float anBcAb     = anAbLen > 0 ? anBcLen / anAbLen : na
+                        float anTDist    = math.abs(pCenter - close)
+                        float anTDistAtr = cATR > 0 ? anTDist / cATR : na
+                        float anTDistXa  = anXaLen > 0 ? anTDist / anXaLen : na
+
+                        // 1f) Snapshot kaydı — asla silinmez/yeniden hesaplanmaz. status = ACTIVE.
                         PredRec rec = PredRec.new(id = predSeq + 1, creationBar = bar_index, pivotCBar = C.bidx,
                              direction = dir, targetLow = pLo, targetHigh = pHi, centerPrice = pCenter,
                              score = pScore, support = pSupport, viz = g,
                              status = 0, resolvedBar = na, resultPrice = na, barsAlive = na,
-                             invalidationPrice = invalP, creationATR = cATR)
+                             invalidationPrice = invalP, creationATR = cATR,
+                             clusterSpread = anSpread, clusterTolerance = tol, normalizedClusterWidth = anNormW,
+                             xaLength = anXaLen, bcLength = anBcLen, xaAtrMultiple = anXaAtr, bcAtrMultiple = anBcAtr,
+                             abXaRatio = anAbXa, bcAbRatio = anBcAb, targetDistance = anTDist,
+                             targetDistanceATR = anTDistAtr, targetDistanceXA = anTDistXa)
                         predSeq += 1
                         array.push(records, rec)
                         cntCreated += 1
 
-                        // 1f) Evaluation kaydı: ACTIVE olarak izlemeye al + oluşum sayaçları.
+                        // 1g) Evaluation kaydı: ACTIVE olarak izlemeye al + oluşum sayaçları.
                         array.push(activeList, rec)
                         evTotal += 1
                         int csb  = f_scoreBucket(pScore)
@@ -748,6 +922,72 @@ if showEval and barstate.islast
     f_evAnalyseRow(ev, 20, "Support 3",  array.get(spCount, 1), array.get(spHit, 1), array.get(spFail, 1), array.get(spExp, 1))
     f_evAnalyseRow(ev, 21, "Support 4",  array.get(spCount, 2), array.get(spHit, 2), array.get(spFail, 2), array.get(spExp, 2))
     f_evAnalyseRow(ev, 22, "Support 5+", array.get(spCount, 3), array.get(spHit, 3), array.get(spFail, 3), array.get(spExp, 3))
+
+// =============================================================================
+// PREDICTION ANALYTICS DASHBOARD (sol üst; yalnızca son barda; tek görünüm)
+// =============================================================================
+var table ana = na
+if showAnalytics and barstate.islast
+    if na(ana)
+        ana := table.new(position.top_left, 11, 12, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
+
+    int   totRes  = evHit + evFail + evExp
+    float base100 = (evHit + evFail) > 0 ? 100.0 * evHit / (evHit + evFail) : na
+    string baseStr = na(base100) ? "—" : str.tostring(base100, "#.#") + "%"
+
+    // Başlık + bilgi satırı
+    table.cell(ana, 0, 0, "PREDICTION ANALYTICS · " + analyticsView, text_color = color.white, bgcolor = ANA_TITLE, text_size = size.normal, text_halign = text.align_left)
+    for c = 1 to 10
+        table.cell(ana, c, 0, "", bgcolor = ANA_TITLE)
+    table.cell(ana, 0, 1, "Baseline " + baseStr + " · Resolved N " + str.tostring(totRes) + " · minN " + str.tostring(minReliableN), text_color = color.white, bgcolor = ANA_CELL, text_size = size.small, text_halign = text.align_left)
+    for c = 1 to 10
+        table.cell(ana, c, 1, "", bgcolor = ANA_CELL)
+
+    if analyticsView == "Evaluation Summary"
+        f_anMetric(ana, 2, "Total Predictions",  str.tostring(evTotal))
+        f_anMetric(ana, 3, "Active",             str.tostring(array.size(activeList)))
+        f_anMetric(ana, 4, "Hit",                str.tostring(evHit))
+        f_anMetric(ana, 5, "Failed",             str.tostring(evFail))
+        f_anMetric(ana, 6, "Expired",            str.tostring(evExp))
+        f_anMetric(ana, 7, "Resolved Hit Rate",  f_pctS(evHit, evHit + evFail))
+        f_anMetric(ana, 8, "Overall Success",    f_pctS(evHit, totRes))
+    else
+        f_anHeader(ana, 2)
+        if analyticsView == "Score Thresholds"
+            f_anRow(ana, 3, "Score >= 5.0", f_cumFrom(anSc_hit, 1), f_cumFrom(anSc_fail, 1), f_cumFrom(anSc_exp, 1), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 4, "Score >= 5.5", f_cumFrom(anSc_hit, 2), f_cumFrom(anSc_fail, 2), f_cumFrom(anSc_exp, 2), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 5, "Score >= 6.0", f_cumFrom(anSc_hit, 3), f_cumFrom(anSc_fail, 3), f_cumFrom(anSc_exp, 3), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 6, "Score >= 6.5", f_cumFrom(anSc_hit, 4), f_cumFrom(anSc_fail, 4), f_cumFrom(anSc_exp, 4), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 7, "Score >= 7.0", f_cumFrom(anSc_hit, 5), f_cumFrom(anSc_fail, 5), f_cumFrom(anSc_exp, 5), totRes, base100, minReliableN, -1, -1)
+        else if analyticsView == "Support Thresholds"
+            f_anRow(ana, 3, "Support >= 2", f_cumFrom(anSp_hit, 0), f_cumFrom(anSp_fail, 0), f_cumFrom(anSp_exp, 0), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 4, "Support >= 3", f_cumFrom(anSp_hit, 1), f_cumFrom(anSp_fail, 1), f_cumFrom(anSp_exp, 1), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 5, "Support >= 4", f_cumFrom(anSp_hit, 2), f_cumFrom(anSp_fail, 2), f_cumFrom(anSp_exp, 2), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 6, "Support >= 5", f_cumFrom(anSp_hit, 3), f_cumFrom(anSp_fail, 3), f_cumFrom(anSp_exp, 3), totRes, base100, minReliableN, -1, -1)
+        else if analyticsView == "Direction"
+            f_anRow(ana, 3, "Bullish", array.get(anDir_hit, 0), array.get(anDir_fail, 0), array.get(anDir_exp, 0), totRes, base100, minReliableN, array.get(anDir_hitBars, 0), array.get(anDir_failBars, 0))
+            f_anRow(ana, 4, "Bearish", array.get(anDir_hit, 1), array.get(anDir_fail, 1), array.get(anDir_exp, 1), totRes, base100, minReliableN, array.get(anDir_hitBars, 1), array.get(anDir_failBars, 1))
+        else if analyticsView == "Cluster Width"
+            f_anRow(ana, 3, "W <= 0.25",   array.get(anCw_hit, 0), array.get(anCw_fail, 0), array.get(anCw_exp, 0), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 4, "0.25 - 0.50", array.get(anCw_hit, 1), array.get(anCw_fail, 1), array.get(anCw_exp, 1), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 5, "0.50 - 1.00", array.get(anCw_hit, 2), array.get(anCw_fail, 2), array.get(anCw_exp, 2), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 6, "W > 1.00",    array.get(anCw_hit, 3), array.get(anCw_fail, 3), array.get(anCw_exp, 3), totRes, base100, minReliableN, -1, -1)
+        else if analyticsView == "Target Distance"
+            f_anRow(ana, 3, "<= 1 ATR",  array.get(anTd_hit, 0), array.get(anTd_fail, 0), array.get(anTd_exp, 0), totRes, base100, minReliableN, array.get(anTd_hitBars, 0), -1)
+            f_anRow(ana, 4, "1 - 2 ATR", array.get(anTd_hit, 1), array.get(anTd_fail, 1), array.get(anTd_exp, 1), totRes, base100, minReliableN, array.get(anTd_hitBars, 1), -1)
+            f_anRow(ana, 5, "2 - 4 ATR", array.get(anTd_hit, 2), array.get(anTd_fail, 2), array.get(anTd_exp, 2), totRes, base100, minReliableN, array.get(anTd_hitBars, 2), -1)
+            f_anRow(ana, 6, "> 4 ATR",   array.get(anTd_hit, 3), array.get(anTd_fail, 3), array.get(anTd_exp, 3), totRes, base100, minReliableN, array.get(anTd_hitBars, 3), -1)
+        else if analyticsView == "XA Scale"
+            f_anRow(ana, 3, "< 3 ATR",    array.get(anXa_hit, 0), array.get(anXa_fail, 0), array.get(anXa_exp, 0), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 4, "3 - 6 ATR",  array.get(anXa_hit, 1), array.get(anXa_fail, 1), array.get(anXa_exp, 1), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 5, "6 - 10 ATR", array.get(anXa_hit, 2), array.get(anXa_fail, 2), array.get(anXa_exp, 2), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 6, "> 10 ATR",   array.get(anXa_hit, 3), array.get(anXa_fail, 3), array.get(anXa_exp, 3), totRes, base100, minReliableN, -1, -1)
+        else if analyticsView == "BC Ratio"
+            f_anRow(ana, 3, "< 0.382",       array.get(anBc_hit, 0), array.get(anBc_fail, 0), array.get(anBc_exp, 0), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 4, "0.382 - 0.50",  array.get(anBc_hit, 1), array.get(anBc_fail, 1), array.get(anBc_exp, 1), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 5, "0.50 - 0.618",  array.get(anBc_hit, 2), array.get(anBc_fail, 2), array.get(anBc_exp, 2), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 6, "0.618 - 0.786", array.get(anBc_hit, 3), array.get(anBc_fail, 3), array.get(anBc_exp, 3), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 7, "> 0.786",       array.get(anBc_hit, 4), array.get(anBc_fail, 4), array.get(anBc_exp, 4), totRes, base100, minReliableN, -1, -1)
 
 // =============================================================================
 // AÇIKLAMA
