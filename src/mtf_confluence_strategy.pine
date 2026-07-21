@@ -1,23 +1,26 @@
 //@version=6
 // =============================================================================
-// HARMONIC PREDICTION ENGINE — Cluster/Confluence Engine ile "Most Probable D Target"
+// HARMONIC PREDICTION ENGINE — Historical Prediction Display
 // -----------------------------------------------------------------------------
-// Mimari korunur: repaint-safe pivot motoru, confirmed pivot mantığı, Historical
-// Predictions, XABC doğrulaması ve projection hesapları AYNEN. Ham Fibonacci
-// projection'ları KULLANICIYA ÇİZİLMEZ. Bunun yerine tüm XA/BC seviyeleri içeride
-// hesaplanır, fiyat yakınlığına göre KÜMELENİR, ağırlıklı skorlanır ve en olası D
-// bölgesi TEK KUTU (Primary; opsiyonel Secondary) olarak gösterilir.
+// AMAÇ: confirmed XABC anında üretilen "Primary D Target" prediction'larını
+//   geçmişte BAR BAR üretip, her birini SNAPSHOT kayıt olarak saklamak ve
+//   seçilen görüntüleme moduna göre çizmek. Böylece geçmiş prediction'ların
+//   gerçekten oluştuğu görsel olarak doğrulanabilir.
 //
-// ÖNEMLİ: Bu hedef bir TRADE SİNYALİ DEĞİLDİR; yalnızca D'nin oluşmasının en olası
-//   fiyat bölgesidir. Fiyat bölgeyi geçebilir/trend sürebilir — bu başarısızlık
-//   değildir. Entry/exit/stop/TP/strategy bu modülün DIŞINDADIR.
+// KORUNAN ALTYAPI (davranış değişmedi): repaint-safe pivot motoru, XABC
+//   doğrulaması, XA/BC projection hesapları, P0 cluster/confluence motoru,
+//   adaptif tolerans, minimum support ve Primary D Target mantığı.
 //
-// GRAFİKTE YALNIZCA: X/A/B/C harfleri + Primary (ve istenirse Secondary) D Target
-//   kutusu. Ham çizgi, tablo, trend, HH/HL, zigzag, debug, pattern adı YOK.
-//   request.security / lookahead YOK.
+// BU SÜRÜMDE YOK (henüz): strategy(), entry/exit, HIT/FAILED/EXPIRED, trade logic.
+//   Yalnızca historical prediction ÜRETİMİ ve GÖRÜNTÜLEME davranışı.
+//
+// REPAINT/TEST GÜVENLİĞİ: motor yalnızca barstate.isconfirmed içinde ilerler;
+//   her kutu, prediction'ın OLUŞTUĞU (confirmed C) bardan itibaren çizilir;
+//   geçmişe gelecek bilgisi taşınmaz; request.security/lookahead yok; kayıtlar
+//   bir daha hesaplanmaz.
 // =============================================================================
 
-indicator("Harmonic Prediction Engine", overlay = true, max_labels_count = 200, max_boxes_count = 100)
+indicator("Harmonic Prediction Engine", overlay = true, max_labels_count = 500, max_boxes_count = 500)
 
 // =============================================================================
 // Girdiler
@@ -28,12 +31,11 @@ pivMinBars  = input.int(8,     "Pivot minimum bar",         minval = 1, group = 
 
 grpPred     = "Prediction / Cluster"
 projLen     = input.int(50, "Kutu uzunluğu (bar)",        minval = 5, group = grpPred)
-histMode    = input.string("Latest only", "Historical predictions", options = ["Latest only", "Keep last 5", "Keep last 10"], group = grpPred)
 patternTolPct = input.float(0.50, "Pattern tolerance (% of XA)", minval = 0.01, maxval = 5.0, step = 0.01, group = grpPred)
 atrFloorMult  = input.float(0.10, "ATR floor multiplier",         minval = 0.0,  step = 0.01, group = grpPred)
 minTolTicks   = input.int(5,      "Minimum tolerance ticks",      minval = 1, group = grpPred)
 minSupport    = input.int(2,      "Minimum projections per cluster", minval = 2, group = grpPred)
-showSecond  = input.bool(false, "Secondary D Target göster", group = grpPred)
+showSecond  = input.bool(false, "Secondary D Target göster (yalnız görsel)", group = grpPred)
 showSources = input.bool(false, "Kutuda kaynakları göster (XA/BC ratio)", group = grpPred)
 colPrimary  = input.color(color.new(color.lime,   0), "Primary kutu rengi",   group = grpPred)
 colSecond   = input.color(color.new(color.orange, 0), "Secondary kutu rengi", group = grpPred)
@@ -44,10 +46,14 @@ abXaMax     = input.float(0.90, "AB/XA max", step = 0.01, group = grpFilt)
 bcAbMin     = input.float(0.30, "BC/AB min", step = 0.01, group = grpFilt)
 bcAbMax     = input.float(2.00, "BC/AB max", step = 0.01, group = grpFilt)
 
-keepCount = histMode == "Keep last 5" ? 5 : histMode == "Keep last 10" ? 10 : 1
+grpView     = "Görünüm / Historical"
+histDisplay = input.string("All historical", "Historical display mode", options = ["Latest only", "All historical", "Last N predictions"], group = grpView)
+histCount   = input.int(50, "Historical prediction count", minval = 1, group = grpView)
+showXABC    = input.bool(false, "X/A/B/C harflerini göster", group = grpView)
+showDebug   = input.bool(true,  "Debug tablo göster", group = grpView)
 
 // =============================================================================
-// Veri yapıları (KORUNAN ALTYAPI)
+// Veri yapıları
 // =============================================================================
 // Onaylanmış pivot. kind: +1 = HIGH (tepe), -1 = LOW (dip).
 type Pivot
@@ -78,10 +84,24 @@ type Proj
     int   src
     float ratio
 
-// Bir prediction grubunun çizim nesneleri (grup bazlı silme için).
+// Bir prediction'ın çizim nesneleri (grup bazlı gizleme/silme için).
 type PredGroup
     array<label> labels
     array<box>   boxes
+
+// Prediction SNAPSHOT kaydı. Oluşturulunca yazılır, bir daha DEĞİŞMEZ/SİLİNMEZ.
+// direction: +1 = D yukarıda (H-L-H-L), -1 = D aşağıda (L-H-L-H).
+type PredRec
+    int   id
+    int   creationBar
+    int   pivotCBar
+    int   direction
+    float targetLow
+    float targetHigh
+    float centerPrice
+    float score
+    int   support
+    PredGroup viz        // canlı çizim nesneleri (yoksa boş/na)
 
 // =============================================================================
 // Repaint-safe pivot motoru (KORUNAN ALTYAPI — davranış değişmedi)
@@ -224,7 +244,7 @@ f_engine_step(Engine e, float k, int minBars, float atr) =>
     result
 
 // =============================================================================
-// Prediction / Cluster yardımcıları
+// Prediction / Cluster yardımcıları (KORUNAN ALTYAPI)
 // =============================================================================
 
 // XABC geçerlilik kontrolü (oranlar GRAFİKTE gösterilmez; yalnızca filtre).
@@ -249,13 +269,14 @@ f_xabc_valid(Pivot X, Pivot A, Pivot B, Pivot C) =>
 //   + sıkılık bonusu: 2*max(0, 1 - spread/(2*tol))  (spread=0→2, =tol→1, =2*tol→0)
 // Bir küme aday olabilmek için en az minSupport DISTINCT projeksiyon içermelidir
 //   (aynı fiyat+aynı oran kopyası ayrı destek saymaz). Uygun küme yoksa bestIdx=-1.
-// DÖNÜŞ: [merkezIndex, skor, altFiyat, üstFiyat].
+// DÖNÜŞ: [merkezIndex, skor, altFiyat, üstFiyat, destekSayısı].
 f_best_cluster(array<Proj> projs, array<bool> used, float tol, int minSupport) =>
     int   nD = array.size(projs)
     int   bestIdx = -1
     float bestScore = -1.0
     float bestLo = na
     float bestHi = na
+    int   bestSupport = 0
     // Sıfıra bölünmeye karşı güvenli alt sınır (tol zaten tickFloor ile > 0'dır).
     float safeTol = math.max(tol, syminfo.mintick)
     for i = 0 to nD - 1
@@ -298,11 +319,12 @@ f_best_cluster(array<Proj> projs, array<bool> used, float tol, int minSupport) =
             float score      = distinct + (hasXA and hasBC ? 2.0 : 0.0) + tight
             // En az minSupport DISTINCT projeksiyon içeren kümeler aday olabilir.
             if support >= minSupport and score > bestScore
-                bestIdx   := i
-                bestScore := score
-                bestLo    := lo
-                bestHi    := hi
-    [bestIdx, bestScore, bestLo, bestHi]
+                bestIdx     := i
+                bestScore   := score
+                bestLo      := lo
+                bestHi      := hi
+                bestSupport := support
+    [bestIdx, bestScore, bestLo, bestHi, bestSupport]
 
 // Merkez etrafındaki (tol içi, used olmayan) üyeleri işaretler ve kaynak metnini
 // ("XA 0.886, BC 2.240") döndürür. Skorlama sonrası kutu metni + used için tek geçiş.
@@ -323,18 +345,17 @@ f_mark(int bidx, float price, string txt) =>
          color = color.new(color.gray, 25), textcolor = color.white, size = size.small,
          force_overlay = true)
 
-// D-target kümesini kutu olarak çizer (C barından sağa) ve gruba ekler.
-f_target_box(PredGroup g, int x1, int x2, float lo, float hi, float score, string title, color col, float atrv, string srcText) =>
+// D-target kümesini kutu olarak çizer ve kutuyu DÖNDÜRÜR (grup çağıran tarafından yönetilir).
+f_target_box(int x1, int x2, float lo, float hi, float score, string title, color col, float atrv, string srcText) =>
     float pad = (hi - lo) < atrv * 0.05 ? atrv * 0.20 : 0.0
     string txt = title + "\n" + str.tostring(lo, format.mintick) + " – " + str.tostring(hi, format.mintick) + "\nScore " + str.tostring(score, "#.#")
     if showSources and str.length(srcText) > 0
         txt := txt + "\n" + srcText
-    box b = box.new(x1, hi + pad, x2, lo - pad, border_color = col, bgcolor = color.new(col, 82),
+    box.new(x1, hi + pad, x2, lo - pad, border_color = col, bgcolor = color.new(col, 82),
          text = txt, text_color = col, text_size = size.small,
          text_halign = text.align_left, text_valign = text.align_center, force_overlay = true)
-    array.push(g.boxes, b)
 
-// Bir prediction grubunun tüm nesnelerini güvenle siler.
+// Bir prediction grubunun tüm ÇİZİM nesnelerini güvenle siler (KAYIT silinmez).
 f_group_delete(PredGroup g) =>
     if array.size(g.labels) > 0
         for lb in g.labels
@@ -345,6 +366,11 @@ f_group_delete(PredGroup g) =>
             box.delete(bx)
         array.clear(g.boxes)
 
+// Debug tabloya bir "etiket | değer" satırı yazar.
+f_drow(table t, int r, string lbl, string val, color bg) =>
+    table.cell(t, 0, r, lbl, text_color = color.white, bgcolor = bg, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, val, text_color = color.white, bgcolor = bg, text_size = size.small, text_halign = text.align_right)
+
 // =============================================================================
 // Motor örneği + confirmed pivot ring buffer (KORUNAN ALTYAPI, çizilmez)
 // =============================================================================
@@ -354,111 +380,173 @@ BUFFER_MAX = 16
 
 atr = ta.atr(atrLen)
 
-// REPAINT GÜVENLİĞİ: motor yalnızca KAPANMIŞ barda ilerler.
-Pivot newPiv = na
+var array<float> xaRatios = array.from(0.786, 0.886, 1.000, 1.130, 1.272, 1.618)
+var array<float> bcRatios = array.from(1.272, 1.414, 1.618, 2.000, 2.240, 2.618, 3.140, 3.618)
+
+// =============================================================================
+// KAYITLAR + ÇİZİM DURUMU
+// -----------------------------------------------------------------------------
+// records : TÜM prediction snapshot'ları (asla silinmez).  drawn : şu an çizili
+// olan kayıtlara referanslar (obje limiti / display moduna göre budanır).
+// =============================================================================
+var array<PredRec> records = array.new<PredRec>()
+var array<PredRec> drawn   = array.new<PredRec>()
+var int predSeq = 0
+
+// Duplicate engelleme: en son üretilen X-A-B-C bar imzası.
+var int lastX = na
+var int lastA = na
+var int lastB = na
+var int lastC = na
+
+// Debug sayaçları.
+var int cntXabc     = 0   // geçerli (confirmed) XABC sayısı
+var int cntClusters = 0   // geçerli Primary cluster sayısı
+var int cntCreated  = 0   // gerçekten oluşturulan prediction sayısı
+var int cntDup      = 0   // atlanan duplicate sayısı
+
+// -----------------------------------------------------------------------------
+// Görüntüleme penceresi: kaç prediction ÇİZİLİ tutulacak (kayıt sayısını etkilemez).
+// Obje limitine (500) göre güvenli üst sınır hesaplanır.
+// -----------------------------------------------------------------------------
+int boxesPer  = 1 + (showSecond ? 1 : 0)
+int labelsPer = showXABC ? 4 : 0
+int capBox    = int(490 / boxesPer)
+int capLbl    = labelsPer > 0 ? int(490 / labelsPer) : 1000000
+int allCap    = math.min(capBox, capLbl)
+int maxDrawn  = histDisplay == "Latest only" ? 1 : histDisplay == "Last N predictions" ? math.min(histCount, allCap) : allCap
+
+// =============================================================================
+// ANA AKIŞ — yalnızca KAPANMIŞ (confirmed) barlarda; ileri doğru, bar bar.
+// =============================================================================
 if barstate.isconfirmed
-    newPiv := f_engine_step(pivEng, pivK, pivMinBars, atr)
+    // 0) Pivot motorunu ilerlet (repaint-safe).
+    Pivot newPiv = f_engine_step(pivEng, pivK, pivMinBars, atr)
     if not na(newPiv)
         array.push(pivots, newPiv)
         if array.size(pivots) > BUFFER_MAX
             array.shift(pivots)
 
+    // 1) Yeni confirmed pivot (yeni C): doğrula, projeksiyon, kümelendir, kaydet+çiz.
+    if not na(newPiv) and array.size(pivots) >= 4
+        int n = array.size(pivots)
+        Pivot X = array.get(pivots, n - 4)
+        Pivot A = array.get(pivots, n - 3)
+        Pivot B = array.get(pivots, n - 2)
+        Pivot C = array.get(pivots, n - 1)
+
+        if f_xabc_valid(X, A, B, C)
+            cntXabc += 1
+            bool wantDown = X.kind == -1   // L-H-L-H -> D aşağı ; H-L-H-L -> D yukarı
+
+            // 1a) Geçerli D seviyelerini (price, src, ratio) havuza topla (HAM ÇİZME).
+            array<Proj> projs = array.new<Proj>()
+            float xaDelta = A.price - X.price
+            float bcDelta = C.price - B.price
+            for i = 0 to array.size(xaRatios) - 1
+                float r = array.get(xaRatios, i)
+                float d = A.price - r * xaDelta
+                if (wantDown ? d < C.price : d > C.price)
+                    array.push(projs, Proj.new(d, 0, r))
+            for i = 0 to array.size(bcRatios) - 1
+                float r = array.get(bcRatios, i)
+                float d = C.price - r * bcDelta
+                if (wantDown ? d < C.price : d > C.price)
+                    array.push(projs, Proj.new(d, 1, r))
+
+            if array.size(projs) > 0
+                // Adaptif tolerans: pattern boyutuna (XA) orantılı, ATR ve tick tabanı ile.
+                // C onaylanınca bir kez hesaplanır (snapshot) — sonradan yeniden hesaplanmaz.
+                float patternTolerance = math.abs(A.price - X.price) * (patternTolPct / 100.0)
+                float atrFloor  = atr * atrFloorMult
+                float tickFloor = syminfo.mintick * minTolTicks
+                float tol = math.max(patternTolerance, math.max(atrFloor, tickFloor))
+                array<bool> used = array.new<bool>(array.size(projs), false)
+
+                // Primary = en yüksek skorlu küme (en az minSupport üye şart).
+                [pIdx, pScore, pLo, pHi, pSupport] = f_best_cluster(projs, used, tol, minSupport)
+                if pIdx >= 0
+                    cntClusters += 1
+
+                    // 1b) Duplicate engelle: aynı X-A-B-C bar imzası tekrar üretilmesin.
+                    bool dup = not na(lastC) and X.bidx == lastX and A.bidx == lastA and B.bidx == lastB and C.bidx == lastC
+                    if dup
+                        cntDup += 1
+                    else
+                        lastX := X.bidx
+                        lastA := A.bidx
+                        lastB := B.bidx
+                        lastC := C.bidx
+
+                        float pCenter = array.get(projs, pIdx).price
+                        int   dir     = wantDown ? -1 : 1
+
+                        // 1c) Çizim: kutu, oluştuğu (confirmed C) bardan itibaren sağa.
+                        //     Geçmişe gelecek bilgisi taşınmaz; kutu şimdi doğuyor.
+                        PredGroup g = PredGroup.new(array.new<label>(), array.new<box>())
+                        int x1 = bar_index
+                        int x2 = bar_index + projLen
+                        string pSrc = f_cluster_src_and_mark(projs, used, tol, pIdx)
+                        array.push(g.boxes, f_target_box(x1, x2, pLo, pHi, pScore, "D Target", colPrimary, atr, pSrc))
+                        if showXABC
+                            array.push(g.labels, f_mark(X.bidx, X.price, "X"))
+                            array.push(g.labels, f_mark(A.bidx, A.price, "A"))
+                            array.push(g.labels, f_mark(B.bidx, B.price, "B"))
+                            array.push(g.labels, f_mark(C.bidx, C.price, "C"))
+                        if showSecond
+                            [sIdx, sScore, sLo, sHi, sSupport] = f_best_cluster(projs, used, tol, minSupport)
+                            if sIdx >= 0 and sScore > 0
+                                string sSrc = f_cluster_src_and_mark(projs, used, tol, sIdx)
+                                array.push(g.boxes, f_target_box(x1, x2, sLo, sHi, sScore, "Secondary", colSecond, atr, sSrc))
+
+                        // 1d) Snapshot kaydı — asla silinmez/yeniden hesaplanmaz.
+                        PredRec rec = PredRec.new(id = predSeq + 1, creationBar = bar_index, pivotCBar = C.bidx,
+                             direction = dir, targetLow = pLo, targetHigh = pHi, centerPrice = pCenter,
+                             score = pScore, support = pSupport, viz = g)
+                        predSeq += 1
+                        array.push(records, rec)
+                        cntCreated += 1
+
+                        // 1e) Görüntüleme penceresini uygula: yalnızca ÇİZİMLERİ buda.
+                        //     En eski çizim silinir; ilgili KAYIT records içinde kalır.
+                        array.push(drawn, rec)
+                        while array.size(drawn) > maxDrawn
+                            PredRec old = array.shift(drawn)
+                            f_group_delete(old.viz)
+
 // =============================================================================
-// PREDICTION + CLUSTER ENGINE
-// -----------------------------------------------------------------------------
-// XA projection: D = A - r*(A-X)   |   BC projection: D = C - r*(C-B)
-// Yön filtresi: L-H-L-H (X dip) yalnızca D<C ; H-L-H-L (X tepe) yalnızca D>C.
-// Geçerli D'ler (price, src, ratio) havuza toplanır; HAM ÇİZİLMEZ. Fiyat
-// yakınlığına göre kümelenir, ağırlıklı skorlanır; en yüksek skor Primary,
-// ikinci Secondary (opsiyonel). Kutu = küme aralığı + skor.
+// DEBUG TABLO (yalnızca son barda güncellenir)
 // =============================================================================
-var array<float> xaRatios = array.from(0.786, 0.886, 1.000, 1.130, 1.272, 1.618)
-var array<float> bcRatios = array.from(1.272, 1.414, 1.618, 2.000, 2.240, 2.618, 3.140, 3.618)
-
-// Aktif prediction grupları (en yeni sonda). Grup bazlı saklanır/silinir.
-var array<PredGroup> groups = array.new<PredGroup>()
-
-// Yeni confirmed pivot (yeni C) geldiğinde: doğrula, hesapla, kümelendir, çiz (bir kez).
-if not na(newPiv) and array.size(pivots) >= 4
-    int n = array.size(pivots)
-    Pivot X = array.get(pivots, n - 4)
-    Pivot A = array.get(pivots, n - 3)
-    Pivot B = array.get(pivots, n - 2)
-    Pivot C = array.get(pivots, n - 1)
-
-    if f_xabc_valid(X, A, B, C)
-        bool wantDown = X.kind == -1   // L-H-L-H -> D aşağı ; H-L-H-L -> D yukarı
-
-        // 1) Geçerli D seviyelerini (price, src, ratio) havuza topla (HAM ÇİZME).
-        array<Proj> projs = array.new<Proj>()
-        float xaDelta = A.price - X.price
-        float bcDelta = C.price - B.price
-        for i = 0 to array.size(xaRatios) - 1
-            float r = array.get(xaRatios, i)
-            float d = A.price - r * xaDelta
-            if (wantDown ? d < C.price : d > C.price)
-                array.push(projs, Proj.new(d, 0, r))
-        for i = 0 to array.size(bcRatios) - 1
-            float r = array.get(bcRatios, i)
-            float d = C.price - r * bcDelta
-            if (wantDown ? d < C.price : d > C.price)
-                array.push(projs, Proj.new(d, 1, r))
-
-        if array.size(projs) > 0
-            // Adaptif tolerans: pattern boyutuna (XA) orantılı, ATR ve tick tabanı ile.
-            // C onaylandığında bir kez hesaplanır (snapshot) — sonradan yeniden hesaplanmaz.
-            float patternTolerance = math.abs(A.price - X.price) * (patternTolPct / 100.0)
-            float atrFloor  = atr * atrFloorMult
-            float tickFloor = syminfo.mintick * minTolTicks
-            float tol = math.max(patternTolerance, math.max(atrFloor, tickFloor))
-            array<bool> used = array.new<bool>(array.size(projs), false)
-
-            // 2) Primary = en yüksek skorlu küme (en az minSupport üye şart).
-            [pIdx, pScore, pLo, pHi] = f_best_cluster(projs, used, tol, minSupport)
-            if pIdx >= 0
-                PredGroup g = PredGroup.new(array.new<label>(), array.new<box>())
-                int x1 = C.bidx
-                int x2 = C.bidx + projLen
-
-                array.push(g.labels, f_mark(X.bidx, X.price, "X"))
-                array.push(g.labels, f_mark(A.bidx, A.price, "A"))
-                array.push(g.labels, f_mark(B.bidx, B.price, "B"))
-                array.push(g.labels, f_mark(C.bidx, C.price, "C"))
-
-                string pSrc = f_cluster_src_and_mark(projs, used, tol, pIdx)
-                f_target_box(g, x1, x2, pLo, pHi, pScore, "Primary D Target", colPrimary, atr, pSrc)
-
-                // 3) Secondary = kalanların en yüksek skorlusu (opsiyonel).
-                if showSecond
-                    [sIdx, sScore, sLo, sHi] = f_best_cluster(projs, used, tol, minSupport)
-                    if sIdx >= 0 and sScore > 0
-                        string sSrc = f_cluster_src_and_mark(projs, used, tol, sIdx)
-                        f_target_box(g, x1, x2, sLo, sHi, sScore, "Secondary D Target", colSecond, atr, sSrc)
-
-                // 4) Grubu ekle; historical moda göre eski grupları sil.
-                array.push(groups, g)
-                while array.size(groups) > keepCount
-                    PredGroup old = array.shift(groups)
-                    f_group_delete(old)
+var table dbg = na
+if showDebug and barstate.islast
+    if na(dbg)
+        dbg := table.new(position.top_right, 2, 6, border_width = 1, frame_width = 1, frame_color = color.gray)
+    color hdr = color.new(color.blue, 20)
+    color bg1 = color.new(color.gray, 90)
+    color bg2 = color.new(color.gray, 80)
+    table.cell(dbg, 0, 0, "Prediction Debug", text_color = color.white, bgcolor = hdr, text_size = size.small, text_halign = text.align_left)
+    table.cell(dbg, 1, 0, "", bgcolor = hdr)
+    f_drow(dbg, 1, "Total confirmed XABC",        str.tostring(cntXabc),           bg1)
+    f_drow(dbg, 2, "Total valid clusters",        str.tostring(cntClusters),       bg2)
+    f_drow(dbg, 3, "Total predictions created",   str.tostring(cntCreated),        bg1)
+    f_drow(dbg, 4, "Predictions currently drawn", str.tostring(array.size(drawn)), bg2)
+    f_drow(dbg, 5, "Duplicate predictions skipped", str.tostring(cntDup),          bg1)
 
 // =============================================================================
 // AÇIKLAMA
 // -----------------------------------------------------------------------------
-// XABC doğrulaması: kronoloji + alternasyon + tam L-H-L-H/H-L-H-L + leg>0 + AB/XA
-//   & BC/AB oran sınırları. Geçersizse hiçbir hedef çizilmez.
-// Üretim anı: yalnızca yeni confirmed pivot (yeni C) bar-close event'inde, bir kez.
-// Formüller: D_XA = A - r*(A-X) ; D_BC = C - r*(C-B). Yön filtresinden geçer.
-// Tolerans (adaptif): tol = max(|A-X|*patternTolPct%, ATR*atrFloorMult,
-//   mintick*minTolTicks). C onaylanınca bir kez hesaplanır (snapshot).
-// Cluster skor (f_best_cluster): farklı ratio sayısı + (XA&BC mix bonusu +2) +
-//   sıkılık. Sıkılık = 2*max(0, 1 - spread/(2*tol)): spread=0→2, spread=tol→1,
-//   spread=2*tol→0. Aynı ratio tekrarı ekstra puan almaz; yalnız-BC/yalnız-XA küme
-//   mix bonusu alamaz. Bir küme Primary/Secondary adayı olmak için en az minSupport
-//   DISTINCT projeksiyon içermelidir (aynı fiyat+aynı oran kopyası destek saymaz).
-//   Uygun küme yoksa hiçbir hedef kutusu çizilmez. En yüksek skor Primary, ikinci
-//   Secondary.
-// Neden repaint yok: motor yalnızca barstate.isconfirmed içinde ilerler; C onaylanınca
-//   X/A/B/C ve küme sınırları/skoru sabit; request.security/lookahead yok; historical
-//   gruplar bir daha hesaplanmaz, yalnızca (pruning'de) silinir.
-// Bu hedef bir TRADE sinyali DEĞİLDİR; yalnızca D'nin en olası tamamlanma bölgesidir.
+// ÜRETİM: her yeni confirmed pivot (yeni C) bar-close event'inde XABC doğrulanır,
+//   XA/BC projeksiyonları hesaplanır, adaptif tolerans + minimum support ile
+//   kümelenir; Primary D Target bulunursa bir SNAPSHOT kayıt (records) yazılır.
+// KALICILIK: records asla silinmez/yeniden hesaplanmaz. Yeni prediction gelince
+//   eski kayıt SİLİNMEZ; yalnızca display modu gerektirirse eski ÇİZİM budanır.
+// GÖRÜNTÜLEME: Latest only (1) / All historical (obje limitli üst sınır) /
+//   Last N predictions (histCount). Mod yalnızca ÇİZİMİ sınırlar; kayıtları,
+//   üretimi veya ileride yapılacak accuracy ölçümünü ETKİLEMEZ.
+// OBJE LİMİTİ: max_boxes_count/max_labels_count = 500. drawn kuyruğu maxDrawn'ı
+//   aşınca en eski ÇİZİM nesneleri silinir (kayıt korunur).
+// DUPLICATE: aynı X-A-B-C bar imzası tekrar üretilmez (atlananlar sayılır).
+// REPAINT YOK: motor yalnızca barstate.isconfirmed'de ilerler; her kutu
+//   oluştuğu (confirmed C) bardan itibaren, x1 = o anki bar_index ile çizilir;
+//   geçmişe gelecek bilgisi taşınmaz; request.security/lookahead yok.
 // =============================================================================
