@@ -62,7 +62,7 @@ showEval      = input.bool(true, "Evaluation dashboard göster (sağ üst)", gro
 grpAn         = "Prediction Analytics"
 analyticsView = input.string("Evaluation Summary", "Analytics View", options = ["Evaluation Summary", "Score Thresholds", "Support Thresholds", "Direction", "Cluster Width", "Target Distance", "XA Scale", "BC Ratio"], group = grpAn)
 minReliableN  = input.int(20, "Minimum Reliable Sample", minval = 1, group = grpAn)
-showAnalytics = input.bool(true, "Show Analytics Dashboard (sol üst)", group = grpAn)
+showAnalytics = input.bool(true, "Show Analytics Dashboard (sol alt)", group = grpAn)
 
 grpRes         = "Prediction Research"
 researchView   = input.string("Research Summary", "Research View", options = ["Research Summary", "Top Features", "Negative Features", "Top Combinations", "Stability", "Recommendations"], group = grpRes)
@@ -1242,7 +1242,7 @@ if showEval and barstate.islast
 var table ana = na
 if showAnalytics and barstate.islast
     if na(ana)
-        ana := table.new(position.top_left, 11, 12, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
+        ana := table.new(position.bottom_left, 11, 12, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
 
     int   totRes  = evHit + evFail + evExp
     float base100 = (evHit + evFail) > 0 ? 100.0 * evHit / (evHit + evFail) : na
