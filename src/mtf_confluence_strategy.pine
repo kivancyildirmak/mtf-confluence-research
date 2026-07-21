@@ -50,7 +50,14 @@ grpView     = "Görünüm / Historical"
 histDisplay = input.string("All historical", "Historical display mode", options = ["Latest only", "All historical", "Last N predictions"], group = grpView)
 histCount   = input.int(50, "Historical prediction count", minval = 1, group = grpView)
 showXABC    = input.bool(false, "X/A/B/C harflerini göster", group = grpView)
-showDebug   = input.bool(true,  "Debug tablo göster", group = grpView)
+showDebug   = input.bool(false, "Debug tablo göster (sağ alt)", group = grpView)
+
+grpEval       = "Evaluation Engine"
+failMode      = input.string("C ± ATR", "Failure Mode", options = ["C ± ATR", "X Pivot", "None"], group = grpEval)
+evalAtrMult   = input.float(0.50, "ATR Multiplier", minval = 0.0, step = 0.05, group = grpEval)
+maxActiveBars = input.int(50, "Maximum Active Bars", minval = 1, group = grpEval)
+ambigMode     = input.string("Conservative", "Ambiguous Handling", options = ["Conservative", "Optimistic", "Ignore"], group = grpEval)
+showEval      = input.bool(true, "Evaluation dashboard göster (sağ üst)", group = grpEval)
 
 // =============================================================================
 // Veri yapıları
@@ -102,6 +109,13 @@ type PredRec
     float score
     int   support
     PredGroup viz        // canlı çizim nesneleri (yoksa boş/na)
+    // --- Evaluation Engine snapshot alanları (oluşumda yazılır, bir daha değişmez) ---
+    int   status             // 0 ACTIVE, 1 HIT, 2 FAILED, 3 EXPIRED
+    int   resolvedBar        // çözüldüğü bar (na = henüz ACTIVE)
+    float resultPrice        // çözümü tetikleyen fiyat (hedef / invalidation / expire close)
+    int   barsAlive          // resolvedBar - creationBar
+    float invalidationPrice  // FAILED seviyesi (snapshot; na = invalidation yok)
+    float creationATR        // oluşum anındaki ATR (snapshot)
 
 // =============================================================================
 // Repaint-safe pivot motoru (KORUNAN ALTYAPI — davranış değişmedi)
@@ -372,6 +386,56 @@ f_drow(table t, int r, string lbl, string val, color bg) =>
     table.cell(t, 1, r, val, text_color = color.white, bgcolor = bg, text_size = size.small, text_halign = text.align_right)
 
 // =============================================================================
+// Evaluation Engine yardımcıları (saf; prediction algoritmasına dokunmaz)
+// =============================================================================
+f_scoreBucket(float s) => s < 5.0 ? 0 : s < 6.0 ? 1 : s < 7.0 ? 2 : 3
+f_supBucket(int sup)   => sup <= 2 ? 0 : sup == 3 ? 1 : sup == 4 ? 2 : 3
+f_pctS(int num, int den) => den > 0 ? str.tostring(100.0 * num / den, "#.#") + "%" : "—"
+f_avgS(int sum, int den) => den > 0 ? str.tostring(sum / den, "#.#") : "—"
+
+// Dashboard renk paleti (Light/Dark okunabilir, yüksek kontrast).
+var color EV_TITLE  = color.rgb(35, 35, 35)
+var color EV_LEFT   = color.rgb(55, 55, 55)
+var color EV_RIGHT  = color.rgb(20, 20, 20)
+var color EV_HIT    = color.rgb(0, 90, 0)
+var color EV_FAIL   = color.rgb(120, 0, 0)
+var color EV_EXP    = color.rgb(120, 70, 0)
+var color EV_ACTIVE = color.rgb(0, 50, 120)
+var color EV_SECT   = color.rgb(45, 45, 45)
+
+// "etiket | değer" metrik satırı (kalan sütunlar valBg ile doldurulur, kompakt görünüm).
+f_evMetric(table t, int r, string lbl, string val, color lblBg, color valBg) =>
+    table.cell(t, 0, r, lbl, text_color = color.white, bgcolor = lblBg, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, val, text_color = color.white, bgcolor = valBg, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 2, r, "", bgcolor = valBg)
+    table.cell(t, 3, r, "", bgcolor = valBg)
+    table.cell(t, 4, r, "", bgcolor = valBg)
+    table.cell(t, 5, r, "", bgcolor = valBg)
+
+// Bölüm başlığı satırı (sarı yazı).
+f_evSection(table t, int r, string title) =>
+    for c = 0 to 5
+        table.cell(t, c, r, c == 0 ? title : "", text_color = color.yellow, bgcolor = EV_SECT, text_size = size.small, text_halign = text.align_left)
+
+// Analiz alt-tablosu başlık satırı.
+f_evAnalyseHdr(table t, int r) =>
+    table.cell(t, 0, r, "Group", text_color = color.white, bgcolor = EV_TITLE, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, "N",     text_color = color.white, bgcolor = EV_TITLE, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 2, r, "Hit",   text_color = color.white, bgcolor = EV_TITLE, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 3, r, "Fail",  text_color = color.white, bgcolor = EV_TITLE, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 4, r, "Exp",   text_color = color.white, bgcolor = EV_TITLE, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 5, r, "Hit%",  text_color = color.white, bgcolor = EV_TITLE, text_size = size.small, text_halign = text.align_right)
+
+// Analiz alt-tablosu veri satırı.
+f_evAnalyseRow(table t, int r, string lbl, int c, int h, int f, int e) =>
+    table.cell(t, 0, r, lbl,               text_color = color.white, bgcolor = EV_LEFT,  text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, str.tostring(c),   text_color = color.white, bgcolor = EV_RIGHT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 2, r, str.tostring(h),   text_color = color.white, bgcolor = EV_RIGHT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 3, r, str.tostring(f),   text_color = color.white, bgcolor = EV_RIGHT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 4, r, str.tostring(e),   text_color = color.white, bgcolor = EV_RIGHT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 5, r, f_pctS(h, h + f),  text_color = color.white, bgcolor = EV_RIGHT, text_size = size.small, text_halign = text.align_right)
+
+// =============================================================================
 // Motor örneği + confirmed pivot ring buffer (KORUNAN ALTYAPI, çizilmez)
 // =============================================================================
 var Engine        pivEng = f_engine_new()
@@ -406,6 +470,27 @@ var int cntCreated  = 0   // gerçekten oluşturulan prediction sayısı
 var int cntDup      = 0   // atlanan duplicate sayısı
 
 // -----------------------------------------------------------------------------
+// EVALUATION ENGINE durumu (incremental). activeList yalnızca ACTIVE kayıtları
+// tutar; çözülen kayıt listeden çıkar ve sayaçlar bir kez güncellenir.
+// -----------------------------------------------------------------------------
+var array<PredRec> activeList = array.new<PredRec>()
+var int evTotal   = 0
+var int evHit     = 0
+var int evFail    = 0
+var int evExp     = 0
+var int evSumHitBars  = 0
+var int evSumFailBars = 0
+var int evSumLifeBars = 0
+var array<int> scCount = array.from(0, 0, 0, 0)
+var array<int> scHit   = array.from(0, 0, 0, 0)
+var array<int> scFail  = array.from(0, 0, 0, 0)
+var array<int> scExp   = array.from(0, 0, 0, 0)
+var array<int> spCount = array.from(0, 0, 0, 0)
+var array<int> spHit   = array.from(0, 0, 0, 0)
+var array<int> spFail  = array.from(0, 0, 0, 0)
+var array<int> spExp   = array.from(0, 0, 0, 0)
+
+// -----------------------------------------------------------------------------
 // Görüntüleme penceresi: kaç prediction ÇİZİLİ tutulacak (kayıt sayısını etkilemez).
 // Obje limitine (500) göre güvenli üst sınır hesaplanır.
 // -----------------------------------------------------------------------------
@@ -426,6 +511,73 @@ if barstate.isconfirmed
         array.push(pivots, newPiv)
         if array.size(pivots) > BUFFER_MAX
             array.shift(pivots)
+
+    // -------------------------------------------------------------------------
+    // 0b) EVALUATION ENGINE — yalnızca ACTIVE prediction'ları bu barın high/low'u
+    //     ile ileri doğru değerlendir. Oluşum barının kendi high/low'u kullanılmaz
+    //     (creationBar < bar_index). Çözülen kayıt bir kez işlenir, listeden çıkar.
+    // -------------------------------------------------------------------------
+    int ai = 0
+    while ai < array.size(activeList)
+        PredRec p = array.get(activeList, ai)
+        bool resolved = false
+        if p.creationBar < bar_index
+            bool bull     = p.direction == 1
+            bool hitCond  = bull ? (high >= p.targetLow) : (low <= p.targetHigh)
+            bool hasInval = not na(p.invalidationPrice)
+            bool failCond = hasInval ? (bull ? (low <= p.invalidationPrice) : (high >= p.invalidationPrice)) : false
+
+            int   rs     = 0
+            float rprice = na
+            if hitCond and failCond
+                // Aynı mumda hem hedef hem invalidation: sıra bilinemez.
+                if ambigMode == "Optimistic"
+                    rs     := 1
+                    rprice := bull ? p.targetLow : p.targetHigh
+                else if ambigMode == "Ignore"
+                    rs     := 0   // çözme; sonraki barda takip devam
+                else
+                    rs     := 2   // Conservative
+                    rprice := p.invalidationPrice
+            else if hitCond
+                rs     := 1
+                rprice := bull ? p.targetLow : p.targetHigh
+            else if failCond
+                rs     := 2
+                rprice := p.invalidationPrice
+            else if (bar_index - p.creationBar) >= maxActiveBars
+                rs     := 3
+                rprice := close
+
+            if rs != 0
+                // Snapshot'a çözüm yaz (bir daha değişmez).
+                p.status      := rs
+                p.resolvedBar := bar_index
+                p.resultPrice := rprice
+                p.barsAlive   := bar_index - p.creationBar
+
+                int sb  = f_scoreBucket(p.score)
+                int spb = f_supBucket(p.support)
+                if rs == 1
+                    evHit         += 1
+                    evSumHitBars  += p.barsAlive
+                    array.set(scHit, sb,  array.get(scHit, sb)  + 1)
+                    array.set(spHit, spb, array.get(spHit, spb) + 1)
+                else if rs == 2
+                    evFail        += 1
+                    evSumFailBars += p.barsAlive
+                    array.set(scFail, sb,  array.get(scFail, sb)  + 1)
+                    array.set(spFail, spb, array.get(spFail, spb) + 1)
+                else
+                    evExp         += 1
+                    array.set(scExp, sb,  array.get(scExp, sb)  + 1)
+                    array.set(spExp, spb, array.get(spExp, spb) + 1)
+                evSumLifeBars += p.barsAlive
+
+                array.remove(activeList, ai)
+                resolved := true
+        if not resolved
+            ai += 1
 
     // 1) Yeni confirmed pivot (yeni C): doğrula, projeksiyon, kümelendir, kaydet+çiz.
     if not na(newPiv) and array.size(pivots) >= 4
@@ -499,13 +651,32 @@ if barstate.isconfirmed
                                 string sSrc = f_cluster_src_and_mark(projs, used, tol, sIdx)
                                 array.push(g.boxes, f_target_box(x1, x2, sLo, sHi, sScore, "Secondary", colSecond, atr, sSrc))
 
-                        // 1d) Snapshot kaydı — asla silinmez/yeniden hesaplanmaz.
+                        // 1d) Evaluation snapshot: invalidation seviyesi + ATR (oluşum anında sabitlenir).
+                        float cATR = atr
+                        float invalP = na
+                        if failMode == "C ± ATR"
+                            invalP := dir == 1 ? C.price - cATR * evalAtrMult : C.price + cATR * evalAtrMult
+                        else if failMode == "X Pivot"
+                            invalP := X.price
+                        // "None" -> invalP = na (yalnız HIT/EXPIRED)
+
+                        // 1e) Snapshot kaydı — asla silinmez/yeniden hesaplanmaz. status = ACTIVE.
                         PredRec rec = PredRec.new(id = predSeq + 1, creationBar = bar_index, pivotCBar = C.bidx,
                              direction = dir, targetLow = pLo, targetHigh = pHi, centerPrice = pCenter,
-                             score = pScore, support = pSupport, viz = g)
+                             score = pScore, support = pSupport, viz = g,
+                             status = 0, resolvedBar = na, resultPrice = na, barsAlive = na,
+                             invalidationPrice = invalP, creationATR = cATR)
                         predSeq += 1
                         array.push(records, rec)
                         cntCreated += 1
+
+                        // 1f) Evaluation kaydı: ACTIVE olarak izlemeye al + oluşum sayaçları.
+                        array.push(activeList, rec)
+                        evTotal += 1
+                        int csb  = f_scoreBucket(pScore)
+                        int cspb = f_supBucket(pSupport)
+                        array.set(scCount, csb,  array.get(scCount, csb)  + 1)
+                        array.set(spCount, cspb, array.get(spCount, cspb) + 1)
 
                         // 1e) Görüntüleme penceresini uygula: yalnızca ÇİZİMLERİ buda.
                         //     En eski çizim silinir; ilgili KAYIT records içinde kalır.
@@ -520,7 +691,7 @@ if barstate.isconfirmed
 var table dbg = na
 if showDebug and barstate.islast
     if na(dbg)
-        dbg := table.new(position.top_right, 2, 6, border_width = 1, frame_width = 1, frame_color = color.gray)
+        dbg := table.new(position.bottom_right, 2, 6, border_width = 1, frame_width = 1, frame_color = color.gray)
     color hdr = color.new(color.blue, 20)
     color bg1 = color.new(color.gray, 90)
     color bg2 = color.new(color.gray, 80)
@@ -531,6 +702,52 @@ if showDebug and barstate.islast
     f_drow(dbg, 3, "Total predictions created",   str.tostring(cntCreated),        bg1)
     f_drow(dbg, 4, "Predictions currently drawn", str.tostring(array.size(drawn)), bg2)
     f_drow(dbg, 5, "Duplicate predictions skipped", str.tostring(cntDup),          bg1)
+
+// =============================================================================
+// EVALUATION DASHBOARD (sağ üst; yalnızca son barda)
+// =============================================================================
+var table ev = na
+if showEval and barstate.islast
+    if na(ev)
+        ev := table.new(position.top_right, 6, 23, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
+
+    int evActive = array.size(activeList)
+
+    // Başlık
+    table.cell(ev, 0, 0, "PREDICTION EVALUATION", text_color = color.white, bgcolor = EV_TITLE, text_size = size.normal, text_halign = text.align_left)
+    table.cell(ev, 1, 0, "", bgcolor = EV_TITLE)
+    table.cell(ev, 2, 0, "", bgcolor = EV_TITLE)
+    table.cell(ev, 3, 0, "", bgcolor = EV_TITLE)
+    table.cell(ev, 4, 0, "", bgcolor = EV_TITLE)
+    table.cell(ev, 5, 0, "", bgcolor = EV_TITLE)
+
+    // Özet metrikler
+    f_evMetric(ev, 1,  "Total Predictions",      str.tostring(evTotal),                       EV_LEFT, EV_RIGHT)
+    f_evMetric(ev, 2,  "Active",                 str.tostring(evActive),                      EV_ACTIVE, EV_ACTIVE)
+    f_evMetric(ev, 3,  "Hit",                    str.tostring(evHit),                         EV_HIT, EV_HIT)
+    f_evMetric(ev, 4,  "Failed",                 str.tostring(evFail),                        EV_FAIL, EV_FAIL)
+    f_evMetric(ev, 5,  "Expired",                str.tostring(evExp),                         EV_EXP, EV_EXP)
+    f_evMetric(ev, 6,  "Hit Rate",               f_pctS(evHit, evHit + evFail),               EV_LEFT, EV_RIGHT)
+    f_evMetric(ev, 7,  "Overall Success",        f_pctS(evHit, evTotal),                      EV_LEFT, EV_RIGHT)
+    f_evMetric(ev, 8,  "Average Bars To Hit",    f_avgS(evSumHitBars, evHit),                 EV_LEFT, EV_RIGHT)
+    f_evMetric(ev, 9,  "Average Bars To Failure",f_avgS(evSumFailBars, evFail),               EV_LEFT, EV_RIGHT)
+    f_evMetric(ev, 10, "Average Lifetime",       f_avgS(evSumLifeBars, evHit + evFail + evExp), EV_LEFT, EV_RIGHT)
+
+    // Score analysis
+    f_evSection(ev, 11, "SCORE ANALYSIS")
+    f_evAnalyseHdr(ev, 12)
+    f_evAnalyseRow(ev, 13, "Score < 5",  array.get(scCount, 0), array.get(scHit, 0), array.get(scFail, 0), array.get(scExp, 0))
+    f_evAnalyseRow(ev, 14, "5.0 - 5.99", array.get(scCount, 1), array.get(scHit, 1), array.get(scFail, 1), array.get(scExp, 1))
+    f_evAnalyseRow(ev, 15, "6.0 - 6.99", array.get(scCount, 2), array.get(scHit, 2), array.get(scFail, 2), array.get(scExp, 2))
+    f_evAnalyseRow(ev, 16, "Score >= 7", array.get(scCount, 3), array.get(scHit, 3), array.get(scFail, 3), array.get(scExp, 3))
+
+    // Support analysis
+    f_evSection(ev, 17, "SUPPORT ANALYSIS")
+    f_evAnalyseHdr(ev, 18)
+    f_evAnalyseRow(ev, 19, "Support 2",  array.get(spCount, 0), array.get(spHit, 0), array.get(spFail, 0), array.get(spExp, 0))
+    f_evAnalyseRow(ev, 20, "Support 3",  array.get(spCount, 1), array.get(spHit, 1), array.get(spFail, 1), array.get(spExp, 1))
+    f_evAnalyseRow(ev, 21, "Support 4",  array.get(spCount, 2), array.get(spHit, 2), array.get(spFail, 2), array.get(spExp, 2))
+    f_evAnalyseRow(ev, 22, "Support 5+", array.get(spCount, 3), array.get(spHit, 3), array.get(spFail, 3), array.get(spExp, 3))
 
 // =============================================================================
 // AÇIKLAMA
