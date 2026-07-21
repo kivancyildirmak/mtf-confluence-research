@@ -71,6 +71,10 @@ coverageFloor  = input.float(10.0, "Coverage Floor (%)", minval = 0.0, step = 1.
 maxPerFamily   = input.int(2, "Maximum Results Per Feature Family", minval = 1, group = grpRes)
 showResearch   = input.bool(true, "Show Research Dashboard (alt orta)", group = grpRes)
 
+grpConf      = "Confidence Engine"
+showConfBox  = input.bool(true, "Kutuda Confidence göster", group = grpConf)
+showConf     = input.bool(true, "Show Confidence Dashboard (sol üst)", group = grpConf)
+
 // =============================================================================
 // Veri yapıları
 // =============================================================================
@@ -141,6 +145,8 @@ type PredRec
     float targetDistance
     float targetDistanceATR
     float targetDistanceXA
+    // --- Confidence Engine (oluşum anında, yalnız geçmiş istatistikten; dondurulur) ---
+    float confidence
 
 // Research Engine aday temsili (yalnızca son barda, sıralama/sınıflandırma için).
 // fam: 0 Score 1 Support 2 Direction 3 ClusterWidth 4 TargetDist 5 XA 6 BC 7 Combo
@@ -401,9 +407,12 @@ f_mark(int bidx, float price, string txt) =>
          force_overlay = true)
 
 // D-target kümesini kutu olarak çizer ve kutuyu DÖNDÜRÜR (grup çağıran tarafından yönetilir).
-f_target_box(int x1, int x2, float lo, float hi, float score, string title, color col, float atrv, string srcText) =>
+// conf: na değilse "Confidence NN%" satırı eklenir (yalnız Score'un YANINDA; Score değişmez).
+f_target_box(int x1, int x2, float lo, float hi, float score, string title, color col, float atrv, string srcText, float conf) =>
     float pad = (hi - lo) < atrv * 0.05 ? atrv * 0.20 : 0.0
     string txt = title + "\n" + str.tostring(lo, format.mintick) + " – " + str.tostring(hi, format.mintick) + "\nScore " + str.tostring(score, "#.#")
+    if showConfBox and not na(conf)
+        txt := txt + "\nConfidence " + str.tostring(conf, "#") + "%"
     if showSources and str.length(srcText) > 0
         txt := txt + "\n" + srcText
     box.new(x1, hi + pad, x2, lo - pad, border_color = col, bgcolor = color.new(col, 82),
@@ -486,6 +495,22 @@ f_cwBin(float w) => na(w) ? 3 : w <= 0.25 ? 0 : w <= 0.50 ? 1 : w <= 1.00 ? 2 : 
 f_tdBin(float t) => na(t) ? 3 : t <= 1.0 ? 0 : t <= 2.0 ? 1 : t <= 4.0 ? 2 : 3
 f_xaBin(float x) => na(x) ? 0 : x < 3.0 ? 0 : x < 6.0 ? 1 : x < 10.0 ? 2 : 3
 f_bcBin(float r) => na(r) ? 0 : r < 0.382 ? 0 : r < 0.50 ? 1 : r < 0.618 ? 2 : r < 0.786 ? 3 : 4
+
+// CONFIDENCE: bir feature bucket'ının katkısı. Geçmiş lift'e, kanıta (N) ve ağırlığa
+// göre; N < minRel ise katkı YOK (düşük örneklem koruması). Katkı ±weight ile sınırlı.
+f_confContrib(int h, int f, int e, float baseline, float weight, int minRel, int minStrong) =>
+    int   n = h + f + e
+    float c = 0.0
+    if n >= minRel and (h + f) > 0 and not na(baseline)
+        float hr   = 100.0 * h / (h + f)
+        float lift = hr - baseline
+        float ev   = math.min(1.0, minStrong > 0 ? n / minStrong : 0.0)
+        c := weight * (lift / 10.0) * ev
+        c := math.max(-weight, math.min(weight, c))
+    c
+
+// Confidence kalibrasyon bini: 0:0-20 1:20-40 2:40-60 3:60-80 4:80-100.
+f_confBin(float conf) => na(conf) ? 2 : conf < 20 ? 0 : conf < 40 ? 1 : conf < 60 ? 2 : conf < 80 ? 3 : 4
 
 // Bir üçlü (hit/fail/exp) sayaç dizisinde bucket b'yi rs sonucuna göre artırır.
 f_bump3(array<int> h, array<int> f, array<int> e, int b, int rs) =>
@@ -651,6 +676,29 @@ var array<int> anXa_exp  = array.from(0, 0, 0, 0)
 var array<int> anBc_hit  = array.from(0, 0, 0, 0, 0)
 var array<int> anBc_fail = array.from(0, 0, 0, 0, 0)
 var array<int> anBc_exp  = array.from(0, 0, 0, 0, 0)
+
+// -----------------------------------------------------------------------------
+// CONFIDENCE ENGINE accumulators (incremental, çözümde O(1); yalnızca okur).
+// -----------------------------------------------------------------------------
+var float cfSumAll  = 0.0
+var float cfSumHit  = 0.0
+var float cfSumFail = 0.0
+var float cfSumExp  = 0.0
+// Kalibrasyon binleri: 0:0-20 1:20-40 2:40-60 3:60-80 4:80-100
+var array<int> cfHit  = array.from(0, 0, 0, 0, 0)
+var array<int> cfFail = array.from(0, 0, 0, 0, 0)
+var array<int> cfExp  = array.from(0, 0, 0, 0, 0)
+var array<int> cfLife = array.from(0, 0, 0, 0, 0)   // resolved barsAlive toplamı / bin
+// Korelasyon toplamları (success = HIT?1:0, resolved üzerinde).
+var int   cfN   = 0
+var float cfSx  = 0.0
+var float cfSy  = 0.0
+var float cfSxy = 0.0
+var float cfSxx = 0.0
+var float cfSyy = 0.0
+// Score/Support grubuna göre confidence toplamı (ortalama için; sayım an* sayaçlarından).
+var array<float> cfScSum = array.from(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+var array<float> cfSpSum = array.from(0.0, 0.0, 0.0, 0.0)
 
 // -----------------------------------------------------------------------------
 // RESEARCH ENGINE — iki-feature kombinasyon sayaçları (sınırlı, incremental).
@@ -922,6 +970,36 @@ f_resStab(table t, int startR, int famCode, string famName, array<Cand> cs, floa
         r += 1
     r
 
+// Confidence: özet/reliability metrik satırı (label | value; 8 sütun).
+f_cfMetric(table t, int r, string lbl, string val) =>
+    table.cell(t, 0, r, lbl, text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, val, text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    for c = 2 to 7
+        table.cell(t, c, r, "", bgcolor = RES_CELL)
+
+// Confidence: kalibrasyon başlık satırı (8 sütun).
+f_cfHdr(table t, int r) =>
+    table.cell(t, 0, r, "Range",   text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, "N",       text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 2, r, "Hit",     text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 3, r, "Fail",    text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 4, r, "Exp",     text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 5, r, "ResHit%", text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 6, r, "Ovr%",    text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 7, r, "Life",    text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+
+// Confidence: kalibrasyon veri satırı.
+f_cfCalRow(table t, int r, string lbl, int h, int f, int e, int sumLife) =>
+    int n = h + f + e
+    table.cell(t, 0, r, lbl,             text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, str.tostring(n), text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 2, r, str.tostring(h), text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 3, r, str.tostring(f), text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 4, r, str.tostring(e), text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 5, r, f_pctS(h, h + f), text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 6, r, f_pctS(h, n),     text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 7, r, n > 0 ? str.tostring(sumLife / n, "#.#") : "—", text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+
 // -----------------------------------------------------------------------------
 // Görüntüleme penceresi: kaç prediction ÇİZİLİ tutulacak (kayıt sayısını etkilemez).
 // Obje limitine (500) göre güvenli üst sınır hesaplanır.
@@ -1043,6 +1121,33 @@ if barstate.isconfirmed
                     if f_condMet(array.get(cbKindA, ci), array.get(cbLvlA, ci), scB, spB, tdB, cwB, dB) and f_condMet(array.get(cbKindB, ci), array.get(cbLvlB, ci), scB, spB, tdB, cwB, dB)
                         f_bump3(cbHit, cbFail, cbExp, ci, rs)
 
+                // ---- CONFIDENCE: çözülen kaydın (dondurulmuş) confidence'ını istatistiğe kat ----
+                float pc = na(p.confidence) ? 50.0 : p.confidence
+                cfSumAll += pc
+                if rs == 1
+                    cfSumHit += pc
+                else if rs == 2
+                    cfSumFail += pc
+                else
+                    cfSumExp += pc
+                int cbn = f_confBin(pc)
+                if rs == 1
+                    array.set(cfHit, cbn, array.get(cfHit, cbn) + 1)
+                else if rs == 2
+                    array.set(cfFail, cbn, array.get(cfFail, cbn) + 1)
+                else
+                    array.set(cfExp, cbn, array.get(cfExp, cbn) + 1)
+                array.set(cfLife, cbn, array.get(cfLife, cbn) + p.barsAlive)
+                float succ = rs == 1 ? 1.0 : 0.0
+                cfN   += 1
+                cfSx  += pc
+                cfSy  += succ
+                cfSxy += pc * succ
+                cfSxx += pc * pc
+                cfSyy += succ * succ
+                array.set(cfScSum, scB, array.get(cfScSum, scB) + pc)
+                array.set(cfSpSum, spB, array.get(cfSpSum, spB) + pc)
+
                 array.remove(activeList, ai)
                 resolved := true
         if not resolved
@@ -1102,25 +1207,7 @@ if barstate.isconfirmed
                         float pCenter = array.get(projs, pIdx).price
                         int   dir     = wantDown ? -1 : 1
 
-                        // 1c) Çizim: kutu, oluştuğu (confirmed C) bardan itibaren sağa.
-                        //     Geçmişe gelecek bilgisi taşınmaz; kutu şimdi doğuyor.
-                        PredGroup g = PredGroup.new(array.new<label>(), array.new<box>())
-                        int x1 = bar_index
-                        int x2 = bar_index + projLen
-                        string pSrc = f_cluster_src_and_mark(projs, used, tol, pIdx)
-                        array.push(g.boxes, f_target_box(x1, x2, pLo, pHi, pScore, "D Target", colPrimary, atr, pSrc))
-                        if showXABC
-                            array.push(g.labels, f_mark(X.bidx, X.price, "X"))
-                            array.push(g.labels, f_mark(A.bidx, A.price, "A"))
-                            array.push(g.labels, f_mark(B.bidx, B.price, "B"))
-                            array.push(g.labels, f_mark(C.bidx, C.price, "C"))
-                        if showSecond
-                            [sIdx, sScore, sLo, sHi, sSupport] = f_best_cluster(projs, used, tol, minSupport)
-                            if sIdx >= 0 and sScore > 0
-                                string sSrc = f_cluster_src_and_mark(projs, used, tol, sIdx)
-                                array.push(g.boxes, f_target_box(x1, x2, sLo, sHi, sScore, "Secondary", colSecond, atr, sSrc))
-
-                        // 1d) Evaluation snapshot: invalidation seviyesi + ATR (oluşum anında sabitlenir).
+                        // 1c) Evaluation snapshot: invalidation seviyesi + ATR (oluşum anında sabitlenir).
                         float cATR = atr
                         float invalP = na
                         if failMode == "C ± ATR"
@@ -1129,7 +1216,7 @@ if barstate.isconfirmed
                             invalP := X.price
                         // "None" -> invalP = na (yalnız HIT/EXPIRED)
 
-                        // 1e) Analytics snapshot — oluşum anında dondurulan pasif özellikler.
+                        // 1d) Analytics snapshot — oluşum anında dondurulan pasif özellikler.
                         float anSpread   = pHi - pLo
                         float anNormW    = anSpread / math.max(tol, syminfo.mintick)
                         float anXaLen    = math.abs(X.price - A.price)
@@ -1143,7 +1230,46 @@ if barstate.isconfirmed
                         float anTDistAtr = cATR > 0 ? anTDist / cATR : na
                         float anTDistXa  = anXaLen > 0 ? anTDist / anXaLen : na
 
-                        // 1f) Snapshot kaydı — asla silinmez/yeniden hesaplanmaz. status = ACTIVE.
+                        // 1e) CONFIDENCE — YALNIZCA GEÇMİŞ istatistikten (as-of-now; lookahead yok).
+                        //     Her feature'ın bucket'ı, o ana kadar ÇÖZÜLMÜŞ prediction'ların hit-rate
+                        //     lift'ine göre küçük katkı verir; ağırlıklar sabit; düşük N katkı vermez.
+                        //     Score DEĞİŞMEZ; Confidence ayrı, tamamen istatistikseldir.
+                        float confBase = (evHit + evFail) > 0 ? 100.0 * evHit / (evHit + evFail) : na
+                        int   cDir = dir == 1 ? 0 : 1
+                        int   cScB = f_scBin(pScore)
+                        int   cSpB = f_spBin(pSupport)
+                        int   cCwB = f_cwBin(anNormW)
+                        int   cTdB = f_tdBin(anTDistAtr)
+                        int   cXaB = f_xaBin(anXaAtr)
+                        int   cBcB = f_bcBin(anBcAb)
+                        float confRaw = 0.0
+                        confRaw += f_confContrib(array.get(anSc_hit, cScB), array.get(anSc_fail, cScB), array.get(anSc_exp, cScB), confBase, 6.0, minReliableN, minStrongN)
+                        confRaw += f_confContrib(array.get(anSp_hit, cSpB), array.get(anSp_fail, cSpB), array.get(anSp_exp, cSpB), confBase, 5.0, minReliableN, minStrongN)
+                        confRaw += f_confContrib(array.get(anDir_hit, cDir), array.get(anDir_fail, cDir), array.get(anDir_exp, cDir), confBase, 3.0, minReliableN, minStrongN)
+                        confRaw += f_confContrib(array.get(anCw_hit, cCwB), array.get(anCw_fail, cCwB), array.get(anCw_exp, cCwB), confBase, 4.0, minReliableN, minStrongN)
+                        confRaw += f_confContrib(array.get(anTd_hit, cTdB), array.get(anTd_fail, cTdB), array.get(anTd_exp, cTdB), confBase, 5.0, minReliableN, minStrongN)
+                        confRaw += f_confContrib(array.get(anXa_hit, cXaB), array.get(anXa_fail, cXaB), array.get(anXa_exp, cXaB), confBase, 3.0, minReliableN, minStrongN)
+                        confRaw += f_confContrib(array.get(anBc_hit, cBcB), array.get(anBc_fail, cBcB), array.get(anBc_exp, cBcB), confBase, 2.0, minReliableN, minStrongN)
+                        float confidence = math.round(math.max(0.0, math.min(100.0, 50.0 + confRaw)))
+
+                        // 1f) Çizim: kutu, oluştuğu (confirmed C) bardan sağa (Score + Confidence).
+                        PredGroup g = PredGroup.new(array.new<label>(), array.new<box>())
+                        int x1 = bar_index
+                        int x2 = bar_index + projLen
+                        string pSrc = f_cluster_src_and_mark(projs, used, tol, pIdx)
+                        array.push(g.boxes, f_target_box(x1, x2, pLo, pHi, pScore, "D Target", colPrimary, atr, pSrc, confidence))
+                        if showXABC
+                            array.push(g.labels, f_mark(X.bidx, X.price, "X"))
+                            array.push(g.labels, f_mark(A.bidx, A.price, "A"))
+                            array.push(g.labels, f_mark(B.bidx, B.price, "B"))
+                            array.push(g.labels, f_mark(C.bidx, C.price, "C"))
+                        if showSecond
+                            [sIdx, sScore, sLo, sHi, sSupport] = f_best_cluster(projs, used, tol, minSupport)
+                            if sIdx >= 0 and sScore > 0
+                                string sSrc = f_cluster_src_and_mark(projs, used, tol, sIdx)
+                                array.push(g.boxes, f_target_box(x1, x2, sLo, sHi, sScore, "Secondary", colSecond, atr, sSrc, na))
+
+                        // 1g) Snapshot kaydı — asla silinmez/yeniden hesaplanmaz. status = ACTIVE.
                         PredRec rec = PredRec.new(id = predSeq + 1, creationBar = bar_index, pivotCBar = C.bidx,
                              direction = dir, targetLow = pLo, targetHigh = pHi, centerPrice = pCenter,
                              score = pScore, support = pSupport, viz = g,
@@ -1152,12 +1278,12 @@ if barstate.isconfirmed
                              clusterSpread = anSpread, clusterTolerance = tol, normalizedClusterWidth = anNormW,
                              xaLength = anXaLen, bcLength = anBcLen, xaAtrMultiple = anXaAtr, bcAtrMultiple = anBcAtr,
                              abXaRatio = anAbXa, bcAbRatio = anBcAb, targetDistance = anTDist,
-                             targetDistanceATR = anTDistAtr, targetDistanceXA = anTDistXa)
+                             targetDistanceATR = anTDistAtr, targetDistanceXA = anTDistXa, confidence = confidence)
                         predSeq += 1
                         array.push(records, rec)
                         cntCreated += 1
 
-                        // 1g) Evaluation kaydı: ACTIVE olarak izlemeye al + oluşum sayaçları.
+                        // 1h) Evaluation kaydı: ACTIVE olarak izlemeye al + oluşum sayaçları.
                         array.push(activeList, rec)
                         evTotal += 1
                         int csb  = f_scoreBucket(pScore)
@@ -1475,6 +1601,65 @@ if showResearch and barstate.islast
             rrow += 1
         if shown == 0 and array.size(rej) == 0
             f_resMetric(res, rrow, "No candidates", "—")
+
+// =============================================================================
+// CONFIDENCE DASHBOARD (sol üst; yalnızca son barda)
+// =============================================================================
+var table cf = na
+if showConf and barstate.islast
+    if na(cf)
+        cf := table.new(position.top_left, 8, 17, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
+
+    int   cTotRes = evHit + evFail + evExp
+    float avgConf     = cTotRes > 0 ? cfSumAll / cTotRes : na
+    float avgConfHit  = evHit > 0 ? cfSumHit / evHit : na
+    float avgConfFail = evFail > 0 ? cfSumFail / evFail : na
+    float avgConfExp  = evExp > 0 ? cfSumExp / evExp : na
+
+    // Başlık
+    table.cell(cf, 0, 0, "CONFIDENCE SUMMARY", text_color = color.white, bgcolor = RES_HDR, text_size = size.normal, text_halign = text.align_left)
+    for c = 1 to 7
+        table.cell(cf, c, 0, "", bgcolor = RES_HDR)
+    f_cfMetric(cf, 1, "Average Confidence",       na(avgConf)     ? "—" : str.tostring(avgConf, "#.#"))
+    f_cfMetric(cf, 2, "Avg Confidence of Hits",   na(avgConfHit)  ? "—" : str.tostring(avgConfHit, "#.#"))
+    f_cfMetric(cf, 3, "Avg Confidence of Fails",  na(avgConfFail) ? "—" : str.tostring(avgConfFail, "#.#"))
+    f_cfMetric(cf, 4, "Avg Confidence of Expired",na(avgConfExp)  ? "—" : str.tostring(avgConfExp, "#.#"))
+
+    // Kalibrasyon
+    table.cell(cf, 0, 5, "CALIBRATION", text_color = color.yellow, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_left)
+    for c = 1 to 7
+        table.cell(cf, c, 5, "", bgcolor = RES_SECT)
+    f_cfHdr(cf, 6)
+    f_cfCalRow(cf, 7,  "0-20",   array.get(cfHit, 0), array.get(cfFail, 0), array.get(cfExp, 0), array.get(cfLife, 0))
+    f_cfCalRow(cf, 8,  "20-40",  array.get(cfHit, 1), array.get(cfFail, 1), array.get(cfExp, 1), array.get(cfLife, 1))
+    f_cfCalRow(cf, 9,  "40-60",  array.get(cfHit, 2), array.get(cfFail, 2), array.get(cfExp, 2), array.get(cfLife, 2))
+    f_cfCalRow(cf, 10, "60-80",  array.get(cfHit, 3), array.get(cfFail, 3), array.get(cfExp, 3), array.get(cfLife, 3))
+    f_cfCalRow(cf, 11, "80-100", array.get(cfHit, 4), array.get(cfFail, 4), array.get(cfExp, 4), array.get(cfLife, 4))
+
+    // Reliability
+    table.cell(cf, 0, 12, "RELIABILITY", text_color = color.yellow, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_left)
+    for c = 1 to 7
+        table.cell(cf, c, 12, "", bgcolor = RES_SECT)
+    float corr = na
+    float denomX = cfN * cfSxx - cfSx * cfSx
+    float denomY = cfN * cfSyy - cfSy * cfSy
+    if cfN > 1 and denomX > 0 and denomY > 0
+        corr := (cfN * cfSxy - cfSx * cfSy) / math.sqrt(denomX * denomY)
+    float confLift = (na(avgConfHit) or na(avgConfFail)) ? na : avgConfHit - avgConfFail
+    string scStr = ""
+    for b = 0 to 5
+        int cnt = array.get(anSc_hit, b) + array.get(anSc_fail, b) + array.get(anSc_exp, b)
+        float av = cnt > 0 ? array.get(cfScSum, b) / cnt : na
+        scStr := scStr + (b == 0 ? "" : "/") + (na(av) ? "-" : str.tostring(av, "#"))
+    string spStr = ""
+    for b = 0 to 3
+        int cnt = array.get(anSp_hit, b) + array.get(anSp_fail, b) + array.get(anSp_exp, b)
+        float av = cnt > 0 ? array.get(cfSpSum, b) / cnt : na
+        spStr := spStr + (b == 0 ? "" : "/") + (na(av) ? "-" : str.tostring(av, "#"))
+    f_cfMetric(cf, 13, "Corr(Conf, Success)",    na(corr) ? "—" : str.tostring(corr, "#.##"))
+    f_cfMetric(cf, 14, "Avg Conf Lift (Hit-Fail)", na(confLift) ? "—" : (confLift >= 0 ? "+" : "") + str.tostring(confLift, "#.#"))
+    f_cfMetric(cf, 15, "Avg Conf by Score", scStr)
+    f_cfMetric(cf, 16, "Avg Conf by Support", spStr)
 
 // =============================================================================
 // AÇIKLAMA
