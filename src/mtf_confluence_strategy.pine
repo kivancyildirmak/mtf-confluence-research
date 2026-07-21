@@ -29,7 +29,10 @@ pivMinBars  = input.int(8,     "Pivot minimum bar",         minval = 1, group = 
 grpPred     = "Prediction / Cluster"
 projLen     = input.int(50, "Kutu uzunluğu (bar)",        minval = 5, group = grpPred)
 histMode    = input.string("Latest only", "Historical predictions", options = ["Latest only", "Keep last 5", "Keep last 10"], group = grpPred)
-clusterTol  = input.float(0.5, "Küme toleransı (× ATR)",  minval = 0.05, step = 0.05, group = grpPred)
+patternTolPct = input.float(0.50, "Pattern tolerance (% of XA)", minval = 0.01, maxval = 5.0, step = 0.01, group = grpPred)
+atrFloorMult  = input.float(0.10, "ATR floor multiplier",         minval = 0.0,  step = 0.01, group = grpPred)
+minTolTicks   = input.int(5,      "Minimum tolerance ticks",      minval = 1, group = grpPred)
+minSupport    = input.int(2,      "Minimum projections per cluster", minval = 2, group = grpPred)
 showSecond  = input.bool(false, "Secondary D Target göster", group = grpPred)
 showSources = input.bool(false, "Kutuda kaynakları göster (XA/BC ratio)", group = grpPred)
 colPrimary  = input.color(color.new(color.lime,   0), "Primary kutu rengi",   group = grpPred)
@@ -243,14 +246,18 @@ f_xabc_valid(Pivot X, Pivot A, Pivot B, Pivot C) =>
 // En YÜKSEK SKORLU kümeyi bulur (used=true olanlar hariç). Skor = ağırlıklı:
 //   + farklı ratio sayısı (aynı ratio tekrarına ekstra yok)
 //   + XA ve BC birlikte varsa mix bonusu (+2)  (yalnız-BC / yalnız-XA daha düşük)
-//   + sıkılık bonusu: 2*(1 - spread/tol)  (üyeler ne kadar yakınsa o kadar yüksek)
+//   + sıkılık bonusu: 2*max(0, 1 - spread/(2*tol))  (spread=0→2, =tol→1, =2*tol→0)
+// Bir küme aday olabilmek için en az minSupport DISTINCT projeksiyon içermelidir
+//   (aynı fiyat+aynı oran kopyası ayrı destek saymaz). Uygun küme yoksa bestIdx=-1.
 // DÖNÜŞ: [merkezIndex, skor, altFiyat, üstFiyat].
-f_best_cluster(array<Proj> projs, array<bool> used, float tol) =>
+f_best_cluster(array<Proj> projs, array<bool> used, float tol, int minSupport) =>
     int   nD = array.size(projs)
     int   bestIdx = -1
     float bestScore = -1.0
     float bestLo = na
     float bestHi = na
+    // Sıfıra bölünmeye karşı güvenli alt sınır (tol zaten tickFloor ile > 0'dır).
+    float safeTol = math.max(tol, syminfo.mintick)
     for i = 0 to nD - 1
         if not array.get(used, i)
             float center = array.get(projs, i).price
@@ -259,6 +266,7 @@ f_best_cluster(array<Proj> projs, array<bool> used, float tol) =>
             bool  hasXA = false
             bool  hasBC = false
             int   distinct = 0
+            int   support  = 0
             for j = 0 to nD - 1
                 if not array.get(used, j)
                     Proj pj = array.get(projs, j)
@@ -269,19 +277,27 @@ f_best_cluster(array<Proj> projs, array<bool> used, float tol) =>
                             hasXA := true
                         else
                             hasBC := true
-                        bool firstOfRatio = true
+                        bool firstOfRatio  = true
+                        bool firstOfMember = true
                         for k = 0 to j - 1
                             if not array.get(used, k)
                                 Proj pk = array.get(projs, k)
-                                if math.abs(pk.price - center) <= tol and pk.ratio == pj.ratio
-                                    firstOfRatio := false
-                                    break
+                                if math.abs(pk.price - center) <= tol
+                                    if pk.ratio == pj.ratio
+                                        firstOfRatio := false
+                                    // Aynı fiyat VE aynı oran = kaza eseri kopya; destek saymaz.
+                                    if pk.ratio == pj.ratio and pk.price == pj.price
+                                        firstOfMember := false
                         if firstOfRatio
                             distinct += 1
-            float spread = na(hi) ? 0.0 : hi - lo
-            float tight  = tol > 0 ? math.max(0.0, 1.0 - spread / tol) : 0.0
-            float score  = distinct + (hasXA and hasBC ? 2.0 : 0.0) + 2.0 * tight
-            if score > bestScore
+                        if firstOfMember
+                            support += 1
+            float spread     = na(hi) ? 0.0 : hi - lo
+            float normSpread = spread / (2.0 * safeTol)
+            float tight      = 2.0 * math.max(0.0, 1.0 - normSpread)
+            float score      = distinct + (hasXA and hasBC ? 2.0 : 0.0) + tight
+            // En az minSupport DISTINCT projeksiyon içeren kümeler aday olabilir.
+            if support >= minSupport and score > bestScore
                 bestIdx   := i
                 bestScore := score
                 bestLo    := lo
@@ -389,11 +405,16 @@ if not na(newPiv) and array.size(pivots) >= 4
                 array.push(projs, Proj.new(d, 1, r))
 
         if array.size(projs) > 0
-            float tol = clusterTol * atr
+            // Adaptif tolerans: pattern boyutuna (XA) orantılı, ATR ve tick tabanı ile.
+            // C onaylandığında bir kez hesaplanır (snapshot) — sonradan yeniden hesaplanmaz.
+            float patternTolerance = math.abs(A.price - X.price) * (patternTolPct / 100.0)
+            float atrFloor  = atr * atrFloorMult
+            float tickFloor = syminfo.mintick * minTolTicks
+            float tol = math.max(patternTolerance, math.max(atrFloor, tickFloor))
             array<bool> used = array.new<bool>(array.size(projs), false)
 
-            // 2) Primary = en yüksek skorlu küme.
-            [pIdx, pScore, pLo, pHi] = f_best_cluster(projs, used, tol)
+            // 2) Primary = en yüksek skorlu küme (en az minSupport üye şart).
+            [pIdx, pScore, pLo, pHi] = f_best_cluster(projs, used, tol, minSupport)
             if pIdx >= 0
                 PredGroup g = PredGroup.new(array.new<label>(), array.new<box>())
                 int x1 = C.bidx
@@ -409,7 +430,7 @@ if not na(newPiv) and array.size(pivots) >= 4
 
                 // 3) Secondary = kalanların en yüksek skorlusu (opsiyonel).
                 if showSecond
-                    [sIdx, sScore, sLo, sHi] = f_best_cluster(projs, used, tol)
+                    [sIdx, sScore, sLo, sHi] = f_best_cluster(projs, used, tol, minSupport)
                     if sIdx >= 0 and sScore > 0
                         string sSrc = f_cluster_src_and_mark(projs, used, tol, sIdx)
                         f_target_box(g, x1, x2, sLo, sHi, sScore, "Secondary D Target", colSecond, atr, sSrc)
@@ -427,9 +448,15 @@ if not na(newPiv) and array.size(pivots) >= 4
 //   & BC/AB oran sınırları. Geçersizse hiçbir hedef çizilmez.
 // Üretim anı: yalnızca yeni confirmed pivot (yeni C) bar-close event'inde, bir kez.
 // Formüller: D_XA = A - r*(A-X) ; D_BC = C - r*(C-B). Yön filtresinden geçer.
+// Tolerans (adaptif): tol = max(|A-X|*patternTolPct%, ATR*atrFloorMult,
+//   mintick*minTolTicks). C onaylanınca bir kez hesaplanır (snapshot).
 // Cluster skor (f_best_cluster): farklı ratio sayısı + (XA&BC mix bonusu +2) +
-//   2*(1 - spread/tol) sıkılık. Aynı ratio tekrarı ekstra puan almaz; yalnız-BC/
-//   yalnız-XA küme mix bonusu alamaz. En yüksek skor Primary, ikinci Secondary.
+//   sıkılık. Sıkılık = 2*max(0, 1 - spread/(2*tol)): spread=0→2, spread=tol→1,
+//   spread=2*tol→0. Aynı ratio tekrarı ekstra puan almaz; yalnız-BC/yalnız-XA küme
+//   mix bonusu alamaz. Bir küme Primary/Secondary adayı olmak için en az minSupport
+//   DISTINCT projeksiyon içermelidir (aynı fiyat+aynı oran kopyası destek saymaz).
+//   Uygun küme yoksa hiçbir hedef kutusu çizilmez. En yüksek skor Primary, ikinci
+//   Secondary.
 // Neden repaint yok: motor yalnızca barstate.isconfirmed içinde ilerler; C onaylanınca
 //   X/A/B/C ve küme sınırları/skoru sabit; request.security/lookahead yok; historical
 //   gruplar bir daha hesaplanmaz, yalnızca (pruning'de) silinir.
