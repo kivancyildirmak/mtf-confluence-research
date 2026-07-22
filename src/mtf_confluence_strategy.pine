@@ -50,31 +50,39 @@ grpView     = "Görünüm / Historical"
 histDisplay = input.string("All historical", "Historical display mode", options = ["Latest only", "All historical", "Last N predictions"], group = grpView)
 histCount   = input.int(50, "Historical prediction count", minval = 1, group = grpView)
 showXABC    = input.bool(false, "X/A/B/C harflerini göster", group = grpView)
-showDebug   = input.bool(false, "Debug tablo göster (sağ alt)", group = grpView)
 
 grpEval       = "Evaluation Engine"
 failMode      = input.string("C ± ATR", "Failure Mode", options = ["C ± ATR", "X Pivot", "None"], group = grpEval)
 evalAtrMult   = input.float(0.50, "ATR Multiplier", minval = 0.0, step = 0.05, group = grpEval)
 maxActiveBars = input.int(50, "Maximum Active Bars", minval = 1, group = grpEval)
 ambigMode     = input.string("Conservative", "Ambiguous Handling", options = ["Conservative", "Optimistic", "Ignore"], group = grpEval)
-showEval      = input.bool(true, "Evaluation dashboard göster (sağ üst)", group = grpEval)
 
 grpAn         = "Prediction Analytics"
 analyticsView = input.string("Evaluation Summary", "Analytics View", options = ["Evaluation Summary", "Score Thresholds", "Support Thresholds", "Direction", "Cluster Width", "Target Distance", "XA Scale", "BC Ratio"], group = grpAn)
 minReliableN  = input.int(20, "Minimum Reliable Sample", minval = 1, group = grpAn)
-showAnalytics = input.bool(true, "Show Analytics Dashboard (sol alt)", group = grpAn)
 
 grpRes         = "Prediction Research"
 researchView   = input.string("Research Summary", "Research View", options = ["Research Summary", "Top Features", "Negative Features", "Top Combinations", "Stability", "Recommendations"], group = grpRes)
 minStrongN     = input.int(50, "Minimum Strong Sample", minval = 1, group = grpRes)
 coverageFloor  = input.float(10.0, "Coverage Floor (%)", minval = 0.0, step = 1.0, group = grpRes)
 maxPerFamily   = input.int(2, "Maximum Results Per Feature Family", minval = 1, group = grpRes)
-showResearch   = input.bool(true, "Show Research Dashboard (alt orta)", group = grpRes)
 
 grpConf      = "Confidence Engine"
 confGain     = input.float(2.0, "Confidence spread (gain)", minval = 0.5, maxval = 5.0, step = 0.1, group = grpConf)
 showConfBox  = input.bool(true, "Kutuda Confidence göster", group = grpConf)
-showConf     = input.bool(true, "Show Confidence Dashboard (sol üst)", group = grpConf)
+
+// =============================================================================
+// DASHBOARD MANAGER — tek yerden yerleşim/görünürlük yönetimi (motor matematiği
+// değişmez; yalnızca hangi tablonun nerede/nasıl gösterileceğini belirler).
+// =============================================================================
+grpDash       = "Dashboard"
+dashLayout    = input.string("Single Panel", "Dashboard Layout", options = ["Single Panel", "Multi Panel", "Minimal"], group = grpDash)
+dashView      = input.string("Evaluation", "Dashboard View (Single Panel)", options = ["Evaluation", "Analytics", "Research", "Confidence", "Debug"], group = grpDash)
+mShowEval     = input.bool(true,  "Show Evaluation (Multi)", group = grpDash)
+mShowConf     = input.bool(true,  "Show Confidence (Multi)", group = grpDash)
+mShowAnalytic = input.bool(false, "Show Analytics (Multi)",  group = grpDash)
+mShowResearch = input.bool(false, "Show Research (Multi)",   group = grpDash)
+mShowDebug    = input.bool(false, "Show Debug (Multi)",      group = grpDash)
 
 // =============================================================================
 // Veri yapıları
@@ -916,6 +924,44 @@ f_addFeatSingles(array<Cand> cs, int fam, array<string> labels, array<int> hh, a
     for i = 0 to array.size(labels) - 1
         array.push(cs, Cand.new(fam, i, array.get(labels, i), "", -1, i, -1, -1, array.get(hh, i), array.get(ff, i), array.get(ee, i)))
 
+// Tüm tekil aday listesini (klasik + feature engineering) kurar ve döndürür.
+// Research dashboard ve Minimal panel bunu paylaşır (tek kaynak; sayaçları OKUR).
+f_buildSingles() =>
+    array<Cand> cs = array.new<Cand>()
+    for li = 1 to 5
+        [h, f, e] = f_condCounts(0, li)
+        array.push(cs, Cand.new(0, li - 1, "Score>=" + (li == 1 ? "5.0" : li == 2 ? "5.5" : li == 3 ? "6.0" : li == 4 ? "6.5" : "7.0"), "", 0, li, -1, -1, h, f, e))
+    for li = 0 to 3
+        [h, f, e] = f_condCounts(1, li)
+        array.push(cs, Cand.new(1, li, "Support>=" + str.tostring(li + 2), "", 1, li, -1, -1, h, f, e))
+    for li = 0 to 1
+        [h, f, e] = f_condCounts(4, li)
+        array.push(cs, Cand.new(2, li, li == 0 ? "Bullish" : "Bearish", "", 4, li, -1, -1, h, f, e))
+    for li = 0 to 2
+        [h, f, e] = f_condCounts(3, li)
+        array.push(cs, Cand.new(3, li, "Width<=" + (li == 0 ? "0.25" : li == 1 ? "0.50" : "1.00"), "", 3, li, -1, -1, h, f, e))
+    for li = 0 to 2
+        [h, f, e] = f_condCounts(2, li)
+        array.push(cs, Cand.new(4, li, "Dist<=" + (li == 0 ? "1" : li == 1 ? "2" : "4") + "ATR", "", 2, li, -1, -1, h, f, e))
+    for li = 0 to 3
+        array.push(cs, Cand.new(5, li, li == 0 ? "XA<3" : li == 1 ? "XA3-6" : li == 2 ? "XA6-10" : "XA>10", "", -1, li, -1, -1, array.get(anXa_hit, li), array.get(anXa_fail, li), array.get(anXa_exp, li)))
+    for li = 0 to 4
+        string bl = li == 0 ? "BC<.382" : li == 1 ? "BC.382-.5" : li == 2 ? "BC.5-.618" : li == 3 ? "BC.618-.786" : "BC>.786"
+        array.push(cs, Cand.new(6, li, bl, "", -1, li, -1, -1, array.get(anBc_hit, li), array.get(anBc_fail, li), array.get(anBc_exp, li)))
+    f_addFeatSingles(cs, 8,  feEmaT_lbl, feEmaT_hit, feEmaT_fail, feEmaT_exp)
+    f_addFeatSingles(cs, 9,  feSlp_lbl,  feSlp_hit,  feSlp_fail,  feSlp_exp)
+    f_addFeatSingles(cs, 10, feAdx_lbl,  feAdx_hit,  feAdx_fail,  feAdx_exp)
+    f_addFeatSingles(cs, 11, feRsi_lbl,  feRsi_hit,  feRsi_fail,  feRsi_exp)
+    f_addFeatSingles(cs, 12, feVol_lbl,  feVol_hit,  feVol_fail,  feVol_exp)
+    f_addFeatSingles(cs, 13, feD50_lbl,  feD50_hit,  feD50_fail,  feD50_exp)
+    f_addFeatSingles(cs, 14, feD200_lbl, feD200_hit, feD200_fail, feD200_exp)
+    f_addFeatSingles(cs, 15, feTr_lbl,   feTr_hit,   feTr_fail,   feTr_exp)
+    f_addFeatSingles(cs, 16, feSw_lbl,   feSw_hit,   feSw_fail,   feSw_exp)
+    f_addFeatSingles(cs, 17, feEx_lbl,   feEx_hit,   feEx_fail,   feEx_exp)
+    f_addFeatSingles(cs, 18, feTm_lbl,   feTm_hit,   feTm_fail,   feTm_exp)
+    f_addFeatSingles(cs, 19, feAg_lbl,   feAg_hit,   feAg_fail,   feAg_exp)
+    cs
+
 // Türev metrikler (h,f,e + baseline + toplamlar). Lift = yüzde puan; oranlar ayrı.
 f_hitRateV(int h, int f) => (h + f) > 0 ? 100.0 * h / (h + f) : na
 f_liftV(int h, int f, float base100) => (h + f) > 0 ? (100.0 * h / (h + f) - base100) : na
@@ -1488,12 +1534,26 @@ if barstate.isconfirmed
                             f_group_delete(old.viz)
 
 // =============================================================================
+// DASHBOARD MANAGER — yerleşim/görünürlük çözümü (tek yer; motorlara dokunmaz).
+// Single Panel: yalnız seçilen view, top_right. Multi Panel: sabit konumlar +
+// panel bazlı toggle. Minimal: yalnız küçük özet panel (top_right).
+// =============================================================================
+bool dSingle  = dashLayout == "Single Panel"
+bool dMulti   = dashLayout == "Multi Panel"
+bool dMinimal = dashLayout == "Minimal"
+bool evShow = dSingle ? dashView == "Evaluation" : dMulti ? mShowEval     : false
+bool cfShow = dSingle ? dashView == "Confidence" : dMulti ? mShowConf     : false
+bool anShow = dSingle ? dashView == "Analytics"  : dMulti ? mShowAnalytic : false
+bool reShow = dSingle ? dashView == "Research"   : dMulti ? mShowResearch : false
+bool dbShow = dSingle ? dashView == "Debug"      : dMulti ? mShowDebug    : false
+
+// =============================================================================
 // DEBUG TABLO (yalnızca son barda güncellenir)
 // =============================================================================
 var table dbg = na
-if showDebug and barstate.islast
+if dbShow and barstate.islast
     if na(dbg)
-        dbg := table.new(position.bottom_right, 2, 6, border_width = 1, frame_width = 1, frame_color = color.gray)
+        dbg := table.new(dSingle ? position.top_right : position.bottom_right, 2, 6, border_width = 1, frame_width = 1, frame_color = color.gray)
     color hdr = color.new(color.blue, 20)
     color bg1 = color.new(color.gray, 90)
     color bg2 = color.new(color.gray, 80)
@@ -1509,7 +1569,7 @@ if showDebug and barstate.islast
 // EVALUATION DASHBOARD (sağ üst; yalnızca son barda)
 // =============================================================================
 var table ev = na
-if showEval and barstate.islast
+if evShow and barstate.islast
     if na(ev)
         ev := table.new(position.top_right, 6, 23, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
 
@@ -1555,9 +1615,9 @@ if showEval and barstate.islast
 // PREDICTION ANALYTICS DASHBOARD (sol üst; yalnızca son barda; tek görünüm)
 // =============================================================================
 var table ana = na
-if showAnalytics and barstate.islast
+if anShow and barstate.islast
     if na(ana)
-        ana := table.new(position.bottom_left, 11, 12, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
+        ana := table.new(dSingle ? position.top_right : position.bottom_left, 11, 12, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
 
     int   totRes  = evHit + evFail + evExp
     float base100 = (evHit + evFail) > 0 ? 100.0 * evHit / (evHit + evFail) : na
@@ -1621,50 +1681,17 @@ if showAnalytics and barstate.islast
 // PREDICTION RESEARCH DASHBOARD (alt orta; yalnızca son barda; tek görünüm)
 // =============================================================================
 var table res = na
-if showResearch and barstate.islast
+if reShow and barstate.islast
     if na(res)
-        res := table.new(position.bottom_center, 9, 22, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
+        res := table.new(dSingle ? position.top_right : position.bottom_center, 9, 22, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
 
     int   totCreated = evTotal
     int   totRes     = evHit + evFail + evExp
     float base100    = (evHit + evFail) > 0 ? 100.0 * evHit / (evHit + evFail) : na
     string baseStr   = na(base100) ? "—" : str.tostring(base100, "#.#") + "%"
 
-    // ---- Tekil aday listesi (mevcut analytics sayaçlarından) ----
-    array<Cand> singles = array.new<Cand>()
-    for li = 1 to 5
-        [h, f, e] = f_condCounts(0, li)
-        array.push(singles, Cand.new(0, li - 1, "Score>=" + (li == 1 ? "5.0" : li == 2 ? "5.5" : li == 3 ? "6.0" : li == 4 ? "6.5" : "7.0"), "", 0, li, -1, -1, h, f, e))
-    for li = 0 to 3
-        [h, f, e] = f_condCounts(1, li)
-        array.push(singles, Cand.new(1, li, "Support>=" + str.tostring(li + 2), "", 1, li, -1, -1, h, f, e))
-    for li = 0 to 1
-        [h, f, e] = f_condCounts(4, li)
-        array.push(singles, Cand.new(2, li, li == 0 ? "Bullish" : "Bearish", "", 4, li, -1, -1, h, f, e))
-    for li = 0 to 2
-        [h, f, e] = f_condCounts(3, li)
-        array.push(singles, Cand.new(3, li, "Width<=" + (li == 0 ? "0.25" : li == 1 ? "0.50" : "1.00"), "", 3, li, -1, -1, h, f, e))
-    for li = 0 to 2
-        [h, f, e] = f_condCounts(2, li)
-        array.push(singles, Cand.new(4, li, "Dist<=" + (li == 0 ? "1" : li == 1 ? "2" : "4") + "ATR", "", 2, li, -1, -1, h, f, e))
-    for li = 0 to 3
-        array.push(singles, Cand.new(5, li, li == 0 ? "XA<3" : li == 1 ? "XA3-6" : li == 2 ? "XA6-10" : "XA>10", "", -1, li, -1, -1, array.get(anXa_hit, li), array.get(anXa_fail, li), array.get(anXa_exp, li)))
-    for li = 0 to 4
-        string bl = li == 0 ? "BC<.382" : li == 1 ? "BC.382-.5" : li == 2 ? "BC.5-.618" : li == 3 ? "BC.618-.786" : "BC>.786"
-        array.push(singles, Cand.new(6, li, bl, "", -1, li, -1, -1, array.get(anBc_hit, li), array.get(anBc_fail, li), array.get(anBc_exp, li)))
-    // Feature engineering tekil adayları (pasif; Research otomatik analiz eder).
-    f_addFeatSingles(singles, 8,  feEmaT_lbl, feEmaT_hit, feEmaT_fail, feEmaT_exp)
-    f_addFeatSingles(singles, 9,  feSlp_lbl,  feSlp_hit,  feSlp_fail,  feSlp_exp)
-    f_addFeatSingles(singles, 10, feAdx_lbl,  feAdx_hit,  feAdx_fail,  feAdx_exp)
-    f_addFeatSingles(singles, 11, feRsi_lbl,  feRsi_hit,  feRsi_fail,  feRsi_exp)
-    f_addFeatSingles(singles, 12, feVol_lbl,  feVol_hit,  feVol_fail,  feVol_exp)
-    f_addFeatSingles(singles, 13, feD50_lbl,  feD50_hit,  feD50_fail,  feD50_exp)
-    f_addFeatSingles(singles, 14, feD200_lbl, feD200_hit, feD200_fail, feD200_exp)
-    f_addFeatSingles(singles, 15, feTr_lbl,   feTr_hit,   feTr_fail,   feTr_exp)
-    f_addFeatSingles(singles, 16, feSw_lbl,   feSw_hit,   feSw_fail,   feSw_exp)
-    f_addFeatSingles(singles, 17, feEx_lbl,   feEx_hit,   feEx_fail,   feEx_exp)
-    f_addFeatSingles(singles, 18, feTm_lbl,   feTm_hit,   feTm_fail,   feTm_exp)
-    f_addFeatSingles(singles, 19, feAg_lbl,   feAg_hit,   feAg_fail,   feAg_exp)
+    // ---- Tekil aday listesi (paylaşılan kaynak; sayaçları OKUR) ----
+    array<Cand> singles = f_buildSingles()
 
     // ---- Kombinasyon aday listesi (mevcut kombinasyon sayaçlarından) ----
     array<Cand> combos = array.new<Cand>()
@@ -1808,9 +1835,9 @@ if showResearch and barstate.islast
 // CONFIDENCE DASHBOARD (sol üst; yalnızca son barda)
 // =============================================================================
 var table cf = na
-if showConf and barstate.islast
+if cfShow and barstate.islast
     if na(cf)
-        cf := table.new(position.top_left, 8, 17, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
+        cf := table.new(dSingle ? position.top_right : position.top_left, 8, 17, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
 
     int   cTotRes = evHit + evFail + evExp
     float avgConf     = cTotRes > 0 ? cfSumAll / cTotRes : na
@@ -1862,6 +1889,66 @@ if showConf and barstate.islast
     f_cfMetric(cf, 14, "Avg Conf Lift (Hit-Fail)", na(confLift) ? "—" : (confLift >= 0 ? "+" : "") + str.tostring(confLift, "#.#"))
     f_cfMetric(cf, 15, "Avg Conf by Score", scStr)
     f_cfMetric(cf, 16, "Avg Conf by Support", spStr)
+
+// =============================================================================
+// TABLE LIFECYCLE — görünür olmayan tabloları ekrandan TAMAMEN kaldır (kalıntı yok).
+// =============================================================================
+if barstate.islast
+    if not dbShow and not na(dbg)
+        table.delete(dbg)
+        dbg := na
+    if not evShow and not na(ev)
+        table.delete(ev)
+        ev := na
+    if not anShow and not na(ana)
+        table.delete(ana)
+        ana := na
+    if not reShow and not na(res)
+        table.delete(res)
+        res := na
+    if not cfShow and not na(cf)
+        table.delete(cf)
+        cf := na
+
+// =============================================================================
+// MINIMAL PANEL (yalnız Minimal modda; küçük özet; top_right)
+// =============================================================================
+var table mini = na
+if dMinimal and barstate.islast
+    if na(mini)
+        mini := table.new(position.top_right, 2, 8, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
+    int   mTotRes  = evHit + evFail + evExp
+    float mAvgConf = mTotRes > 0 ? cfSumAll / mTotRes : na
+    float mCorr = na
+    float mDx = cfN * cfSxx - cfSx * cfSx
+    float mDy = cfN * cfSyy - cfSy * cfSy
+    if cfN > 1 and mDx > 0 and mDy > 0
+        mCorr := (cfN * cfSxy - cfSx * cfSy) / math.sqrt(mDx * mDy)
+    array<Cand> mSingles = f_buildSingles()
+    float mBase   = (evHit + evFail) > 0 ? 100.0 * evHit / (evHit + evFail) : na
+    int   mBestI  = -1
+    float mBestRS = -1.0
+    for i = 0 to array.size(mSingles) - 1
+        Cand c = array.get(mSingles, i)
+        float lift = f_liftV(c.hit, c.fail, mBase)
+        float rs   = f_rScoreV(c.hit, c.fail, c.exp, mBase, minStrongN, mTotRes)
+        if not na(lift) and lift > 0 and rs > mBestRS
+            mBestRS := rs
+            mBestI  := i
+    string mBestStr = mBestI < 0 ? "—" : f_famName(array.get(mSingles, mBestI).fam) + " " + array.get(mSingles, mBestI).label
+    table.cell(mini, 0, 0, "SUMMARY", text_color = color.white, bgcolor = RES_HDR, text_size = size.small, text_halign = text.align_left)
+    table.cell(mini, 1, 0, "", bgcolor = RES_HDR)
+    f_drow(mini, 1, "Total Pred",     str.tostring(evTotal),                   RES_CELL)
+    f_drow(mini, 2, "Hit Rate",       f_pctS(evHit, evHit + evFail),           RES_CELL)
+    f_drow(mini, 3, "Overall",        f_pctS(evHit, mTotRes),                  RES_CELL)
+    f_drow(mini, 4, "Active",         str.tostring(array.size(activeList)),    RES_CELL)
+    f_drow(mini, 5, "Avg Conf",       na(mAvgConf) ? "—" : str.tostring(mAvgConf, "#.#"), RES_CELL)
+    f_drow(mini, 6, "Conf Corr",      na(mCorr) ? "—" : str.tostring(mCorr, "#.##"),      RES_CELL)
+    f_drow(mini, 7, "Best Feature",   mBestStr,                                RES_CELL)
+else
+    if not na(mini)
+        table.delete(mini)
+        mini := na
 
 // =============================================================================
 // AÇIKLAMA
