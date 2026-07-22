@@ -995,11 +995,13 @@ f_clsColor(int c) => c == 2 ? color.rgb(0, 90, 0) : c == 1 ? color.rgb(20, 70, 2
 f_liftColor(float lift) => na(lift) ? color.rgb(25, 25, 25) : lift > 1.0 ? color.rgb(0, 90, 0) : lift < -1.0 ? color.rgb(120, 0, 0) : color.rgb(60, 60, 60)
 f_liftStr(float lift) => na(lift) ? "—" : (lift >= 0 ? "+" : "") + str.tostring(lift, "#.#") + " pp"
 f_pctF(float v) => na(v) ? "—" : str.tostring(v, "#.#") + "%"
-// Meta Research export biçimlendiricileri (pasif; yalnız string üretir).
-f_n1(float v)   => na(v) ? "na" : str.tostring(v, "#.#")
-f_n2(float v)   => na(v) ? "na" : str.tostring(v, "#.##")
-f_sgn1(float v) => na(v) ? "na" : (v >= 0 ? "+" : "") + str.tostring(v, "#.#")
+// Meta Research export biçimlendiricileri (pasif; DAİMA geçerli string üretir).
+// na hiçbir zaman propagate etmez: sayılar "NA" (CSV) / null (JSON), string'ler "NA".
+f_n1(float v)   => na(v) ? "NA" : str.tostring(v, "#.#")
+f_n2(float v)   => na(v) ? "NA" : str.tostring(v, "#.##")
+f_sgn1(float v) => na(v) ? "NA" : (v >= 0 ? "+" : "") + str.tostring(v, "#.#")
 f_jn(float v)   => na(v) ? "null" : str.tostring(v, "#.#")
+f_s(string s)   => na(s) or s == "" ? "NA" : s
 
 // Komşu eşik kararlılığı (STABLE / MIXED / ISOLATED / —).
 f_stab3(float lp, float lc, float ln) =>
@@ -2020,14 +2022,20 @@ if researchMode == "Export"
             xSumConf  += rr.confidence
         float xAvgScore = xRn > 0 ? xSumScore / xRn : na
         float xAvgConf  = xRn > 0 ? xSumConf / xRn : na
-        // Tek satır (CSV / JSON)
-        string exportStr = exportFmt == "JSON" ? '{"symbol":"' + mSym + '","timeframe":"' + mTf + '","predictionCount":' + str.tostring(evTotal) + ',"resolvedCount":' + str.tostring(xResolved) + ',"hitRate":' + f_jn(xBase) + ',"overallSuccess":' + f_jn(xOverall) + ',"confidenceCorrelation":' + f_jn(xCorr) + ',"avgConfidenceLift":' + f_jn(xConfLift) + ',"scoreThresholdLift":' + f_jn(xScThrLift) + ',"bestSingleFeature":"' + xBestSingle + '","bestSingleLift":' + f_jn(xBestSingleLift) + ',"bestCombination":"' + xBestCombo + '","bestCombinationLift":' + f_jn(xBestComboLift) + ',"coverage":' + f_jn(xCoverage) + ',"avgConfidence":' + f_jn(xAvgConf) + ',"avgScore":' + f_jn(xAvgScore) + '}' : mSym + "," + mTf + "," + str.tostring(evTotal) + "," + str.tostring(xResolved) + "," + f_n1(xBase) + "," + f_n1(xOverall) + "," + f_n2(xCorr) + "," + f_sgn1(xConfLift) + "," + f_sgn1(xScThrLift) + "," + xBestSingle + "," + f_sgn1(xBestSingleLift) + "," + xBestCombo + "," + f_sgn1(xBestComboLift) + "," + f_n1(xCoverage) + "," + f_n1(xAvgConf) + "," + f_n1(xAvgScore)
+        // Tek satır (CSV / JSON). TÜM string alanlar f_s ile korunur → na propagate ETMEZ.
+        string sSym    = f_s(mSym)
+        string sTf     = f_s(mTf)
+        string sSingle = f_s(xBestSingle)
+        string sCombo  = f_s(xBestCombo)
+        string exportStr = exportFmt == "JSON" ? '{"symbol":"' + sSym + '","timeframe":"' + sTf + '","predictionCount":' + str.tostring(evTotal) + ',"resolvedCount":' + str.tostring(xResolved) + ',"hitRate":' + f_jn(xBase) + ',"overallSuccess":' + f_jn(xOverall) + ',"confidenceCorrelation":' + f_jn(xCorr) + ',"avgConfidenceLift":' + f_jn(xConfLift) + ',"scoreThresholdLift":' + f_jn(xScThrLift) + ',"bestSingleFeature":"' + sSingle + '","bestSingleLift":' + f_jn(xBestSingleLift) + ',"bestCombination":"' + sCombo + '","bestCombinationLift":' + f_jn(xBestComboLift) + ',"coverage":' + f_jn(xCoverage) + ',"avgConfidence":' + f_jn(xAvgConf) + ',"avgScore":' + f_jn(xAvgScore) + '}' : sSym + "," + sTf + "," + str.tostring(evTotal) + "," + str.tostring(xResolved) + "," + f_n1(xBase) + "," + f_n1(xOverall) + "," + f_n2(xCorr) + "," + f_sgn1(xConfLift) + "," + f_sgn1(xScThrLift) + "," + sSingle + "," + f_sgn1(xBestSingleLift) + "," + sCombo + "," + f_sgn1(xBestComboLift) + "," + f_n1(xCoverage) + "," + f_n1(xAvgConf) + "," + f_n1(xAvgScore)
+        // Son güvence: her ihtimale karşı exportStr asla na kalmasın.
+        string safeStr = na(exportStr) ? (f_s(mSym) + "," + f_s(mTf) + ",EXPORT_FALLBACK") : exportStr
         if na(meta)
             meta := table.new(position.top_center, 1, 2, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
         table.cell(meta, 0, 0, "META EXPORT (" + exportFmt + ") — kopyala / Pine Logs", text_color = color.white, bgcolor = RES_HDR, text_size = size.small, text_halign = text.align_left)
-        table.cell(meta, 0, 1, exportStr, text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+        table.cell(meta, 0, 1, safeStr, text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
         if not metaLogged
-            log.info(exportStr)
+            log.info(safeStr)
             metaLogged := true
 else
     if not na(meta)
