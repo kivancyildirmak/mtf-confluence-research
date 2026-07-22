@@ -84,6 +84,10 @@ mShowAnalytic = input.bool(false, "Show Analytics (Multi)",  group = grpDash)
 mShowResearch = input.bool(false, "Show Research (Multi)",   group = grpDash)
 mShowDebug    = input.bool(false, "Show Debug (Multi)",      group = grpDash)
 
+grpMeta      = "Meta Research"
+researchMode = input.string("Local", "Research Mode", options = ["Local", "Export"], group = grpMeta)
+exportFmt    = input.string("CSV", "Export Format", options = ["CSV", "JSON"], group = grpMeta)
+
 // =============================================================================
 // Veri yapıları
 // =============================================================================
@@ -991,6 +995,11 @@ f_clsColor(int c) => c == 2 ? color.rgb(0, 90, 0) : c == 1 ? color.rgb(20, 70, 2
 f_liftColor(float lift) => na(lift) ? color.rgb(25, 25, 25) : lift > 1.0 ? color.rgb(0, 90, 0) : lift < -1.0 ? color.rgb(120, 0, 0) : color.rgb(60, 60, 60)
 f_liftStr(float lift) => na(lift) ? "—" : (lift >= 0 ? "+" : "") + str.tostring(lift, "#.#") + " pp"
 f_pctF(float v) => na(v) ? "—" : str.tostring(v, "#.#") + "%"
+// Meta Research export biçimlendiricileri (pasif; yalnız string üretir).
+f_n1(float v)   => na(v) ? "na" : str.tostring(v, "#.#")
+f_n2(float v)   => na(v) ? "na" : str.tostring(v, "#.##")
+f_sgn1(float v) => na(v) ? "na" : (v >= 0 ? "+" : "") + str.tostring(v, "#.#")
+f_jn(float v)   => na(v) ? "null" : str.tostring(v, "#.#")
 
 // Komşu eşik kararlılığı (STABLE / MIXED / ISOLATED / —).
 f_stab3(float lp, float lc, float ln) =>
@@ -1949,6 +1958,81 @@ else
     if not na(mini)
         table.delete(mini)
         mini := na
+
+// =============================================================================
+// META RESEARCH EXPORT (pasif; hiçbir motoru/matematiği DEĞİŞTİRMEZ; yalnız OKUR)
+// Research Mode = Export iken tek satırlık standart özet (CSV/JSON) üretir:
+// üstte kopyalanabilir panel (top_center) + Pine Logs'a bir kez log.info.
+// =============================================================================
+var table meta = na
+var bool metaLogged = false
+if researchMode == "Export"
+    if barstate.islast
+        string mSym = syminfo.ticker
+        string mTf  = timeframe.isdaily ? "1D" : timeframe.isweekly ? "1W" : timeframe.ismonthly ? "1M" : (timeframe.isminutes and timeframe.multiplier % 60 == 0) ? (str.tostring(timeframe.multiplier / 60, "#") + "H") : timeframe.isminutes ? (str.tostring(timeframe.multiplier) + "m") : timeframe.period
+        int   xResolved = evHit + evFail + evExp
+        float xBase     = (evHit + evFail) > 0 ? 100.0 * evHit / (evHit + evFail) : na
+        float xOverall  = xResolved > 0 ? 100.0 * evHit / xResolved : na
+        float xCorr = na
+        float xDx = cfN * cfSxx - cfSx * cfSx
+        float xDy = cfN * cfSyy - cfSy * cfSy
+        if cfN > 1 and xDx > 0 and xDy > 0
+            xCorr := (cfN * cfSxy - cfSx * cfSy) / math.sqrt(xDx * xDy)
+        float xAcHit    = evHit  > 0 ? cfSumHit  / evHit  : na
+        float xAcFail   = evFail > 0 ? cfSumFail / evFail : na
+        float xConfLift = (na(xAcHit) or na(xAcFail)) ? na : xAcHit - xAcFail
+        // En iyi tekil feature + score-threshold lift
+        array<Cand> xS = f_buildSingles()
+        array<int> xTop = f_rankSingles(xS, 1, 999, xBase, xResolved, minReliableN, minStrongN, coverageFloor)
+        string xBestSingle = "-"
+        float  xBestSingleLift = na
+        float  xCoverage = na
+        if array.size(xTop) > 0
+            Cand bcd = array.get(xS, array.get(xTop, 0))
+            xBestSingle := bcd.label
+            xBestSingleLift := f_liftV(bcd.hit, bcd.fail, xBase)
+            xCoverage := f_covV(bcd.hit, bcd.fail, bcd.exp, xResolved)
+        float xScThrLift = na
+        for i = 0 to array.size(xS) - 1
+            Cand c = array.get(xS, i)
+            if c.fam == 0 and (c.hit + c.fail + c.exp) >= minReliableN
+                float lf = f_liftV(c.hit, c.fail, xBase)
+                if not na(lf) and (na(xScThrLift) or lf > xScThrLift)
+                    xScThrLift := lf
+        // En iyi kombinasyon
+        array<Cand> xC = array.new<Cand>()
+        for ci = 0 to array.size(cbFam) - 1
+            array.push(xC, Cand.new(7, ci, f_condLabel(array.get(cbKindA, ci), array.get(cbLvlA, ci)), f_condLabel(array.get(cbKindB, ci), array.get(cbLvlB, ci)), array.get(cbKindA, ci), array.get(cbLvlA, ci), array.get(cbKindB, ci), array.get(cbLvlB, ci), array.get(cbHit, ci), array.get(cbFail, ci), array.get(cbExp, ci)))
+        array<int> xTopC = f_rankCombos(xC, 1, 999, xBase, xResolved, minReliableN, minStrongN, coverageFloor)
+        string xBestCombo = "-"
+        float  xBestComboLift = na
+        if array.size(xTopC) > 0
+            Cand ccd = array.get(xC, array.get(xTopC, 0))
+            xBestCombo := ccd.label + " & " + ccd.cond2
+            xBestComboLift := f_liftV(ccd.hit, ccd.fail, xBase)
+        // Ortalama score + confidence (tüm kayıtlar; records[] yalnız OKUNUR)
+        float xSumScore = 0.0
+        float xSumConf  = 0.0
+        int   xRn = array.size(records)
+        for i = 0 to xRn - 1
+            PredRec rr = array.get(records, i)
+            xSumScore += rr.score
+            xSumConf  += rr.confidence
+        float xAvgScore = xRn > 0 ? xSumScore / xRn : na
+        float xAvgConf  = xRn > 0 ? xSumConf / xRn : na
+        // Tek satır (CSV / JSON)
+        string exportStr = exportFmt == "JSON" ? '{"symbol":"' + mSym + '","timeframe":"' + mTf + '","predictionCount":' + str.tostring(evTotal) + ',"resolvedCount":' + str.tostring(xResolved) + ',"hitRate":' + f_jn(xBase) + ',"overallSuccess":' + f_jn(xOverall) + ',"confidenceCorrelation":' + f_jn(xCorr) + ',"avgConfidenceLift":' + f_jn(xConfLift) + ',"scoreThresholdLift":' + f_jn(xScThrLift) + ',"bestSingleFeature":"' + xBestSingle + '","bestSingleLift":' + f_jn(xBestSingleLift) + ',"bestCombination":"' + xBestCombo + '","bestCombinationLift":' + f_jn(xBestComboLift) + ',"coverage":' + f_jn(xCoverage) + ',"avgConfidence":' + f_jn(xAvgConf) + ',"avgScore":' + f_jn(xAvgScore) + '}' : mSym + "," + mTf + "," + str.tostring(evTotal) + "," + str.tostring(xResolved) + "," + f_n1(xBase) + "," + f_n1(xOverall) + "," + f_n2(xCorr) + "," + f_sgn1(xConfLift) + "," + f_sgn1(xScThrLift) + "," + xBestSingle + "," + f_sgn1(xBestSingleLift) + "," + xBestCombo + "," + f_sgn1(xBestComboLift) + "," + f_n1(xCoverage) + "," + f_n1(xAvgConf) + "," + f_n1(xAvgScore)
+        if na(meta)
+            meta := table.new(position.top_center, 1, 2, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
+        table.cell(meta, 0, 0, "META EXPORT (" + exportFmt + ") — kopyala / Pine Logs", text_color = color.white, bgcolor = RES_HDR, text_size = size.small, text_halign = text.align_left)
+        table.cell(meta, 0, 1, exportStr, text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+        if not metaLogged
+            log.info(exportStr)
+            metaLogged := true
+else
+    if not na(meta)
+        table.delete(meta)
+        meta := na
 
 // =============================================================================
 // AÇIKLAMA
