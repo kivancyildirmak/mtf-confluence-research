@@ -20,7 +20,7 @@
 //   bir daha hesaplanmaz.
 // =============================================================================
 
-indicator("Harmonic Prediction Engine", overlay = true, max_labels_count = 500, max_boxes_count = 500)
+indicator("Harmonic Prediction Engine", overlay = true, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000)
 
 // =============================================================================
 // Girdiler
