@@ -148,6 +148,19 @@ type PredRec
     float targetDistanceXA
     // --- Confidence Engine (oluşum anında, yalnız geçmiş istatistikten; dondurulur) ---
     float confidence
+    // --- Feature Engineering bin'leri (oluşumda dondurulur; pasif; yalnız analytics/research) ---
+    int   emaTrendBin    // 0 bull (EMA50>EMA200), 1 bear
+    int   emaSlopeBin    // 0 up, 1 flat, 2 down
+    int   adxBin         // 0 <20, 1 20-30, 2 30-40, 3 40+
+    int   rsiBin         // 0 <40, 1 40-50, 2 50-60, 3 60-70, 4 70+
+    int   volBin         // 0 low, 1 normal, 2 high (ATR percentile)
+    int   distE50Bin     // 0 near, 1 mid, 2 far
+    int   distE200Bin    // 0 near, 1 mid, 2 far
+    int   trendStrBin    // 0 HH-HL, 1 LH-LL, 2 range
+    int   swingBin       // 0 small, 1 mid, 2 large (XA impulse in ATR)
+    int   volExpBin      // 0 expanding, 1 contracting
+    int   timePivBin     // 0 short, 1 mid, 2 long (bars since C pivot)
+    int   ageBin         // 0 trend start, 1 mid, 2 end (ADX regime proxy)
 
 // Research Engine aday temsili (yalnızca son barda, sıralama/sınıflandırma için).
 // fam: 0 Score 1 Support 2 Direction 3 ClusterWidth 4 TargetDist 5 XA 6 BC 7 Combo
@@ -518,6 +531,18 @@ f_confAcc(int h, int f, float p0, int K, float dmax, float wFeat) =>
 // Confidence kalibrasyon bini: 0:0-20 1:20-40 2:40-60 3:60-80 4:80-100.
 f_confBin(float conf) => na(conf) ? 2 : conf < 20 ? 0 : conf < 40 ? 1 : conf < 60 ? 2 : conf < 80 ? 3 : 4
 
+// ---- FEATURE ENGINEERING bin fonksiyonları (saf; değerleri parametre alır) ----
+f_binEmaTrend(float e50, float e200) => (na(e50) or na(e200)) ? 0 : e50 > e200 ? 0 : 1
+f_binEmaSlope(float s)  => na(s) ? 1 : s > 0.15 ? 0 : s < -0.15 ? 2 : 1
+f_binAdx(float a)       => na(a) ? 0 : a < 20 ? 0 : a < 30 ? 1 : a < 40 ? 2 : 3
+f_binRsi(float r)       => na(r) ? 1 : r < 40 ? 0 : r < 50 ? 1 : r < 60 ? 2 : r < 70 ? 3 : 4
+f_binVol(float pct)     => na(pct) ? 1 : pct < 33 ? 0 : pct < 66 ? 1 : 2
+f_binDist(float dATR)   => na(dATR) ? 1 : dATR < 1.0 ? 0 : dATR < 2.5 ? 1 : 2
+f_binSwing(float xaATR) => na(xaATR) ? 0 : xaATR < 3.0 ? 0 : xaATR < 6.0 ? 1 : 2
+f_binVolExp(bool exp)   => exp ? 0 : 1
+f_binTimePiv(int bars)  => bars < 10 ? 0 : bars < 25 ? 1 : 2
+f_binAge(float adx, bool rising) => na(adx) ? 0 : adx < 25.0 ? 0 : rising ? 1 : 2
+
 // Bir üçlü (hit/fail/exp) sayaç dizisinde bucket b'yi rs sonucuna göre artırır.
 f_bump3(array<int> h, array<int> f, array<int> e, int b, int rs) =>
     if rs == 1
@@ -600,6 +625,28 @@ var array<Pivot>  pivots = array.new<Pivot>()
 BUFFER_MAX = 16
 
 atr = ta.atr(atrLen)
+
+// =============================================================================
+// FEATURE ENGINEERING — bağımsız pasif göstergeler (yalnızca snapshot/analytics
+// için; prediction/target/confidence'ı ETKİLEMEZ). Global scope'ta her barda
+// hesaplanır (repaint-safe); oluşum anında değerleri dondurulur.
+// =============================================================================
+grpFeat    = "Feature Engineering"
+feEmaFast  = input.int(50,  "EMA fast",  minval = 2, group = grpFeat)
+feEmaSlow  = input.int(200, "EMA slow",  minval = 5, group = grpFeat)
+feAdxLen   = input.int(14,  "ADX length", minval = 2, group = grpFeat)
+feRsiLen   = input.int(14,  "RSI length", minval = 2, group = grpFeat)
+feVolLook  = input.int(100, "ATR percentile lookback", minval = 10, group = grpFeat)
+feSlopeLb  = input.int(5,   "EMA slope / expansion lookback", minval = 1, group = grpFeat)
+
+feEma50  = ta.ema(close, feEmaFast)
+feEma200 = ta.ema(close, feEmaSlow)
+[feDiP, feDiM, feAdx] = ta.dmi(feAdxLen, feAdxLen)
+feRsi    = ta.rsi(close, feRsiLen)
+feAtrPct = ta.percentrank(atr, feVolLook)
+feSlopeAtr  = atr > 0 ? (feEma50 - feEma50[feSlopeLb]) / atr : na
+feAtrExpand = atr > atr[feSlopeLb]
+feAdxRising = feAdx >= feAdx[feSlopeLb]
 
 var array<float> xaRatios = array.from(0.786, 0.886, 1.000, 1.130, 1.272, 1.618)
 var array<float> bcRatios = array.from(1.272, 1.414, 1.618, 2.000, 2.240, 2.618, 3.140, 3.618)
@@ -707,6 +754,59 @@ var array<float> cfScSum = array.from(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 var array<float> cfSpSum = array.from(0.0, 0.0, 0.0, 0.0)
 
 // -----------------------------------------------------------------------------
+// FEATURE ENGINEERING analytics sayaçları (partition bucket; çözümde O(1) bump).
+// -----------------------------------------------------------------------------
+var array<int> feEmaT_hit  = array.from(0, 0)
+var array<int> feEmaT_fail = array.from(0, 0)
+var array<int> feEmaT_exp  = array.from(0, 0)
+var array<int> feSlp_hit   = array.from(0, 0, 0)
+var array<int> feSlp_fail  = array.from(0, 0, 0)
+var array<int> feSlp_exp   = array.from(0, 0, 0)
+var array<int> feAdx_hit   = array.from(0, 0, 0, 0)
+var array<int> feAdx_fail  = array.from(0, 0, 0, 0)
+var array<int> feAdx_exp   = array.from(0, 0, 0, 0)
+var array<int> feRsi_hit   = array.from(0, 0, 0, 0, 0)
+var array<int> feRsi_fail  = array.from(0, 0, 0, 0, 0)
+var array<int> feRsi_exp   = array.from(0, 0, 0, 0, 0)
+var array<int> feVol_hit   = array.from(0, 0, 0)
+var array<int> feVol_fail  = array.from(0, 0, 0)
+var array<int> feVol_exp   = array.from(0, 0, 0)
+var array<int> feD50_hit   = array.from(0, 0, 0)
+var array<int> feD50_fail  = array.from(0, 0, 0)
+var array<int> feD50_exp   = array.from(0, 0, 0)
+var array<int> feD200_hit  = array.from(0, 0, 0)
+var array<int> feD200_fail = array.from(0, 0, 0)
+var array<int> feD200_exp  = array.from(0, 0, 0)
+var array<int> feTr_hit    = array.from(0, 0, 0)
+var array<int> feTr_fail   = array.from(0, 0, 0)
+var array<int> feTr_exp    = array.from(0, 0, 0)
+var array<int> feSw_hit    = array.from(0, 0, 0)
+var array<int> feSw_fail   = array.from(0, 0, 0)
+var array<int> feSw_exp    = array.from(0, 0, 0)
+var array<int> feEx_hit    = array.from(0, 0)
+var array<int> feEx_fail   = array.from(0, 0)
+var array<int> feEx_exp    = array.from(0, 0)
+var array<int> feTm_hit    = array.from(0, 0, 0)
+var array<int> feTm_fail   = array.from(0, 0, 0)
+var array<int> feTm_exp    = array.from(0, 0, 0)
+var array<int> feAg_hit    = array.from(0, 0, 0)
+var array<int> feAg_fail   = array.from(0, 0, 0)
+var array<int> feAg_exp    = array.from(0, 0, 0)
+// Feature bucket etiketleri (research tekil aday satırları için).
+var array<string> feEmaT_lbl = array.from("EMA Bull", "EMA Bear")
+var array<string> feSlp_lbl  = array.from("Slope Up", "Slope Flat", "Slope Down")
+var array<string> feAdx_lbl  = array.from("ADX<20", "ADX20-30", "ADX30-40", "ADX40+")
+var array<string> feRsi_lbl  = array.from("RSI<40", "RSI40-50", "RSI50-60", "RSI60-70", "RSI70+")
+var array<string> feVol_lbl  = array.from("Vol Low", "Vol Norm", "Vol High")
+var array<string> feD50_lbl  = array.from("E50 Near", "E50 Mid", "E50 Far")
+var array<string> feD200_lbl = array.from("E200 Near", "E200 Mid", "E200 Far")
+var array<string> feTr_lbl   = array.from("HH-HL", "LH-LL", "Range")
+var array<string> feSw_lbl   = array.from("Swing S", "Swing M", "Swing L")
+var array<string> feEx_lbl   = array.from("ATR Exp", "ATR Contr")
+var array<string> feTm_lbl   = array.from("Piv Short", "Piv Mid", "Piv Long")
+var array<string> feAg_lbl   = array.from("Trend Start", "Trend Mid", "Trend End")
+
+// -----------------------------------------------------------------------------
 // RESEARCH ENGINE — iki-feature kombinasyon sayaçları (sınırlı, incremental).
 // Kondisyon kind kodları: 0 Score(scBin>=lvl), 1 Support(spBin>=lvl),
 //   2 TargetDist(tdBin<=lvl), 3 ClusterWidth(cwBin<=lvl), 4 Direction(dBin==lvl).
@@ -727,17 +827,22 @@ var array<int> lvSup   = array.from(1, 2, 3)      // Support >= 3/4/5
 var array<int> lvTd    = array.from(0, 1, 2)      // Dist <= 1/2/4 ATR
 var array<int> lvCw    = array.from(0, 1, 2)      // Width <= 0.25/0.50/1.00
 var array<int> lvDir   = array.from(0, 1)         // Bullish / Bearish
+var array<int> lvEmaB  = array.from(0)            // EMA bull
+var array<int> lvAdxT  = array.from(1, 2, 3)      // ADX >= 20/30/40
+var array<int> lvRsiH  = array.from(2)            // RSI >= 50
+var array<int> lvVolL  = array.from(0)            // Low volatility
 
 // =============================================================================
 // RESEARCH ENGINE yardımcıları (pasif; yalnızca mevcut sayaçları okur)
 // =============================================================================
-// Kondisyon üyeliği (prediction bin'lerinden). kind: 0 Score,1 Support,2 TD,3 CW,4 Dir.
-f_condMet(int kind, int lvl, int scB, int spB, int tdB, int cwB, int dB) =>
-    kind == 0 ? scB >= lvl : kind == 1 ? spB >= lvl : kind == 2 ? tdB <= lvl : kind == 3 ? cwB <= lvl : dB == lvl
+// Kondisyon üyeliği (prediction bin'lerinden). kind: 0 Score,1 Support,2 TD,3 CW,
+//   4 Dir, 5 EMAtrend(==), 6 ADX(>=), 7 RSI(>=), 8 Volatility(==).
+f_condMet(int kind, int lvl, int scB, int spB, int tdB, int cwB, int dB, int emaB, int adxB, int rsiB, int volB) =>
+    kind == 0 ? scB >= lvl : kind == 1 ? spB >= lvl : kind == 2 ? tdB <= lvl : kind == 3 ? cwB <= lvl : kind == 4 ? dB == lvl : kind == 5 ? emaB == lvl : kind == 6 ? adxB >= lvl : kind == 7 ? rsiB >= lvl : volB == lvl
 
 // Kondisyon etiketi (dashboard için).
 f_condLabel(int kind, int lvl) =>
-    kind == 0 ? "Sc>=" + (lvl == 2 ? "5.5" : lvl == 3 ? "6.0" : lvl == 4 ? "6.5" : "7.0") : kind == 1 ? "Sup>=" + str.tostring(lvl + 2) : kind == 2 ? "Dist<=" + (lvl == 0 ? "1" : lvl == 1 ? "2" : "4") + "A" : kind == 3 ? "Wid<=" + (lvl == 0 ? "0.25" : lvl == 1 ? "0.50" : "1.00") : (lvl == 0 ? "Bull" : "Bear")
+    kind == 0 ? "Sc>=" + (lvl == 2 ? "5.5" : lvl == 3 ? "6.0" : lvl == 4 ? "6.5" : "7.0") : kind == 1 ? "Sup>=" + str.tostring(lvl + 2) : kind == 2 ? "Dist<=" + (lvl == 0 ? "1" : lvl == 1 ? "2" : "4") + "A" : kind == 3 ? "Wid<=" + (lvl == 0 ? "0.25" : lvl == 1 ? "0.50" : "1.00") : kind == 4 ? (lvl == 0 ? "Bull" : "Bear") : kind == 5 ? (lvl == 0 ? "EMAbull" : "EMAbear") : kind == 6 ? "ADX>=" + (lvl == 1 ? "20" : lvl == 2 ? "30" : "40") : kind == 7 ? "RSI>=50" : "LowVol"
 
 // 0..last kümülatif toplam (<= eşikleri için).
 f_cumUpTo(array<int> a, int last) =>
@@ -767,10 +872,26 @@ f_condCounts(int kind, int lvl) =>
         h := f_cumUpTo(anCw_hit, lvl)
         f := f_cumUpTo(anCw_fail, lvl)
         e := f_cumUpTo(anCw_exp, lvl)
-    else
+    else if kind == 4
         h := array.get(anDir_hit, lvl)
         f := array.get(anDir_fail, lvl)
         e := array.get(anDir_exp, lvl)
+    else if kind == 5
+        h := array.get(feEmaT_hit, lvl)
+        f := array.get(feEmaT_fail, lvl)
+        e := array.get(feEmaT_exp, lvl)
+    else if kind == 6
+        h := f_cumFrom(feAdx_hit, lvl)
+        f := f_cumFrom(feAdx_fail, lvl)
+        e := f_cumFrom(feAdx_exp, lvl)
+    else if kind == 7
+        h := f_cumFrom(feRsi_hit, lvl)
+        f := f_cumFrom(feRsi_fail, lvl)
+        e := f_cumFrom(feRsi_exp, lvl)
+    else
+        h := array.get(feVol_hit, lvl)
+        f := array.get(feVol_fail, lvl)
+        e := array.get(feVol_exp, lvl)
     [h, f, e]
 
 // Bir aile için tüm (lvA × lvB) kombinasyonlarını metadata dizilerine ekler (bir kez).
@@ -785,6 +906,15 @@ f_addFamily(int kindA, array<int> lvA, int kindB, array<int> lvB, string fam, ar
             array.push(hh, 0)
             array.push(ff, 0)
             array.push(ee, 0)
+
+// Aile kodundan görünen ad (tekil aday satırlarında "Feature" sütunu).
+f_famName(int fam) =>
+    fam == 0 ? "Score" : fam == 1 ? "Support" : fam == 2 ? "Direction" : fam == 3 ? "ClusterW" : fam == 4 ? "TargetD" : fam == 5 ? "XA" : fam == 6 ? "BC" : fam == 8 ? "EMAtrend" : fam == 9 ? "EMAslope" : fam == 10 ? "ADX" : fam == 11 ? "RSI" : fam == 12 ? "Vol" : fam == 13 ? "DistE50" : fam == 14 ? "DistE200" : fam == 15 ? "TrendStr" : fam == 16 ? "Swing" : fam == 17 ? "VolExp" : fam == 18 ? "TimePiv" : fam == 19 ? "AgeCtx" : "?"
+
+// Bir feature engineering ailesinin partition bucket'larını tekil aday listesine ekler.
+f_addFeatSingles(array<Cand> cs, int fam, array<string> labels, array<int> hh, array<int> ff, array<int> ee) =>
+    for i = 0 to array.size(labels) - 1
+        array.push(cs, Cand.new(fam, i, array.get(labels, i), "", -1, i, -1, -1, array.get(hh, i), array.get(ff, i), array.get(ee, i)))
 
 // Türev metrikler (h,f,e + baseline + toplamlar). Lift = yüzde puan; oranlar ayrı.
 f_hitRateV(int h, int f) => (h + f) > 0 ? 100.0 * h / (h + f) : na
@@ -876,7 +1006,7 @@ f_resMetric(table t, int r, string lbl, string val) =>
 // Tekil adayları Research Score'a göre sırala (pozitif lift, aile başına perFam sınırı).
 f_rankSingles(array<Cand> cs, int k, int perFam, float base100, int totRes, int minRel, int minStrong, float covFloor) =>
     array<int> chosen = array.new<int>()
-    array<int> famCnt = array.new<int>(8, 0)
+    array<int> famCnt = array.new<int>(24, 0)
     bool go = true
     while array.size(chosen) < k and go
         int   bestI = -1
@@ -1026,6 +1156,10 @@ if barstate.isfirst and array.size(cbFam) == 0
     f_addFamily(1, lvSup,   3, lvCw,  "Sup+Wid", cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
     f_addFamily(4, lvDir,   0, lvScore,"Dir+Sc", cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
     f_addFamily(4, lvDir,   2, lvTd,  "Dir+Dist",cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
+    f_addFamily(0, lvScore, 5, lvEmaB, "Sc+EMA", cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
+    f_addFamily(0, lvScore, 6, lvAdxT, "Sc+ADX", cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
+    f_addFamily(0, lvScore, 7, lvRsiH, "Sc+RSI", cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
+    f_addFamily(0, lvScore, 8, lvVolL, "Sc+Vol", cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
 
 // =============================================================================
 // ANA AKIŞ — yalnızca KAPANMIŞ (confirmed) barlarda; ileri doğru, bar bar.
@@ -1123,8 +1257,12 @@ if barstate.isconfirmed
                 int tdB = f_tdBin(p.targetDistanceATR)
                 int cwB = f_cwBin(p.normalizedClusterWidth)
                 int dB  = p.direction == 1 ? 0 : 1
+                int emB = p.emaTrendBin
+                int axB = p.adxBin
+                int rsB = p.rsiBin
+                int vlB = p.volBin
                 for ci = 0 to array.size(cbFam) - 1
-                    if f_condMet(array.get(cbKindA, ci), array.get(cbLvlA, ci), scB, spB, tdB, cwB, dB) and f_condMet(array.get(cbKindB, ci), array.get(cbLvlB, ci), scB, spB, tdB, cwB, dB)
+                    if f_condMet(array.get(cbKindA, ci), array.get(cbLvlA, ci), scB, spB, tdB, cwB, dB, emB, axB, rsB, vlB) and f_condMet(array.get(cbKindB, ci), array.get(cbLvlB, ci), scB, spB, tdB, cwB, dB, emB, axB, rsB, vlB)
                         f_bump3(cbHit, cbFail, cbExp, ci, rs)
 
                 // ---- CONFIDENCE: çözülen kaydın (dondurulmuş) confidence'ını istatistiğe kat ----
@@ -1153,6 +1291,20 @@ if barstate.isconfirmed
                 cfSyy += succ * succ
                 array.set(cfScSum, scB, array.get(cfScSum, scB) + pc)
                 array.set(cfSpSum, spB, array.get(cfSpSum, spB) + pc)
+
+                // ---- FEATURE ENGINEERING: yeni feature bucket sayaçları (pasif) ----
+                f_bump3(feEmaT_hit, feEmaT_fail, feEmaT_exp, p.emaTrendBin, rs)
+                f_bump3(feSlp_hit,  feSlp_fail,  feSlp_exp,  p.emaSlopeBin, rs)
+                f_bump3(feAdx_hit,  feAdx_fail,  feAdx_exp,  p.adxBin,      rs)
+                f_bump3(feRsi_hit,  feRsi_fail,  feRsi_exp,  p.rsiBin,      rs)
+                f_bump3(feVol_hit,  feVol_fail,  feVol_exp,  p.volBin,      rs)
+                f_bump3(feD50_hit,  feD50_fail,  feD50_exp,  p.distE50Bin,  rs)
+                f_bump3(feD200_hit, feD200_fail, feD200_exp, p.distE200Bin, rs)
+                f_bump3(feTr_hit,   feTr_fail,   feTr_exp,   p.trendStrBin, rs)
+                f_bump3(feSw_hit,   feSw_fail,   feSw_exp,   p.swingBin,    rs)
+                f_bump3(feEx_hit,   feEx_fail,   feEx_exp,   p.volExpBin,   rs)
+                f_bump3(feTm_hit,   feTm_fail,   feTm_exp,   p.timePivBin,  rs)
+                f_bump3(feAg_hit,   feAg_fail,   feAg_exp,   p.ageBin,      rs)
 
                 array.remove(activeList, ai)
                 resolved := true
@@ -1265,6 +1417,27 @@ if barstate.isconfirmed
                         float confidence = na(l0) ? 50.0 : math.round(100.0 / (1.0 + math.exp(-(l0 + confGain * avgShift))))
                         confidence := math.max(0.0, math.min(100.0, confidence))
 
+                        // 1e2) FEATURE ENGINEERING snapshot — oluşum anındaki bağımsız göstergeler
+                        //      dondurulur (pasif; prediction/target/confidence'ı ETKİLEMEZ).
+                        int feEmaTB = f_binEmaTrend(feEma50, feEma200)
+                        int feSlpB  = f_binEmaSlope(feSlopeAtr)
+                        int feAdxB  = f_binAdx(feAdx)
+                        int feRsiB  = f_binRsi(feRsi)
+                        int feVolB  = f_binVol(feAtrPct)
+                        int feD50B  = f_binDist(atr > 0 ? math.abs(close - feEma50) / atr : na)
+                        int feD200B = f_binDist(atr > 0 ? math.abs(close - feEma200) / atr : na)
+                        float prevHigh = X.kind == -1 ? A.price : X.price
+                        float lastHigh = X.kind == -1 ? C.price : B.price
+                        float prevLow  = X.kind == -1 ? X.price : A.price
+                        float lastLow  = X.kind == -1 ? B.price : C.price
+                        bool  feHH = lastHigh > prevHigh
+                        bool  feHL = lastLow > prevLow
+                        int   feTrB = (feHH and feHL) ? 0 : ((not feHH) and (not feHL)) ? 1 : 2
+                        int feSwB   = f_binSwing(anXaAtr)
+                        int feExB   = f_binVolExp(feAtrExpand)
+                        int feTmB   = f_binTimePiv(bar_index - C.bidx)
+                        int feAgB   = f_binAge(feAdx, feAdxRising)
+
                         // 1f) Çizim: kutu, oluştuğu (confirmed C) bardan sağa (Score + Confidence).
                         PredGroup g = PredGroup.new(array.new<label>(), array.new<box>())
                         int x1 = bar_index
@@ -1291,7 +1464,10 @@ if barstate.isconfirmed
                              clusterSpread = anSpread, clusterTolerance = tol, normalizedClusterWidth = anNormW,
                              xaLength = anXaLen, bcLength = anBcLen, xaAtrMultiple = anXaAtr, bcAtrMultiple = anBcAtr,
                              abXaRatio = anAbXa, bcAbRatio = anBcAb, targetDistance = anTDist,
-                             targetDistanceATR = anTDistAtr, targetDistanceXA = anTDistXa, confidence = confidence)
+                             targetDistanceATR = anTDistAtr, targetDistanceXA = anTDistXa, confidence = confidence,
+                             emaTrendBin = feEmaTB, emaSlopeBin = feSlpB, adxBin = feAdxB, rsiBin = feRsiB,
+                             volBin = feVolB, distE50Bin = feD50B, distE200Bin = feD200B, trendStrBin = feTrB,
+                             swingBin = feSwB, volExpBin = feExB, timePivBin = feTmB, ageBin = feAgB)
                         predSeq += 1
                         array.push(records, rec)
                         cntCreated += 1
@@ -1476,6 +1652,19 @@ if showResearch and barstate.islast
     for li = 0 to 4
         string bl = li == 0 ? "BC<.382" : li == 1 ? "BC.382-.5" : li == 2 ? "BC.5-.618" : li == 3 ? "BC.618-.786" : "BC>.786"
         array.push(singles, Cand.new(6, li, bl, "", -1, li, -1, -1, array.get(anBc_hit, li), array.get(anBc_fail, li), array.get(anBc_exp, li)))
+    // Feature engineering tekil adayları (pasif; Research otomatik analiz eder).
+    f_addFeatSingles(singles, 8,  feEmaT_lbl, feEmaT_hit, feEmaT_fail, feEmaT_exp)
+    f_addFeatSingles(singles, 9,  feSlp_lbl,  feSlp_hit,  feSlp_fail,  feSlp_exp)
+    f_addFeatSingles(singles, 10, feAdx_lbl,  feAdx_hit,  feAdx_fail,  feAdx_exp)
+    f_addFeatSingles(singles, 11, feRsi_lbl,  feRsi_hit,  feRsi_fail,  feRsi_exp)
+    f_addFeatSingles(singles, 12, feVol_lbl,  feVol_hit,  feVol_fail,  feVol_exp)
+    f_addFeatSingles(singles, 13, feD50_lbl,  feD50_hit,  feD50_fail,  feD50_exp)
+    f_addFeatSingles(singles, 14, feD200_lbl, feD200_hit, feD200_fail, feD200_exp)
+    f_addFeatSingles(singles, 15, feTr_lbl,   feTr_hit,   feTr_fail,   feTr_exp)
+    f_addFeatSingles(singles, 16, feSw_lbl,   feSw_hit,   feSw_fail,   feSw_exp)
+    f_addFeatSingles(singles, 17, feEx_lbl,   feEx_hit,   feEx_fail,   feEx_exp)
+    f_addFeatSingles(singles, 18, feTm_lbl,   feTm_hit,   feTm_fail,   feTm_exp)
+    f_addFeatSingles(singles, 19, feAg_lbl,   feAg_hit,   feAg_fail,   feAg_exp)
 
     // ---- Kombinasyon aday listesi (mevcut kombinasyon sayaçlarından) ----
     array<Cand> combos = array.new<Cand>()
@@ -1546,7 +1735,7 @@ if showResearch and barstate.islast
         for m = 0 to array.size(top) - 1
             Cand c = array.get(singles, array.get(top, m))
             int cf = c.fam
-            string famN = cf == 0 ? "Score" : cf == 1 ? "Support" : cf == 2 ? "Direction" : cf == 3 ? "ClusterW" : cf == 4 ? "TargetD" : cf == 5 ? "XA" : "BC"
+            string famN = f_famName(cf)
             f_resRow9(res, 3 + m, str.tostring(m + 1), famN, c.label, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
         if array.size(top) == 0
             f_resMetric(res, 3, "No positive candidates", "—")
@@ -1556,7 +1745,7 @@ if showResearch and barstate.islast
         for m = 0 to array.size(neg) - 1
             Cand c = array.get(singles, array.get(neg, m))
             int cf = c.fam
-            string famN = cf == 0 ? "Score" : cf == 1 ? "Support" : cf == 2 ? "Direction" : cf == 3 ? "ClusterW" : cf == 4 ? "TargetD" : cf == 5 ? "XA" : "BC"
+            string famN = f_famName(cf)
             f_resRow9(res, 3 + m, "", famN, c.label, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
         if array.size(neg) == 0
             f_resMetric(res, 3, "No reliable negatives", "—")
@@ -1595,7 +1784,7 @@ if showResearch and barstate.islast
             int cls = f_classV(c.hit, c.fail, c.exp, base100, minReliableN, minStrongN, coverageFloor, totRes)
             if cls == 2 or cls == 1
                 int cf = c.fam
-                string famN = cf == 0 ? "Score" : cf == 1 ? "Support" : cf == 2 ? "Direction" : cf == 3 ? "ClusterW" : cf == 4 ? "TargetD" : cf == 5 ? "XA" : "BC"
+                string famN = f_famName(cf)
                 f_resRow9(res, rrow, str.tostring(shown + 1), famN, c.label, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
                 rrow  += 1
                 shown += 1
@@ -1609,7 +1798,7 @@ if showResearch and barstate.islast
         for m = 0 to array.size(rej) - 1
             Cand c = array.get(singles, array.get(rej, m))
             int cf = c.fam
-            string famN = cf == 0 ? "Score" : cf == 1 ? "Support" : cf == 2 ? "Direction" : cf == 3 ? "ClusterW" : cf == 4 ? "TargetD" : cf == 5 ? "XA" : "BC"
+            string famN = f_famName(cf)
             f_resRow9(res, rrow, "", famN, c.label, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
             rrow += 1
         if shown == 0 and array.size(rej) == 0
