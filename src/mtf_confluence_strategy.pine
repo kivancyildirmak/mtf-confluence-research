@@ -1085,34 +1085,41 @@ f_rankSingles(array<Cand> cs, int k, int perFam, float base100, int totRes, int 
             array.set(famCnt, cb.fam, array.get(famCnt, cb.fam) + 1)
     chosen
 
-// Kombinasyonları guardrail + aile sınırı ile sırala.
+// Kombinasyonları guardrail + aile sınırı ile sırala. Tüm array.get erişimleri
+// sınır-korumalı: boş/tutarsız dizi durumunda CRASH etmez (fail-safe).
 f_rankCombos(array<Cand> cs, int k, int perFam, float base100, int totRes, int minRel, int minStrong, float covFloor) =>
     array<int> chosen = array.new<int>()
-    bool go = true
-    while array.size(chosen) < k and go
-        int   bestI = -1
-        float bestS = -1.0
-        for i = 0 to array.size(cs) - 1
-            if not array.includes(chosen, i)
-                Cand c = array.get(cs, i)
-                int   n    = c.hit + c.fail + c.exp
-                float lift = f_liftV(c.hit, c.fail, base100)
-                float cov  = f_covV(c.hit, c.fail, c.exp, totRes)
-                if n >= minRel and cov >= covFloor and not na(lift) and lift >= 5.0
-                    string fam = array.get(cbFam, c.ord)
-                    int cnt = 0
-                    for j = 0 to array.size(chosen) - 1
-                        if array.get(cbFam, array.get(cs, array.get(chosen, j)).ord) == fam
-                            cnt += 1
-                    if cnt < perFam
-                        float rs = f_rScoreV(c.hit, c.fail, c.exp, base100, minStrong, totRes)
-                        if rs > bestS
-                            bestS := rs
-                            bestI := i
-        if bestI < 0
-            go := false
-        else
-            array.push(chosen, bestI)
+    int csN = array.size(cs)
+    int cbN = array.size(cbFam)
+    if csN > 0
+        bool go = true
+        while array.size(chosen) < k and go
+            int   bestI = -1
+            float bestS = -1.0
+            for i = 0 to csN - 1
+                if not array.includes(chosen, i)
+                    Cand c = array.get(cs, i)
+                    int   n    = c.hit + c.fail + c.exp
+                    float lift = f_liftV(c.hit, c.fail, base100)
+                    float cov  = f_covV(c.hit, c.fail, c.exp, totRes)
+                    if n >= minRel and cov >= covFloor and not na(lift) and lift >= 5.0
+                        string fam = (c.ord >= 0 and c.ord < cbN) ? array.get(cbFam, c.ord) : ""
+                        int cnt = 0
+                        for j = 0 to array.size(chosen) - 1
+                            int oi = array.get(chosen, j)
+                            int od = (oi >= 0 and oi < csN) ? array.get(cs, oi).ord : -1
+                            string ofam = (od >= 0 and od < cbN) ? array.get(cbFam, od) : ""
+                            if ofam == fam
+                                cnt += 1
+                        if cnt < perFam
+                            float rs = f_rScoreV(c.hit, c.fail, c.exp, base100, minStrong, totRes)
+                            if rs > bestS
+                                bestS := rs
+                                bestI := i
+            if bestI < 0
+                go := false
+            else
+                array.push(chosen, bestI)
     chosen
 
 // Negatif adayları (güvenilir örneklem, lift<0) en düşük lift'e göre sırala.
@@ -1204,8 +1211,10 @@ int capLbl    = labelsPer > 0 ? int(490 / labelsPer) : 1000000
 int allCap    = math.min(capBox, capLbl)
 int maxDrawn  = histDisplay == "Latest only" ? 1 : histDisplay == "Last N predictions" ? math.min(histCount, allCap) : allCap
 
-// RESEARCH: kombinasyon metadata'sını bir kez kur (7 aile; toplam 68 kombinasyon).
-if barstate.isfirst and array.size(cbFam) == 0
+// RESEARCH: kombinasyon metadata'sını kur. barstate.isfirst yerine "boşsa kur"
+// kullanılır (self-healing): uzun geçmişli sembollerde isfirst güvenilmez olabilir;
+// bu blok ANA AKIŞ'tan ÖNCE her barda kontrol edilir, bir kez (boşken) doldurur.
+if array.size(cbFam) == 0
     f_addFamily(0, lvScore, 1, lvSup, "Sc+Sup",  cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
     f_addFamily(0, lvScore, 2, lvTd,  "Sc+Dist", cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
     f_addFamily(0, lvScore, 3, lvCw,  "Sc+Wid",  cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
