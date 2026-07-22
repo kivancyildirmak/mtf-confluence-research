@@ -1105,12 +1105,14 @@ f_rankCombos(array<Cand> cs, int k, int perFam, float base100, int totRes, int m
                     if n >= minRel and cov >= covFloor and not na(lift) and lift >= 5.0
                         string fam = (c.ord >= 0 and c.ord < cbN) ? array.get(cbFam, c.ord) : ""
                         int cnt = 0
-                        for j = 0 to array.size(chosen) - 1
-                            int oi = array.get(chosen, j)
-                            int od = (oi >= 0 and oi < csN) ? array.get(cs, oi).ord : -1
-                            string ofam = (od >= 0 and od < cbN) ? array.get(cbFam, od) : ""
-                            if ofam == fam
-                                cnt += 1
+                        int chN = array.size(chosen)
+                        if chN > 0
+                            for j = 0 to chN - 1
+                                int oi = array.get(chosen, j)
+                                int od = (oi >= 0 and oi < csN) ? array.get(cs, oi).ord : -1
+                                string ofam = (od >= 0 and od < cbN) ? array.get(cbFam, od) : ""
+                                if ofam == fam
+                                    cnt += 1
                         if cnt < perFam
                             float rs = f_rScoreV(c.hit, c.fail, c.exp, base100, minStrong, totRes)
                             if rs > bestS
@@ -1779,29 +1781,32 @@ if reShow and barstate.islast
     else if researchView == "Top Features"
         f_resHdr9(res, 2, "#", "Feature", "Group", "N", "Hit%", "Lift", "Cov", "RScr", "Class")
         array<int> top = f_rankSingles(singles, 5, maxPerFamily, base100, totRes, minReliableN, minStrongN, coverageFloor)
-        for m = 0 to array.size(top) - 1
-            Cand c = array.get(singles, array.get(top, m))
-            int cf = c.fam
-            string famN = f_famName(cf)
-            f_resRow9(res, 3 + m, str.tostring(m + 1), famN, c.label, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
+        if array.size(top) > 0
+            for m = 0 to array.size(top) - 1
+                Cand c = array.get(singles, array.get(top, m))
+                int cf = c.fam
+                string famN = f_famName(cf)
+                f_resRow9(res, 3 + m, str.tostring(m + 1), famN, c.label, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
         if array.size(top) == 0
             f_resMetric(res, 3, "No positive candidates", "—")
     else if researchView == "Negative Features"
         f_resHdr9(res, 2, "", "Feature", "Group", "N", "Hit%", "Lift", "Cov", "RScr", "Class")
         array<int> neg = f_rankNeg(singles, 5, base100, totRes, minReliableN, coverageFloor)
-        for m = 0 to array.size(neg) - 1
-            Cand c = array.get(singles, array.get(neg, m))
-            int cf = c.fam
-            string famN = f_famName(cf)
-            f_resRow9(res, 3 + m, "", famN, c.label, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
+        if array.size(neg) > 0
+            for m = 0 to array.size(neg) - 1
+                Cand c = array.get(singles, array.get(neg, m))
+                int cf = c.fam
+                string famN = f_famName(cf)
+                f_resRow9(res, 3 + m, "", famN, c.label, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
         if array.size(neg) == 0
             f_resMetric(res, 3, "No reliable negatives", "—")
     else if researchView == "Top Combinations"
         f_resHdr9(res, 2, "#", "Cond1", "Cond2", "N", "Hit%", "Lift", "Cov", "RScr", "Class")
         array<int> topc = f_rankCombos(combos, 5, maxPerFamily, base100, totRes, minReliableN, minStrongN, coverageFloor)
-        for m = 0 to array.size(topc) - 1
-            Cand c = array.get(combos, array.get(topc, m))
-            f_resRow9(res, 3 + m, str.tostring(m + 1), c.label, c.cond2, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
+        if array.size(topc) > 0
+            for m = 0 to array.size(topc) - 1
+                Cand c = array.get(combos, array.get(topc, m))
+                f_resRow9(res, 3 + m, str.tostring(m + 1), c.label, c.cond2, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
         if array.size(topc) > 0
             Cand c0 = array.get(combos, array.get(topc, 0))
             float cLift = f_liftV(c0.hit, c0.fail, base100)
@@ -1826,15 +1831,16 @@ if reShow and barstate.islast
         array<int> rec = f_rankSingles(singles, 3, maxPerFamily, base100, totRes, minReliableN, minStrongN, coverageFloor)
         int shown = 0
         int rrow  = 3
-        for m = 0 to array.size(rec) - 1
-            Cand c = array.get(singles, array.get(rec, m))
-            int cls = f_classV(c.hit, c.fail, c.exp, base100, minReliableN, minStrongN, coverageFloor, totRes)
-            if cls == 2 or cls == 1
-                int cf = c.fam
-                string famN = f_famName(cf)
-                f_resRow9(res, rrow, str.tostring(shown + 1), famN, c.label, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
-                rrow  += 1
-                shown += 1
+        if array.size(rec) > 0
+            for m = 0 to array.size(rec) - 1
+                Cand c = array.get(singles, array.get(rec, m))
+                int cls = f_classV(c.hit, c.fail, c.exp, base100, minReliableN, minStrongN, coverageFloor, totRes)
+                if cls == 2 or cls == 1
+                    int cf = c.fam
+                    string famN = f_famName(cf)
+                    f_resRow9(res, rrow, str.tostring(shown + 1), famN, c.label, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
+                    rrow  += 1
+                    shown += 1
         f_resMetric(res, rrow, "Next step", "Forward test only — do not activate")
         rrow += 1
         table.cell(res, 0, rrow, "NOT SUPPORTED", text_color = color.yellow, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_left)
@@ -1842,12 +1848,13 @@ if reShow and barstate.islast
             table.cell(res, c, rrow, "", bgcolor = RES_SECT)
         rrow += 1
         array<int> rej = f_rankNeg(singles, 3, base100, totRes, minReliableN, coverageFloor)
-        for m = 0 to array.size(rej) - 1
-            Cand c = array.get(singles, array.get(rej, m))
-            int cf = c.fam
-            string famN = f_famName(cf)
-            f_resRow9(res, rrow, "", famN, c.label, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
-            rrow += 1
+        if array.size(rej) > 0
+            for m = 0 to array.size(rej) - 1
+                Cand c = array.get(singles, array.get(rej, m))
+                int cf = c.fam
+                string famN = f_famName(cf)
+                f_resRow9(res, rrow, "", famN, c.label, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
+                rrow += 1
         if shown == 0 and array.size(rej) == 0
             f_resMetric(res, rrow, "No candidates", "—")
 
@@ -2025,10 +2032,11 @@ if researchMode == "Export"
         float xSumScore = 0.0
         float xSumConf  = 0.0
         int   xRn = array.size(records)
-        for i = 0 to xRn - 1
-            PredRec rr = array.get(records, i)
-            xSumScore += rr.score
-            xSumConf  += rr.confidence
+        if xRn > 0
+            for i = 0 to xRn - 1
+                PredRec rr = array.get(records, i)
+                xSumScore += rr.score
+                xSumConf  += rr.confidence
         float xAvgScore = xRn > 0 ? xSumScore / xRn : na
         float xAvgConf  = xRn > 0 ? xSumConf / xRn : na
         // Tek satır (CSV / JSON). TÜM string alanlar f_s ile korunur → na propagate ETMEZ.
