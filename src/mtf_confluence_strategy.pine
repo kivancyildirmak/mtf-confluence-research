@@ -795,6 +795,12 @@ var array<int> qCount = array.from(0, 0, 0, 0)
 var array<int> qHit   = array.from(0, 0, 0, 0)
 var array<int> qFail  = array.from(0, 0, 0, 0)
 var array<int> qExp   = array.from(0, 0, 0, 0)
+// UNKNOWN neden partisyonu (index = qReason). TÜM UNKNOWN'lar tam olarak bir
+// koda düşer → toplam(qUnkReason[1..6]) == qCount[0]. 0=classified (kullanılmaz).
+//   1 MARKET_SAMPLE_LOW 2 INVALID_BASELINE 3 NO_BUCKET
+//   4 SINGLE_SAMPLE_LOW 5 COVERAGE_LOW 6 OTHER
+var array<int> qUnkReason = array.from(0, 0, 0, 0, 0, 0, 0)
+var int qJointLow = 0   // tanısal: joint aday anahtarına uydu ama yetersizdi (partisyon dışı)
 
 // -----------------------------------------------------------------------------
 // FEATURE ENGINEERING analytics sayaçları (partition bucket; çözümde O(1) bump).
@@ -901,30 +907,46 @@ f_cumUpTo(array<int> a, int last) =>
 // (anSc/anTd). Adayın kendisi bu sayaçlarda YOKTUR (kendi sonucunu göremez).
 // Korele lift'ler TOPLANMAZ: tek bir bucket seçilir (en spesifik yeterli joint,
 // yoksa en güçlü yeterli tekil). DÖNÜŞ:
-//   [status, reason, bucketType, bucketN, marketN, baseline, cond, lift, coverage]
-//   status: 0 UNKNOWN 1 QUALIFIED 2 WEAK 3 REJECTED ; reason: 0 ok 1 market<min 2 no-bucket
+//   [status, reason, bucketType, bucketN, marketDec, baseline, cond, lift, coverage, jointLow]
+//   status: 0 UNKNOWN 1 QUALIFIED 2 WEAK 3 REJECTED
+//   reason (UNKNOWN nedeni; TÜM UNKNOWN'lar bu partisyonu doldurur, toplam=UNKNOWN):
+//     0 evaluated (QUALIFIED/WEAK/REJECTED — UNKNOWN değil)
+//     1 MARKET_SAMPLE_LOW  — 0<marketDec<MIN_MARKET (karara bağlanmış piyasa örneği yetersiz)
+//     2 INVALID_BASELINE   — marketDec==0 (hiç hit/fail yok → baseline tanımsız)
+//     3 NO_BUCKET          — piyasa yeterli; ilgili hiçbir tekil bucket'ta resolved yok
+//     4 SINGLE_SAMPLE_LOW  — bucket var ama resolved<MIN_BUCKET
+//     5 COVERAGE_LOW       — bucket resolved>=MIN_BUCKET ama coverage<MIN_COVERAGE
+//     6 OTHER              — beklenmeyen (bins total fonksiyon olduğundan MISSING_FEATURE /
+//                            OUT_OF_RANGE / INVALID_KEY / HISTORY_NOT_ACCUMULATED oluşamaz → 0)
+//   jointLow: 1 = joint kombosu ADAYA UYDU ama yetersizdi (tanısal; partisyon dışı).
+//   NOT (PART 2): piyasa örneği = hit+failed (marketDec). EXPIRED resolved kanıt SAYILMAZ;
+//   yalnız coverage/populasyon paydasında yer alır. marketN (hit+fail+exp) artık kapı DEĞİL.
 // =============================================================================
 f_qualify(int scB, int tdB, int mH, int mF, int mE) =>
-    int   marketN   = mH + mF + mE
-    int   marketDec = mH + mF
+    int   marketDec = mH + mF          // PART 2: resolved sample = hit+failed (expired hariç)
     float baseline  = marketDec > 0 ? mH / marketDec : na
-    int   status = 0
-    int   reason = 1
-    int   bType  = 0
-    int   bN     = 0
-    float cond = na
-    float lift = na
-    float cov  = na
-    if marketN < qMinMarketResolved or marketDec == 0 or na(baseline)
+    int   status  = 0
+    int   reason  = 6
+    int   bType   = 0
+    int   bN      = 0
+    float cond    = na
+    float lift    = na
+    float cov     = na
+    int   jointLow = 0
+    if marketDec == 0 or na(baseline)
         status := 0
-        reason := 1
+        reason := 2                       // INVALID_BASELINE
+    else if marketDec < qMinMarketResolved
+        status := 0
+        reason := 1                       // MARKET_SAMPLE_LOW (PART 2: hit+failed, expired hariç)
     else
         // (a) En spesifik YETERLİ joint Score×Dist bucket (cbKindA=0 Score>=, cbKindB=2 Dist<=).
         int  jH = 0
         int  jF = 0
         int  jE = 0
         int  jSpec = -1
-        bool jFound = false
+        bool jFound   = false
+        bool jMatched = false             // aday combo anahtarına uydu (yeterli olmasa da)
         for ci = 0 to array.size(cbFam) - 1
             if array.get(cbKindA, ci) == 0 and array.get(cbKindB, ci) == 2
                 int lvA = array.get(cbLvlA, ci)
@@ -935,7 +957,9 @@ f_qualify(int scB, int tdB, int mH, int mF, int mE) =>
                     int e = array.get(cbExp, ci)
                     int dec = h + f
                     int tot = h + f + e
-                    if dec >= qMinBucketResolved and tot / marketN >= qMinCoverage
+                    if dec > 0
+                        jMatched := true
+                    if dec >= qMinBucketResolved and tot / marketDec >= qMinCoverage
                         int spec = lvA * 10 - lvB
                         if not jFound or spec > jSpec
                             jFound := true
@@ -947,7 +971,7 @@ f_qualify(int scB, int tdB, int mH, int mF, int mE) =>
             bType := 1
             bN    := jH + jF
             cond  := (jH + jF) > 0 ? jH / (jH + jF) : na
-            cov   := (jH + jF + jE) / marketN
+            cov   := (jH + jF + jE) / marketDec
         else
             // (b) Tekil: Score (>= scB kümülatif) ve Dist (<= tdB kümülatif); en güçlü |lift| kazanır.
             int sH = f_cumFrom(anSc_hit, scB)
@@ -956,8 +980,8 @@ f_qualify(int scB, int tdB, int mH, int mF, int mE) =>
             int dH = f_cumUpTo(anTd_hit, tdB)
             int dF = f_cumUpTo(anTd_fail, tdB)
             int dE = f_cumUpTo(anTd_exp, tdB)
-            bool  sOk   = (sH + sF) >= qMinBucketResolved and (sH + sF + sE) / marketN >= qMinCoverage
-            bool  dOk   = (dH + dF) >= qMinBucketResolved and (dH + dF + dE) / marketN >= qMinCoverage
+            bool  sOk   = (sH + sF) >= qMinBucketResolved and (sH + sF + sE) / marketDec >= qMinCoverage
+            bool  dOk   = (dH + dF) >= qMinBucketResolved and (dH + dF + dE) / marketDec >= qMinCoverage
             float sCond = (sH + sF) > 0 ? sH / (sH + sF) : na
             float dCond = (dH + dF) > 0 ? dH / (dH + dF) : na
             float sLift = na(sCond) ? na : sCond - baseline
@@ -966,20 +990,32 @@ f_qualify(int scB, int tdB, int mH, int mF, int mE) =>
                 bType := 2
                 bN    := sH + sF
                 cond  := sCond
-                cov   := (sH + sF + sE) / marketN
+                cov   := (sH + sF + sE) / marketDec
             else if dOk
                 bType := 3
                 bN    := dH + dF
                 cond  := dCond
-                cov   := (dH + dF + dE) / marketN
+                cov   := (dH + dF + dE) / marketDec
+            else
+                // Yeterli bucket yok → nedeni ayır (en geniş tekil bucket'a göre).
+                int bestDec = math.max(sH + sF, dH + dF)
+                if bestDec == 0
+                    reason := 3   // NO_BUCKET (ilgili bin'lerde hiç resolved yok)
+                else if bestDec < qMinBucketResolved
+                    reason := 4   // SINGLE_SAMPLE_LOW
+                else
+                    reason := 5   // COVERAGE_LOW
+        // joint aday anahtarına uydu ama seçilemedi → tanısal işaret.
+        if jMatched and not jFound
+            jointLow := 1
         if bType == 0
             status := 0
-            reason := 2
+            // reason yukarıda belirlendi (3/4/5)
         else
             reason := 0
             lift   := cond - baseline
             status := lift >= qQualifiedMinLift ? 1 : lift <= qRejectedMaxLift ? 3 : 2
-    [status, reason, bType, bN, marketN, baseline, cond, lift, cov]
+    [status, reason, bType, bN, marketDec, baseline, cond, lift, cov, jointLow]
 
 // Bir tekil kondisyonun (kind,lvl) resolved sayacı [h,f,e].
 f_condCounts(int kind, int lvl) =>
@@ -1639,7 +1675,7 @@ if barstate.isconfirmed
                         //      HİÇBİR prediction'ı bastırmaz/değiştirmez (SHADOW).
                         int qScB = f_scBin(pScore)
                         int qTdB = f_tdBin(anTDistAtr)
-                        [qSt, qRs, qBt, qBN, qMN, qBase, qCondV, qLiftV, qCov] = f_qualify(qScB, qTdB, evHit, evFail, evExp)
+                        [qSt, qRs, qBt, qBN, qMN, qBase, qCondV, qLiftV, qCov, qJLow] = f_qualify(qScB, qTdB, evHit, evFail, evExp)
 
                         // 1f) Çizim: kutu, oluştuğu (confirmed C) bardan sağa (Score + Confidence).
                         PredGroup g = PredGroup.new(array.new<label>(), array.new<box>())
@@ -1678,6 +1714,11 @@ if barstate.isconfirmed
                         cntCreated += 1
                         // Qualification (SHADOW) oluşum dağılımı — emisyonu ETKİLEMEZ.
                         array.set(qCount, qSt, array.get(qCount, qSt) + 1)
+                        // UNKNOWN neden partisyonu (toplam = UNKNOWN adedi). reason 0 = classified.
+                        if qSt == 0
+                            array.set(qUnkReason, qRs, array.get(qUnkReason, qRs) + 1)
+                        // Tanısal: joint kombosu adaya uydu ama seçilemedi (partisyon dışı).
+                        qJointLow += qJLow
 
                         // 1h) Evaluation kaydı: ACTIVE olarak izlemeye al + oluşum sayaçları.
                         array.push(activeList, rec)
@@ -2186,9 +2227,18 @@ if researchMode == "Export"
         int   qQdec = array.get(qHit, 1) + array.get(qFail, 1)
         float qQhitRate = qQdec > 0 ? 100.0 * array.get(qHit, 1) / qQdec : na
         float qQlift    = na(qQhitRate) or na(xBase) ? na : qQhitRate - xBase
-        float qQcov     = evTotal > 0 ? 100.0 * qQ / evTotal : na
-        string qualCsv  = ",SHADOW,Q1," + str.tostring(qQ) + "," + str.tostring(qW) + "," + str.tostring(qU) + "," + str.tostring(qR) + "," + f_n1(qQhitRate) + "," + f_sgn1(qQlift) + "," + f_n1(qQcov)
-        string qualJson = ',"qualMode":"SHADOW","qualVersion":"Q1","qualQualified":' + str.tostring(qQ) + ',"qualWeak":' + str.tostring(qW) + ',"qualUnknown":' + str.tostring(qU) + ',"qualRejected":' + str.tostring(qR) + ',"qualQualifiedHitRate":' + f_jn(qQhitRate) + ',"qualQualifiedLift":' + f_jn(qQlift) + ',"qualCoverage":' + f_jn(qQcov)
+        // PART 5: coverage = sınıflandırılan / toplam = (QUALIFIED+WEAK+REJECTED)/total.
+        int   qClassified = qQ + qW + qR
+        float qQcov     = evTotal > 0 ? 100.0 * qClassified / evTotal : na
+        // UNKNOWN neden partisyonu (export'a dahil; toplam == qU).
+        int   qrMkt = array.get(qUnkReason, 1)
+        int   qrBase = array.get(qUnkReason, 2)
+        int   qrNoB = array.get(qUnkReason, 3)
+        int   qrSgl = array.get(qUnkReason, 4)
+        int   qrCov = array.get(qUnkReason, 5)
+        int   qrOth = array.get(qUnkReason, 6)
+        string qualCsv  = ",SHADOW,Q1," + str.tostring(qQ) + "," + str.tostring(qW) + "," + str.tostring(qU) + "," + str.tostring(qR) + "," + f_n1(qQhitRate) + "," + f_sgn1(qQlift) + "," + f_n1(qQcov) + "," + str.tostring(qrMkt) + "," + str.tostring(qrBase) + "," + str.tostring(qrNoB) + "," + str.tostring(qrSgl) + "," + str.tostring(qrCov) + "," + str.tostring(qrOth) + "," + str.tostring(qJointLow)
+        string qualJson = ',"qualMode":"SHADOW","qualVersion":"Q1","qualQualified":' + str.tostring(qQ) + ',"qualWeak":' + str.tostring(qW) + ',"qualUnknown":' + str.tostring(qU) + ',"qualRejected":' + str.tostring(qR) + ',"qualQualifiedHitRate":' + f_jn(qQhitRate) + ',"qualQualifiedLift":' + f_jn(qQlift) + ',"qualCoverage":' + f_jn(qQcov) + ',"qualUnkMarketLow":' + str.tostring(qrMkt) + ',"qualUnkInvalidBaseline":' + str.tostring(qrBase) + ',"qualUnkNoBucket":' + str.tostring(qrNoB) + ',"qualUnkSingleLow":' + str.tostring(qrSgl) + ',"qualUnkCoverageLow":' + str.tostring(qrCov) + ',"qualUnkOther":' + str.tostring(qrOth) + ',"qualJointLow":' + str.tostring(qJointLow)
         // Tek satır (CSV / JSON). TÜM string alanlar f_s ile korunur → na propagate ETMEZ.
         string sSym    = f_s(mSym)
         string sTf     = f_s(mTf)
@@ -2223,11 +2273,23 @@ f_qrow(table t, int r, string lbl, int s, float baseAll) =>
     table.cell(t, 2, r, na(hr) ? "—" : str.tostring(hr, "#.#"), text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
     table.cell(t, 3, r, na(lf) ? "—" : (lf >= 0 ? "+" : "") + str.tostring(lf, "#.#"), text_color = color.white, bgcolor = f_liftColor(lf), text_size = size.small, text_halign = text.align_right)
 
+// UNKNOWN neden satırı: etiket + adet + toplam UNKNOWN içindeki yüzde.
+f_qureason(table t, int r, string lbl, int idx, int unkTot) =>
+    int   n  = array.get(qUnkReason, idx)
+    float pc = unkTot > 0 ? 100.0 * n / unkTot : na
+    table.cell(t, 0, r, lbl,             text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, str.tostring(n), text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 2, r, na(pc) ? "—" : str.tostring(pc, "#.#") + "%", text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 3, r, "", bgcolor = RES_CELL)
+
 var table qtab = na
 if showQual and barstate.islast
     if na(qtab)
-        qtab := table.new(position.middle_left, 4, 7, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
+        qtab := table.new(position.middle_left, 4, 16, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
     float qBaseAll = (evHit + evFail) > 0 ? 100.0 * evHit / (evHit + evFail) : na
+    int   qU2 = array.get(qCount, 0)
+    int   qClassified2 = array.get(qCount, 1) + array.get(qCount, 2) + array.get(qCount, 3)
+    int   qUnkSum = array.get(qUnkReason, 1) + array.get(qUnkReason, 2) + array.get(qUnkReason, 3) + array.get(qUnkReason, 4) + array.get(qUnkReason, 5) + array.get(qUnkReason, 6)
     table.cell(qtab, 0, 0, "QUALIFICATION · SHADOW · Q1", text_color = color.white, bgcolor = RES_HDR, text_size = size.small, text_halign = text.align_left)
     table.cell(qtab, 1, 0, "", bgcolor = RES_HDR)
     table.cell(qtab, 2, 0, "", bgcolor = RES_HDR)
@@ -2240,10 +2302,32 @@ if showQual and barstate.islast
     f_qrow(qtab, 3, "WEAK",      2, qBaseAll)
     f_qrow(qtab, 4, "UNKNOWN",   0, qBaseAll)
     f_qrow(qtab, 5, "REJECTED",  3, qBaseAll)
-    table.cell(qtab, 0, 6, "QUAL coverage", text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
-    table.cell(qtab, 1, 6, evTotal > 0 ? str.tostring(100.0 * array.get(qCount, 1) / evTotal, "#.#") + "%" : "—", text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
-    table.cell(qtab, 2, 6, "", bgcolor = RES_CELL)
+    // PART 5: coverage = sınıflandırılan / toplam = (QUALIFIED+WEAK+REJECTED)/total.
+    table.cell(qtab, 0, 6, "Coverage", text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    table.cell(qtab, 1, 6, evTotal > 0 ? str.tostring(100.0 * qClassified2 / evTotal, "#.#") + "%" : "—", text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(qtab, 2, 6, str.tostring(qClassified2) + "/" + str.tostring(evTotal), text_color = color.gray, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
     table.cell(qtab, 3, 6, "", bgcolor = RES_CELL)
+    // PART 1: UNKNOWN neden partisyonu (toplam == UNKNOWN N; jenerik UNKNOWN yok).
+    table.cell(qtab, 0, 7, "UNKNOWN reasons", text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_left)
+    table.cell(qtab, 1, 7, "N",  text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(qtab, 2, 7, "%",  text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(qtab, 3, 7, "",   bgcolor = RES_SECT)
+    f_qureason(qtab, 8,  "MARKET_SAMPLE_LOW", 1, qU2)
+    f_qureason(qtab, 9,  "INVALID_BASELINE",  2, qU2)
+    f_qureason(qtab, 10, "NO_BUCKET",         3, qU2)
+    f_qureason(qtab, 11, "SINGLE_SAMPLE_LOW", 4, qU2)
+    f_qureason(qtab, 12, "COVERAGE_LOW",      5, qU2)
+    f_qureason(qtab, 13, "OTHER",             6, qU2)
+    // Partisyon bütünlüğü: reason toplamı == UNKNOWN N olmalı (OK/BAD).
+    table.cell(qtab, 0, 14, "sum == UNKNOWN", text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    table.cell(qtab, 1, 14, str.tostring(qUnkSum), text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(qtab, 2, 14, qUnkSum == qU2 ? "OK" : "BAD", text_color = qUnkSum == qU2 ? color.lime : color.red, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(qtab, 3, 14, "", bgcolor = RES_CELL)
+    // Tanısal (partisyon dışı): joint aday anahtarına uydu ama yetersizdi.
+    table.cell(qtab, 0, 15, "joint matched-low", text_color = color.gray, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    table.cell(qtab, 1, 15, str.tostring(qJointLow), text_color = color.gray, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(qtab, 2, 15, "", bgcolor = RES_CELL)
+    table.cell(qtab, 3, 15, "", bgcolor = RES_CELL)
 else
     if not na(qtab)
         table.delete(qtab)
