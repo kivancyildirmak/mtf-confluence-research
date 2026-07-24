@@ -90,8 +90,8 @@ exportFmt    = input.string("CSV", "Export Format", options = ["CSV", "JSON"], g
 
 // Qualification V1 — SHADOW MODE. Sınıflandırır ama HİÇBİR prediction'ı bastırmaz.
 grpQual            = "Qualification (Shadow)"
-qMinMarketResolved = input.int(100,  "Min market resolved (N0)", minval = 1, group = grpQual)
-qMinBucketResolved = input.int(40,   "Min bucket resolved",      minval = 1, group = grpQual)
+qMinMarketResolved = input.int(40,   "Min market resolved (N0)", minval = 1, group = grpQual)
+qMinBucketResolved = input.int(20,   "Min bucket resolved",      minval = 1, group = grpQual)
 qMinCoverage       = input.float(0.05, "Min coverage",           minval = 0.0, step = 0.01, group = grpQual)
 qQualifiedMinLift  = input.float(0.05, "Qualified min lift",     step = 0.01, group = grpQual)
 qRejectedMaxLift   = input.float(-0.05,"Rejected max lift",      step = 0.01, group = grpQual)

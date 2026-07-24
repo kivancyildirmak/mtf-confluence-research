@@ -22,8 +22,8 @@ Rule (identical to Pine):
 """
 
 # Global parameters (defaults, identical to the Pine inputs)
-MIN_MARKET_RESOLVED = 100
-MIN_BUCKET_RESOLVED = 40
+MIN_MARKET_RESOLVED = 40
+MIN_BUCKET_RESOLVED = 20
 MIN_COVERAGE        = 0.05
 QUALIFIED_MIN_LIFT  = 0.05
 REJECTED_MAX_LIFT   = -0.05
@@ -173,8 +173,9 @@ if __name__ == "__main__":
     MKT = (400, 600, 0)          # baseline = 400/1000 = 0.40, marketDec = 1000
     BASE = 0.40
 
-    # 1. Market not established -> UNKNOWN(MARKET_SAMPLE_LOW)
-    r = qualify(3, 1, (30, 20, 0), [], EMPTY_SC, EMPTY_TD)   # 50 decisive < 100
+    # 1. Market not established -> UNKNOWN(MARKET_SAMPLE_LOW). Pin min_market so the
+    #    rule is tested independent of the default (which is now 40).
+    r = qualify(3, 1, (30, 20, 0), [], EMPTY_SC, EMPTY_TD, min_market=100)   # 50 decisive < 100
     check("1 market<min -> UNKNOWN/MARKET_SAMPLE_LOW", r["status"] == UNKNOWN and r["reason"] == R_MARKET_LOW)
 
     # 2. QUALIFIED: single score bucket 50% hit vs 40% baseline (lift +10) N=60 cov=6%
@@ -242,8 +243,9 @@ if __name__ == "__main__":
 
     # P6-1. Market resolved sample EXCLUDES expired. Same 87 decisive outcomes:
     #   expired padding it to >=100 total must NOT let it pass the market gate.
-    r_pad = qualify(3, 3, (46, 41, 18), [], sc_single(3, 30, 30), EMPTY_TD)  # 87 dec, 18 exp, 105 tot
-    r_nopad = qualify(3, 3, (46, 41, 0), [], sc_single(3, 30, 30), EMPTY_TD)  # 87 dec, 0 exp
+    # Pin min_market=100 so the expired-exclusion demo holds (87 dec < 100) regardless of default.
+    r_pad = qualify(3, 3, (46, 41, 18), [], sc_single(3, 30, 30), EMPTY_TD, min_market=100)  # 87 dec, 18 exp, 105 tot
+    r_nopad = qualify(3, 3, (46, 41, 0), [], sc_single(3, 30, 30), EMPTY_TD, min_market=100)  # 87 dec, 0 exp
     check("P6-1 expired does NOT count as resolved (105 tot but 87 dec -> MARKET_LOW)",
           r_pad["status"] == UNKNOWN and r_pad["reason"] == R_MARKET_LOW and r_pad["marketDec"] == 87)
     check("P6-1 market gate identical with/without expired padding",
@@ -297,10 +299,11 @@ if __name__ == "__main__":
     check("P6-7 AYGAZ-like 5/105 coverage ~= 4.76% (not 0%)",
           abs(cov_aygaz - (100.0 * 5 / 105)) < 1e-9 and abs(cov_aygaz - 4.7619) < 1e-3)
 
-    # P6-7b. AYGAZ under the PART 2 fix: 87 decisive < 100 -> the market gate makes
-    #   the candidate UNKNOWN/MARKET_SAMPLE_LOW regardless of any bucket evidence.
-    r = qualify(3, 3, (46, 41, 18), combos2, sc_single(3, 99, 1), EMPTY_TD)
-    check("P6-7b AYGAZ decisive=87 -> UNKNOWN/MARKET_SAMPLE_LOW (fix removes spurious WEAK)",
+    # P6-7b. AYGAZ under the PART 2 fix: at a 100 market gate, 87 decisive < 100 ->
+    #   UNKNOWN/MARKET_SAMPLE_LOW regardless of bucket evidence (pin min_market=100 to
+    #   demonstrate the gate; the production default is now 40, at which 87 passes).
+    r = qualify(3, 3, (46, 41, 18), combos2, sc_single(3, 99, 1), EMPTY_TD, min_market=100)
+    check("P6-7b AYGAZ decisive=87 < 100 gate -> UNKNOWN/MARKET_SAMPLE_LOW",
           r["status"] == UNKNOWN and r["reason"] == R_MARKET_LOW)
 
     # P6-8. Pine and Python reference use identical semantics. We cannot import Pine,
@@ -310,7 +313,7 @@ if __name__ == "__main__":
     #     - coverage denominators use marketDec (not marketN)
     #     - reason partition ids 1..6 as named
     check("P6-8 thresholds identical to Pine inputs",
-          MIN_MARKET_RESOLVED == 100 and MIN_BUCKET_RESOLVED == 40 and
+          MIN_MARKET_RESOLVED == 40 and MIN_BUCKET_RESOLVED == 20 and
           abs(MIN_COVERAGE - 0.05) < 1e-12 and abs(QUALIFIED_MIN_LIFT - 0.05) < 1e-12 and
           abs(REJECTED_MAX_LIFT + 0.05) < 1e-12)
     # marketDec is exposed and equals hit+failed for a mixed sample:
