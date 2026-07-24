@@ -75,8 +75,12 @@ chk("reject: R:R >= minRR", "stRR >= minRR" in strat_text)
 chk("Minimum R:R input default 1.0", 'input.float(1.0, "Minimum R:R"' in strat_text)
 chk("risk % sizing from entry-to-stop distance",
     "riskCash / stRisk" in strat_text and "strategy.equity * (riskPct" in strat_text)
-chk("editable commission input", 'input.float(0.04, "Commission %"' in strat_text)
-chk("editable slippage input", 'input.int(1, "Slippage (ticks)"' in strat_text)
+# Pine requires const commission/slippage in the strategy() header (CE10123 if
+# input.* is used); they are edited natively via the Strategy Properties tab.
+chk("commission_value const in header (0.04)", "commission_value = 0.04" in strat_text)
+chk("slippage const in header (1)", "slippage = 1" in strat_text)
+chk("no input.* inside strategy() header (would fail CE10123)",
+    re.search(r"strategy\([^\n]*input\.", strat_text) is None)
 chk("trade modes All / QUALIFIED only / QUALIFIED + WEAK",
     '"All", "QUALIFIED only", "QUALIFIED + WEAK"' in strat_text)
 chk("timeout close at maxActiveBars (matches expiry rule)",
