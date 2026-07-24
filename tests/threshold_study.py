@@ -321,7 +321,9 @@ def parse_qstudy(text):
         if i < 0:
             continue
         diag["qstudy_lines"] += 1
-        parts = raw[i:].strip().split(",")
+        # CSV exports wrap the message in quotes ("QSTUDY,..."); strip quotes/
+        # whitespace from every field so the trailing '"' on the last token parses.
+        parts = [x.strip().strip('"').strip() for x in raw[i:].strip().split(",")]
         if len(parts) < 7:
             diag["malformed"].append((ln, raw.strip()))
             continue
