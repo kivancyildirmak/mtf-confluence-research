@@ -16,7 +16,8 @@ A per-prediction event log per symbol. Each prediction:
     dict(id, create_t, resolve_t, outcome, scB, tdB)
       create_t  : monotonic creation index/bar (chronological)
       resolve_t : resolution index/bar, or None if still active at chart end
-      outcome   : "H" hit | "F" fail | "E" expired | "U" unresolved(active)
+      outcome   : "H" hit | "F" fail | "E" expired | "A" active/unresolved
+                  (A, never "U" — "U" would collide with qualification UNKNOWN)
       scB       : score fine-bin 0..5   (f_scBin at creation)
       tdB       : target-distance bin 0..3 (f_tdBin at creation)
 Export it from Pine by enabling the "Export per-prediction log (threshold
@@ -287,40 +288,135 @@ def toy_dataset(n=120, seed=1):
         else:
             outcome = "H" if (i * 7 + 3) % 5 < 3 else "F"   # ~60% of decisive hit
         resolve_t = None if i >= n - 6 else 2 * i + 40      # last 6 still active
-        out = "U" if resolve_t is None else outcome
+        out = "A" if resolve_t is None else outcome          # A = active/unresolved
         preds.append(dict(id=i + 1, create_t=2 * i,
                           resolve_t=resolve_t, outcome=out,
                           scB=(i % SC_BINS), tdB=(i % TD_BINS)))
     return preds
 
 
+# Outcome codes (item 4). A = Active/unresolved (deliberately NOT 'U', which
+# could be confused with qualification UNKNOWN).
+VALID_OUTCOMES = {"H", "F", "E", "A"}
+OUTCOME_NAMES = {"H": "Hit", "F": "Failed", "E": "Expired", "A": "Active"}
+
+
 def parse_qstudy(text):
-    """Parse Pine QSTUDY log lines into a preds list. Each line:
-        QSTUDY,id,createBar,resolveBar|NA,H|F|E|U,scB,tdB
-    Lines may carry a TradingView log timestamp/prefix; we scan for the token.
-    createBar/resolveBar drive the chronological timeline; if a symbol's log has
-    no bar (older format) we fall back to line order for create_t."""
+    """Parse Pine QSTUDY log lines. Each line (a TradingView log prefix may lead):
+        QSTUDY,id,createBar,resolveBar|NA,H|F|E|A,scB,tdB
+    Returns (preds, diag). diag records every integrity problem so the caller can
+    reconcile before trusting the study. Malformed / unknown-outcome rows are
+    dropped from preds but recorded in diag."""
     preds = []
-    for ln, raw in enumerate(text.splitlines()):
+    diag = dict(qstudy_lines=0, malformed=[], unknown_outcome=[], duplicate_ids=[],
+                resolve_before_create=[], active_with_resolve=[], resolved_with_na=[])
+    seen = set()
+
+    def _int(x):
+        x = x.strip()
+        return int(x) if x.lstrip("-").isdigit() else None
+
+    for ln, raw in enumerate(text.splitlines(), 1):
         i = raw.find("QSTUDY,")
         if i < 0:
             continue
+        diag["qstudy_lines"] += 1
         parts = raw[i:].strip().split(",")
         if len(parts) < 7:
+            diag["malformed"].append((ln, raw.strip()))
             continue
         _, pid, cbar, rbar, outcome, scb, tdb = parts[:7]
-        create_t = int(cbar) if cbar.strip().lstrip("-").isdigit() else ln
-        resolve_t = None if rbar.strip().upper() in ("NA", "", "NAN") else int(rbar)
-        preds.append(dict(id=int(pid) if pid.strip().lstrip("-").isdigit() else ln,
-                          create_t=create_t, resolve_t=resolve_t,
-                          outcome=outcome.strip().upper()[:1],
-                          scB=int(scb), tdB=int(tdb)))
-    return preds
+        pidv, cbarv, scbv, tdbv = _int(pid), _int(cbar), _int(scb), _int(tdb)
+        oc = outcome.strip().upper()
+        rbraw = rbar.strip().upper()
+        na_resolve = rbraw in ("NA", "", "NAN")
+        rbarv = None if na_resolve else _int(rbar)
+        if pidv is None or cbarv is None or scbv is None or tdbv is None or (not na_resolve and rbarv is None):
+            diag["malformed"].append((ln, raw.strip()))
+            continue
+        if oc not in VALID_OUTCOMES:
+            diag["unknown_outcome"].append((ln, oc))
+            continue
+        if pidv in seen:
+            diag["duplicate_ids"].append(pidv)
+        seen.add(pidv)
+        # semantic integrity (item 9)
+        if oc == "A" and rbarv is not None:
+            diag["active_with_resolve"].append(pidv)
+        if oc in ("H", "F", "E") and rbarv is None:
+            diag["resolved_with_na"].append(pidv)
+        if rbarv is not None and rbarv < cbarv:
+            diag["resolve_before_create"].append(pidv)
+        preds.append(dict(id=pidv, create_t=cbarv, resolve_t=rbarv,
+                          outcome=oc, scB=scbv, tdB=tdbv))
+    return preds, diag
+
+
+def reconcile(sym, preds, diag, expected=None):
+    """AYGAZ-style reconciliation report (items 1-8). Prints exactly-once /
+    count / outcome-total checks and returns True iff no integrity problem was
+    found. `expected` = dict(total,H,F,E) to match the TradingView panel."""
+    n = len(preds)
+    by = {"H": 0, "F": 0, "E": 0, "A": 0}
+    for p in preds:
+        by[p["outcome"]] += 1
+    resolved = by["H"] + by["F"] + by["E"]
+    active = by["A"]
+    problems = []
+    if diag["malformed"]:
+        problems.append(f"{len(diag['malformed'])} malformed row(s)")
+    if diag["unknown_outcome"]:
+        problems.append(f"{len(diag['unknown_outcome'])} unknown-outcome row(s)")
+    if diag["duplicate_ids"]:
+        problems.append(f"{len(set(diag['duplicate_ids']))} duplicate id(s) "
+                        f"(double-emit: resolution + active) -> {sorted(set(diag['duplicate_ids']))[:8]}")
+    if diag["active_with_resolve"]:
+        problems.append(f"{len(diag['active_with_resolve'])} active row(s) with a non-NA resolveBar")
+    if diag["resolved_with_na"]:
+        problems.append(f"{len(diag['resolved_with_na'])} resolved row(s) with NA resolveBar")
+    if diag["resolve_before_create"]:
+        problems.append(f"{len(diag['resolve_before_create'])} row(s) resolveBar<createBar")
+
+    print(f"\n===== {sym} — QSTUDY reconciliation =====")
+    print(f"  QSTUDY lines parsed        : {diag['qstudy_lines']}")
+    print(f"  valid records (preds)      : {n}")
+    print(f"  unique ids                 : {len(set(p['id'] for p in preds))}  "
+          f"(exactly-once: {'OK' if len(set(p['id'] for p in preds)) == n and not diag['duplicate_ids'] else 'FAIL'})")
+    print(f"  outcomes  H={by['H']}  F={by['F']}  E={by['E']}  A(active)={active}")
+    print(f"  resolved (H+F+E)           : {resolved}")
+    print(f"  Total Predictions (= n)    : {n}  [includes {active} active record(s)]")
+    if expected:
+        ok_tot = n == expected["total"]
+        ok_h = by["H"] == expected["H"]
+        ok_f = by["F"] == expected["F"]
+        ok_e = by["E"] == expected["E"]
+        print(f"  panel expected             : total={expected['total']} H={expected['H']} "
+              f"F={expected['F']} E={expected['E']}")
+        print(f"  match                      : total {'OK' if ok_tot else 'FAIL'} | "
+              f"H {'OK' if ok_h else 'FAIL'} | F {'OK' if ok_f else 'FAIL'} | E {'OK' if ok_e else 'FAIL'}")
+        # active accounting note
+        if resolved == expected["total"]:
+            print("  note                       : resolved == panel total -> 0 active; "
+                  "Total does NOT include any active here")
+        elif resolved + active == n:
+            print(f"  note                       : Total ({n}) = resolved ({resolved}) + active ({active})")
+        if not (ok_tot and ok_h and ok_f and ok_e):
+            problems.append("panel totals mismatch")
+    print(f"  integrity                  : {'ALL OK' if not problems else 'PROBLEMS -> ' + '; '.join(problems)}")
+    return not problems
+
+
+# expected panel totals for symbols with confirmed marginals (item 5)
+PANEL_EXPECTED = {
+    "AYGAZ": dict(total=105, H=46, F=41, E=18),
+}
 
 
 def study_from_logs(paths):
     """Run the full study on one or more real QSTUDY logs. A path may be
-    'SYMBOL=file.log' to label the symbol; otherwise the filename stem is used."""
+    'SYMBOL=file.log' to label the symbol; otherwise the filename stem is used.
+    Reconciles each log first; refuses to run the grid on a log with integrity
+    problems (duplicate/malformed/etc.) so bad data never reaches the study."""
     per_symbol = {}
     for path in paths:
         if "=" in path:
@@ -328,9 +424,13 @@ def study_from_logs(paths):
         else:
             sym, fn = os.path.splitext(os.path.basename(path))[0], path
         with open(fn) as fh:
-            preds = parse_qstudy(fh.read())
+            preds, diag = parse_qstudy(fh.read())
         if not preds:
-            print(f"[skip] {sym}: no QSTUDY lines in {fn}")
+            print(f"[skip] {sym}: no valid QSTUDY records in {fn}")
+            continue
+        clean = reconcile(sym, preds, diag, PANEL_EXPECTED.get(sym))
+        if not clean:
+            print(f"[hold] {sym}: integrity problems above — grid NOT run until resolved.")
             continue
         name, rows = run_symbol(sym, preds)
         print_symbol_table(name, rows)
@@ -363,6 +463,81 @@ def cross_symbol_summary(per_symbol):
         print(f"{mm:>3} {mb:>3}  {_f(med):>5}  {_f(worst):>7}  {_f(unw):>11}  {_f(wcov):>18}  {len(entries)}")
 
 
+# ===========================================================================
+# Parser / integrity tests (item 9) + reconciliation self-check
+# ===========================================================================
+def run_parser_tests():
+    fails = []
+
+    def chk(name, cond):
+        print(("PASS " if cond else "FAIL ") + name)
+        if not cond:
+            fails.append(name)
+
+    # clean baseline: 3 records, all fields valid
+    good = ("QSTUDY,1,10,20,H,3,1\n"
+            "QSTUDY,2,11,25,F,4,0\n"
+            "QSTUDY,3,12,NA,A,2,2\n")
+    preds, d = parse_qstudy(good)
+    chk("clean: 3 valid records", len(preds) == 3)
+    chk("clean: no diagnostics", not any(d[k] for k in
+        ("malformed", "unknown_outcome", "duplicate_ids", "resolve_before_create",
+         "active_with_resolve", "resolved_with_na")))
+
+    # duplicate ids (double-emit: resolution then active)
+    dup = "QSTUDY,7,10,20,H,3,1\nQSTUDY,7,10,NA,A,3,1\n"
+    _p, d = parse_qstudy(dup)
+    chk("duplicate id detected", 7 in d["duplicate_ids"])
+
+    # malformed rows (too few fields / non-numeric)
+    mal = "QSTUDY,9,10,20,H\nQSTUDY,x,10,20,H,3,1\nQSTUDY,10,ab,20,H,3,1\n"
+    p, d = parse_qstudy(mal)
+    chk("malformed rows dropped", len(p) == 0 and len(d["malformed"]) == 3)
+
+    # unknown outcome code (incl. the forbidden 'U')
+    unk = "QSTUDY,1,10,20,U,3,1\nQSTUDY,2,10,20,Z,3,1\n"
+    p, d = parse_qstudy(unk)
+    chk("unknown outcome 'U'/'Z' rejected", len(p) == 0 and len(d["unknown_outcome"]) == 2)
+
+    # resolveBar earlier than createBar
+    early = "QSTUDY,1,50,40,H,3,1\n"
+    _p, d = parse_qstudy(early)
+    chk("resolve<create flagged", 1 in d["resolve_before_create"])
+
+    # active record with a non-NA resolveBar
+    ar = "QSTUDY,1,10,30,A,3,1\n"
+    _p, d = parse_qstudy(ar)
+    chk("active with non-NA resolveBar flagged", 1 in d["active_with_resolve"])
+
+    # resolved record with an NA resolveBar
+    rn = "QSTUDY,1,10,NA,H,3,1\n"
+    _p, d = parse_qstudy(rn)
+    chk("resolved (H) with NA resolveBar flagged", 1 in d["resolved_with_na"])
+
+    # tolerates a TradingView log prefix before the token
+    pref = "2026-01-01T00:00:00Z [info] QSTUDY,1,10,20,H,3,1\n"
+    p, d = parse_qstudy(pref)
+    chk("log-prefix tolerated", len(p) == 1 and p[0]["id"] == 1)
+
+    if fails:
+        print("PARSER TESTS: %d FAILED -> %s" % (len(fails), fails))
+        raise SystemExit(1)
+    print("PARSER TESTS: ALL PASSED")
+
+
+def synthetic_aygaz_log():
+    """Deterministic AYGAZ-shaped log matching the panel marginals EXACTLY
+    (total 105, H 46, F 41, E 18, 0 active) — for reconciliation self-check ONLY.
+    This is NOT real AYGAZ data; it proves the reconciliation math, not behaviour."""
+    seq = ["H"] * 46 + ["F"] * 41 + ["E"] * 18   # 105 resolved, 0 active
+    lines = []
+    for i, oc in enumerate(seq):
+        cb = 2 * i
+        rb = cb + 5
+        lines.append(f"QSTUDY,{i+1},{cb},{rb},{oc},{i % SC_BINS},{i % TD_BINS}")
+    return "\n".join(lines) + "\n"
+
+
 def main():
     import sys
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
@@ -371,6 +546,12 @@ def main():
         study_from_logs(args)
         return
     print(__doc__.strip().splitlines()[0])
+    print("\n### PARSER / INTEGRITY TESTS ###")
+    run_parser_tests()
+    print("\n### AYGAZ reconciliation on SYNTHETIC marginals-matched log"
+          " (mechanics check, NOT real data) ###")
+    p, d = parse_qstudy(synthetic_aygaz_log())
+    reconcile("AYGAZ(synthetic)", p, d, PANEL_EXPECTED["AYGAZ"])
     print("\n### TOY DEMONSTRATION — synthetic, NOT real symbol behaviour ###")
     name, rows = run_symbol("TOY(mid-vol)", toy_dataset())
     print_symbol_table(name, rows)
@@ -385,6 +566,9 @@ def main():
     })
     print("\nNOTE: XU100/GOZDE/Gold/BTCUSD 'decisive' above are reported TOTALS used")
     print("as an upper bound; only AYGAZ's hit/fail split (87 decisive) is confirmed.")
+    print("\nNO THRESHOLD RECOMMENDATION is produced here. A recommendation requires")
+    print("real QSTUDY logs run through this harness (feasibility bounds and binomial")
+    print("reliability are structural context, not a data-derived pick).")
 
 
 if __name__ == "__main__":
