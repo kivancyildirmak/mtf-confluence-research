@@ -2297,9 +2297,11 @@ if qStudyExport and barstate.islast
             if pr.status == 0
                 qExpActive += 1
                 log.info("QSTUDY," + str.tostring(pr.id) + "," + str.tostring(pr.creationBar) + ",NA,A," + str.tostring(pr.qScBin) + "," + str.tostring(pr.qTdBin))
-    // Heartbeat: HER ZAMAN yazılır (qStudyExport açıkken) → log.info çalıştı mı ve
-    // kaç kayıt beklenmeli, anında doğrulanır. Parser bunu yok sayar ("QSTUDY," yok).
-    log.info("QSTUDY_SUMMARY,total=" + str.tostring(array.size(records)) + ",active=" + str.tostring(qExpActive) + ",resolved=" + str.tostring(array.size(records) - qExpActive))
+    // Heartbeat: HER ZAMAN yazılır (qStudyExport açıkken). log.WARNING kullanılır
+    // çünkü Pine Logs panelinin seviye filtresi "Info"yu gizleyebilir; warning her
+    // filtrede görünür. Bu satırı görüyor ama QSTUDY satırlarını görmüyorsan →
+    // filtre Info'yu gizliyor demektir (paneli "All / Info"ya al). Parser yok sayar.
+    log.warning("QSTUDY_SUMMARY,total=" + str.tostring(array.size(records)) + ",active=" + str.tostring(qExpActive) + ",resolved=" + str.tostring(array.size(records) - qExpActive) + " (QSTUDY satirlari log.info; panel filtresini Info'ya al)")
 
 // UNKNOWN neden satırı: etiket + adet + toplam UNKNOWN içindeki yüzde.
 f_qureason(table t, int r, string lbl, int idx, int unkTot) =>
