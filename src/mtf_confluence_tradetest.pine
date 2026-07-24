@@ -41,8 +41,18 @@ strategy("Harmonic Prediction Strategy", overlay = true, max_labels_count = 500,
 // --- Strategy katmanı input'ları ---
 grpStrat   = "Strategy"
 tradeMode  = input.string("QUALIFIED + WEAK", "Trade mode", options = ["All", "QUALIFIED only", "QUALIFIED + WEAK"], group = grpStrat, tooltip = "Hangi qStatus'lu sinyaller işleme girer. QUALIFIED=1, WEAK=2 (SHADOW etiketleri; qualification mantığı DEĞİŞMEZ).")
-minRR      = input.float(1.0, "Minimum R:R", minval = 0.0, step = 0.1, group = grpStrat)
 riskPct    = input.float(1.0, "Risk % of equity per trade", minval = 0.01, maxval = 100.0, step = 0.1, group = grpStrat)
+// Giriş: pivot ~3*ATR yükselince onaylandığından, C-confirmation'da MARKET girmek
+// çok geç/pahalı. Varsayılan PULLBACK: C'ye doğru geri çekilmede limit ile daha
+// iyi fiyat → daha küçük stop → R:R yükselir. Dolmazsa iptal (işlem yok).
+entryMode  = input.string("Pullback", "Entry mode", options = ["Pullback", "Market"], group = grpStrat, tooltip = "Pullback: C'ye geri çekilmede limit emir. Market: sinyal barı kapanışında piyasa (agresif, daha çok dolum ama düşük R:R).")
+pullbackFrac   = input.float(0.5, "Pullback fraction (C->signal)", minval = 0.0, maxval = 0.95, step = 0.05, group = grpStrat, tooltip = "Limit = C + f*(sinyal kapanışı - C). 0=C'de, 0.5=ortada.")
+entryValidBars = input.int(8, "Entry limit valid (bars)", minval = 1, group = grpStrat, tooltip = "Limit bu kadar bar içinde dolmazsa iptal.")
+stopBufferATR  = input.float(0.25, "Stop buffer (× ATR below C)", minval = 0.0, step = 0.05, group = grpStrat, tooltip = "Yapısal stop = C - max(bufferATR*ATR, minStopTicks).")
+minStopTicks   = input.int(5, "Stop buffer min ticks", minval = 0, group = grpStrat)
+minRR      = input.float(2.0, "Minimum R:R", minval = 0.0, step = 0.1, group = grpStrat, tooltip = "entry->stop mesafesine göre hedefe uzaklık bu orandan küçükse işlem reddedilir.")
+minTargetDistATR = input.float(1.0, "Min target distance (× ATR)", minval = 0.0, step = 0.1, group = grpStrat, tooltip = "Giriş D hedefine bu ATR'den yakınsa işlem reddedilir (D'ye çok yakın).")
+maxTradeBars = input.int(15, "Max trade duration (bars)", minval = 1, group = grpStrat, tooltip = "Doldurulan pozisyon bu kadar bar sonra piyasadan kapatılır (evaluation maxActiveBars'tan AYRI).")
 
 // =============================================================================
 // Girdiler
@@ -838,6 +848,9 @@ var float stCprice       = na   // C pivot fiyatı
 var float stEntryRef     = na   // sinyal barı kapanışı (giriş referansı; gerçek dolum sonraki açılış)
 var float stRRrec        = na   // hesaplanan R:R (kayıt)
 var bool  stDrew         = false // bu pozisyon için etiket/çizgi çizildi mi
+var bool  stPending      = false // bekleyen (henüz dolmamış) limit emir var mı
+var int   stOrderBar     = na   // limit emrin verildiği bar (iptal penceresi için)
+var float stLimitPx      = na   // pullback limit fiyatı (giriş referansı)
 
 // -----------------------------------------------------------------------------
 // FEATURE ENGINEERING analytics sayaçları (partition bucket; çözümde O(1) bump).
@@ -1767,28 +1780,40 @@ if barstate.isconfirmed
                         //      Giriş = sinyal barı kapanışı referansı; gerçek dolum SONRAKİ barın
                         //      açılışı (Strategy Tester varsayılanı). C tarihsel fiyatından GİRİLMEZ.
                         if dir == 1
-                            float stEntry  = close                 // sinyal barı kapanışı (referans)
-                            float stStop   = C.price - 0.5 * cATR  // yapısal stop: onaylı C dibinin 0.5*ATR altı
+                            // Giriş fiyatı: PULLBACK ise C'ye geri çekilmede limit; MARKET ise
+                            // sinyal kapanışı. Her iki durumda da C tarihsel fiyatından GİRİLMEZ.
+                            float stEntry  = entryMode == "Pullback" ? C.price + pullbackFrac * (close - C.price) : close
+                            // Yapısal stop: onaylı C dibinin altı (sabit ATR ofseti değil, YAPISAL seviye).
+                            float stStop   = C.price - math.max(stopBufferATR * cATR, minStopTicks * syminfo.mintick)
                             float stTarget = pLo                   // en yakın D küme kenarı (HIT seviyesi)
                             float stRisk   = stEntry - stStop
                             float stRew    = stTarget - stEntry
                             float stRR     = stRisk > 0 ? stRew / stRisk : na
                             bool modeOk = tradeMode == "All" or (tradeMode == "QUALIFIED only" and qSt == 1) or (tradeMode == "QUALIFIED + WEAK" and (qSt == 1 or qSt == 2))
-                            // Reddet: target<=giriş, stop>=giriş, veya R:R < minRR.
-                            bool geomOk = stTarget > stEntry and stStop < stEntry and not na(stRR) and stRR >= minRR
-                            if modeOk and geomOk and strategy.position_size == 0
+                            // Reddet: target<=giriş, stop>=giriş, R:R<minRR, VEYA giriş D'ye çok yakın.
+                            bool geomOk = stTarget > stEntry and stStop < stEntry and not na(stRR) and stRR >= minRR and (stTarget - stEntry) >= minTargetDistATR * cATR
+                            // Pullback için limit girişin bugünkü fiyatın ALTINDA olması gerekir (aksi halde
+                            // hemen dolar = pullback değil). Market'te bu şart aranmaz.
+                            bool entryOk = entryMode == "Market" or stEntry < close
+                            if modeOk and geomOk and entryOk and strategy.position_size == 0 and not stPending
                                 float riskCash = strategy.equity * (riskPct / 100.0)
                                 float qty = stRisk > 0 ? riskCash / stRisk : na
                                 if not na(qty) and qty > 0
-                                    strategy.entry("L", strategy.long, qty = qty, alert_message = "HPS BUY entry")
+                                    if entryMode == "Pullback"
+                                        strategy.entry("L", strategy.long, qty = qty, limit = stEntry, alert_message = "HPS BUY limit")
+                                    else
+                                        strategy.entry("L", strategy.long, qty = qty, alert_message = "HPS BUY market")
                                     stActiveStop   := stStop
                                     stActiveTarget := stTarget
                                     stSignalBar    := bar_index
                                     stCbar         := C.bidx
                                     stCprice       := C.price
                                     stEntryRef     := stEntry
+                                    stLimitPx      := stEntry
                                     stRRrec        := stRR
                                     stDrew         := false
+                                    stPending      := entryMode == "Pullback"
+                                    stOrderBar     := bar_index
 
                         // 1h) Evaluation kaydı: ACTIVE olarak izlemeye al + oluşum sayaçları.
                         array.push(activeList, rec)
@@ -2448,21 +2473,27 @@ else
 // kapanmış (confirmed) bar verisiyle; dolum bir sonraki açılışta gerçekleşir.
 // =============================================================================
 if barstate.isconfirmed
-    // Açık long için stop/target (OCO) ve süre-durdurma (expiry ile aynı kural).
+    // Bekleyen pullback limitini süre dolunca iptal et (dolmadıysa işlem yok).
+    if stPending and strategy.position_size == 0 and not na(stOrderBar) and (bar_index - stOrderBar) >= entryValidBars
+        strategy.cancel("L")
+        stPending := false
+
+    // Açık long için stop/target (OCO) ve süre-durdurma (trade'e özel maxTradeBars).
     if strategy.position_size > 0
         strategy.exit("X", from_entry = "L", stop = stActiveStop, limit = stActiveTarget, alert_message = "HPS exit (stop/target)")
-        if bar_index - strategy.opentrades.entry_bar_index(0) >= maxActiveBars
+        if bar_index - strategy.opentrades.entry_bar_index(0) >= maxTradeBars
             strategy.close("L", comment = "timeout", alert_message = "HPS timeout close")
 
     // Dolum tespiti (poz 0 -> >0): gerçek giriş barı, C->giriş bar farkı, R:R çiz.
     if strategy.position_size > 0 and strategy.position_size[1] == 0
+        stPending := false
         int   fillBar   = strategy.opentrades.entry_bar_index(0)
         float fillPrice = strategy.opentrades.entry_price(0)
         int   barsCtoEntry = fillBar - stCbar
         label.new(fillBar, fillPrice, "ENTRY " + str.tostring(fillPrice, format.mintick) + "\nC->entry " + str.tostring(barsCtoEntry) + " bar\nR:R " + str.tostring(stRRrec, "#.##"), xloc = xloc.bar_index, style = label.style_label_up, color = color.new(color.teal, 0), textcolor = color.white, size = size.small)
         label.new(stCbar, stCprice, "C " + str.tostring(stCprice, format.mintick), xloc = xloc.bar_index, style = label.style_label_down, color = color.new(color.gray, 20), textcolor = color.white, size = size.tiny)
-        line.new(fillBar, stActiveStop,   fillBar + maxActiveBars, stActiveStop,   xloc = xloc.bar_index, color = color.red,   style = line.style_dashed, width = 1)
-        line.new(fillBar, stActiveTarget, fillBar + maxActiveBars, stActiveTarget, xloc = xloc.bar_index, color = color.green, style = line.style_dashed, width = 1)
+        line.new(fillBar, stActiveStop,   fillBar + maxTradeBars, stActiveStop,   xloc = xloc.bar_index, color = color.red,   style = line.style_dashed, width = 1)
+        line.new(fillBar, stActiveTarget, fillBar + maxTradeBars, stActiveTarget, xloc = xloc.bar_index, color = color.green, style = line.style_dashed, width = 1)
         label.new(fillBar, stActiveStop,   "STOP "   + str.tostring(stActiveStop, format.mintick),   xloc = xloc.bar_index, style = label.style_label_up,   color = color.new(color.red, 30),   textcolor = color.white, size = size.tiny)
         label.new(fillBar, stActiveTarget, "TARGET " + str.tostring(stActiveTarget, format.mintick), xloc = xloc.bar_index, style = label.style_label_down, color = color.new(color.green, 30), textcolor = color.white, size = size.tiny)
         alert("HPS BUY entry filled @ " + str.tostring(fillPrice, format.mintick) + " | C->entry " + str.tostring(barsCtoEntry) + " bars | R:R " + str.tostring(stRRrec, "#.##"), alert.freq_once_per_bar)

@@ -59,20 +59,29 @@ chk("no request.security() call introduced", "request.security(" not in "\n".joi
 # strategy.entry must be indented (nested inside the barstate.isconfirmed detection
 # block), never at column 0 (global/every-bar).
 entry_lines = [l for l in strat if "strategy.entry(" in l]
-chk("exactly one strategy.entry call", len(entry_lines) == 1)
-chk("strategy.entry is nested (indented), not global", bool(entry_lines) and entry_lines[0].startswith(" "))
+chk("two entry variants only (pullback-limit + market)", len(entry_lines) == 2)
+chk("all strategy.entry calls nested (indented), never global",
+    bool(entry_lines) and all(l.startswith(" ") for l in entry_lines))
+chk("all entries use the single id 'L' (pyramiding-safe)",
+    all('"L"' in l for l in entry_lines))
 chk("detection guarded by barstate.isconfirmed", "if barstate.isconfirmed" in strat_text)
 # position-management block also gated by confirmed bars
 chk("position management under barstate.isconfirmed",
     strat_text.count("if barstate.isconfirmed") >= 2)
 
-# (C) ORDER RULES PRESENT
-chk("stop = C.price - 0.5 * ATR", "C.price - 0.5 * cATR" in strat_text)
+# (C) ORDER RULES PRESENT (redesigned trade management)
+chk("structural stop below C with buffer (not fixed 0.5 ATR)",
+    "C.price - math.max(stopBufferATR * cATR, minStopTicks * syminfo.mintick)" in strat_text)
+chk("pullback limit entry toward C", "C.price + pullbackFrac * (close - C.price)" in strat_text)
+chk("pullback places a limit order", 'strategy.entry("L", strategy.long, qty = qty, limit = stEntry' in strat_text)
+chk("optional market entry mode retained", 'entryMode  = input.string("Pullback", "Entry mode"' in strat_text)
 chk("target = pLo", re.search(r"stTarget\s*=\s*pLo", strat_text) is not None)
 chk("reject: target > entry required", "stTarget > stEntry" in strat_text)
 chk("reject: stop < entry required", "stStop < stEntry" in strat_text)
 chk("reject: R:R >= minRR", "stRR >= minRR" in strat_text)
-chk("Minimum R:R input default 1.0", 'input.float(1.0, "Minimum R:R"' in strat_text)
+chk("reject: entry too close to D (min target distance)",
+    "(stTarget - stEntry) >= minTargetDistATR * cATR" in strat_text)
+chk("Minimum R:R input default 2.0", 'input.float(2.0, "Minimum R:R"' in strat_text)
 chk("risk % sizing from entry-to-stop distance",
     "riskCash / stRisk" in strat_text and "strategy.equity * (riskPct" in strat_text)
 # Pine requires const commission/slippage in the strategy() header (CE10123 if
@@ -83,12 +92,17 @@ chk("no input.* inside strategy() header (would fail CE10123)",
     re.search(r"strategy\([^\n]*input\.", strat_text) is None)
 chk("trade modes All / QUALIFIED only / QUALIFIED + WEAK",
     '"All", "QUALIFIED only", "QUALIFIED + WEAK"' in strat_text)
-chk("timeout close at maxActiveBars (matches expiry rule)",
-    "maxActiveBars" in strat_text and 'strategy.close("L"' in strat_text)
+chk("trade timeout at maxTradeBars (separate from evaluation maxActiveBars)",
+    "maxTradeBars" in strat_text and 'strategy.close("L"' in strat_text and 'input.int(15, "Max trade duration' in strat_text)
+chk("unfilled pullback limit cancelled after entryValidBars",
+    'strategy.cancel("L")' in strat_text and "entryValidBars" in strat_text)
 chk("stop/target OCO exit", "strategy.exit(" in strat_text and "stop = stActiveStop" in strat_text and "limit = stActiveTarget" in strat_text)
 
-# (D) ENTRY IS SIGNAL-BAR, NOT HISTORICAL C PRICE
-chk("entry reference is the signal-bar close (not C.price)", "float stEntry  = close" in strat_text)
+# (D) ENTRY IS SIGNAL-DERIVED, NOT HISTORICAL C PRICE
+chk("entry never uses raw historical C price as fill (pullback is C + f*(close-C))",
+    "C.price + pullbackFrac * (close - C.price)" in strat_text)
+chk("pullback limit must sit below current close (real pullback, not instant fill)",
+    'entryMode == "Market" or stEntry < close' in strat_text)
 chk("labels show C->entry bar gap", "C->entry" in strat_text)
 chk("labels show calculated R:R", "R:R " in strat_text)
 chk("alerts for entry/exit/timeout present",
