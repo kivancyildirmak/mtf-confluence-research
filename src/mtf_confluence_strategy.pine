@@ -2289,11 +2289,17 @@ f_qrow(table t, int r, string lbl, int s, float baseAll) =>
 // Kod A = Active/unresolved (UNKNOWN qualification ile KARIŞTIRILMASIN).
 // Her prediction ya çözümde (status!=0, H/F/E) ya da burada (status==0, A) TAM
 // BİR KEZ yazılır — ikisi karşılıklı dışlayıcı (resolved kayıt status!=0 olur).
-if qStudyExport and barstate.islast and array.size(records) > 0
-    for ri = 0 to array.size(records) - 1
-        PredRec pr = array.get(records, ri)
-        if pr.status == 0
-            log.info("QSTUDY," + str.tostring(pr.id) + "," + str.tostring(pr.creationBar) + ",NA,A," + str.tostring(pr.qScBin) + "," + str.tostring(pr.qTdBin))
+if qStudyExport and barstate.islast
+    int qExpActive = 0
+    if array.size(records) > 0
+        for ri = 0 to array.size(records) - 1
+            PredRec pr = array.get(records, ri)
+            if pr.status == 0
+                qExpActive += 1
+                log.info("QSTUDY," + str.tostring(pr.id) + "," + str.tostring(pr.creationBar) + ",NA,A," + str.tostring(pr.qScBin) + "," + str.tostring(pr.qTdBin))
+    // Heartbeat: HER ZAMAN yazılır (qStudyExport açıkken) → log.info çalıştı mı ve
+    // kaç kayıt beklenmeli, anında doğrulanır. Parser bunu yok sayar ("QSTUDY," yok).
+    log.info("QSTUDY_SUMMARY,total=" + str.tostring(array.size(records)) + ",active=" + str.tostring(qExpActive) + ",resolved=" + str.tostring(array.size(records) - qExpActive))
 
 // UNKNOWN neden satırı: etiket + adet + toplam UNKNOWN içindeki yüzde.
 f_qureason(table t, int r, string lbl, int idx, int unkTot) =>

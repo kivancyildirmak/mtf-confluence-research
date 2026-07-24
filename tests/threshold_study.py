@@ -519,6 +519,11 @@ def run_parser_tests():
     p, d = parse_qstudy(pref)
     chk("log-prefix tolerated", len(p) == 1 and p[0]["id"] == 1)
 
+    # QSTUDY_SUMMARY heartbeat line is ignored (not a record)
+    hb = "QSTUDY_SUMMARY,total=105,active=0,resolved=105\nQSTUDY,1,10,20,H,3,1\n"
+    p, d = parse_qstudy(hb)
+    chk("QSTUDY_SUMMARY ignored", len(p) == 1 and d["qstudy_lines"] == 1)
+
     if fails:
         print("PARSER TESTS: %d FAILED -> %s" % (len(fails), fails))
         raise SystemExit(1)
