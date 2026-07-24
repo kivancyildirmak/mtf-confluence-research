@@ -96,6 +96,7 @@ qMinCoverage       = input.float(0.05, "Min coverage",           minval = 0.0, s
 qQualifiedMinLift  = input.float(0.05, "Qualified min lift",     step = 0.01, group = grpQual)
 qRejectedMaxLift   = input.float(-0.05,"Rejected max lift",      step = 0.01, group = grpQual)
 showQual           = input.bool(true, "Show Qualification panel (orta)", group = grpQual)
+qStudyExport       = input.bool(false, "Export per-prediction log (threshold study)", group = grpQual, tooltip = "Pine Logs'a her prediction için tek satır: QSTUDY,id,createBar,resolveBar,outcome,scB,tdB. tests/threshold_study.py bunu okur. SHADOW; hiçbir kararı etkilemez.")
 
 // =============================================================================
 // Veri yapıları
@@ -171,7 +172,8 @@ type PredRec
     float confidence
     // --- Qualification V1 (SHADOW) — oluşumda dondurulur; hiçbir kararı ETKİLEMEZ ---
     // qStatus: 0 UNKNOWN, 1 QUALIFIED, 2 WEAK, 3 REJECTED
-    // qReason: 0 evaluated, 1 market<min, 2 no sufficient bucket
+    // qReason: 0 evaluated | 1 MARKET_SAMPLE_LOW | 2 INVALID_BASELINE | 3 NO_BUCKET
+    //          4 SINGLE_SAMPLE_LOW | 5 COVERAGE_LOW | 6 OTHER
     // qBucketType: 0 none, 1 joint(Score×Dist), 2 single Score, 3 single Dist
     int   qStatus
     int   qReason
@@ -182,6 +184,9 @@ type PredRec
     float qCond
     float qLift
     float qCoverage
+    // Threshold-study export (as-of-creation, lookahead-safe): raw score/dist bins.
+    int   qScBin
+    int   qTdBin
     // --- Feature Engineering bin'leri (oluşumda dondurulur; pasif; yalnız analytics/research) ---
     int   emaTrendBin    // 0 bull (EMA50>EMA200), 1 bear
     int   emaSlopeBin    // 0 up, 1 flat, 2 down
@@ -1537,6 +1542,11 @@ if barstate.isconfirmed
                 else
                     array.set(qExp, qs, array.get(qExp, qs) + 1)
 
+                // ---- THRESHOLD-STUDY EXPORT (opt-in; SHADOW): tek satır/prediction ----
+                if qStudyExport
+                    string qoc = rs == 1 ? "H" : rs == 2 ? "F" : "E"
+                    log.info("QSTUDY," + str.tostring(p.id) + "," + str.tostring(p.creationBar) + "," + str.tostring(p.resolvedBar) + "," + qoc + "," + str.tostring(p.qScBin) + "," + str.tostring(p.qTdBin))
+
                 array.remove(activeList, ai)
                 resolved := true
         if not resolved
@@ -1708,7 +1718,8 @@ if barstate.isconfirmed
                              volBin = feVolB, distE50Bin = feD50B, distE200Bin = feD200B, trendStrBin = feTrB,
                              swingBin = feSwB, volExpBin = feExB, timePivBin = feTmB, ageBin = feAgB,
                              qStatus = qSt, qReason = qRs, qBucketType = qBt, qBucketN = qBN, qMarketN = qMN,
-                             qBaseline = qBase, qCond = qCondV, qLift = qLiftV, qCoverage = qCov)
+                             qBaseline = qBase, qCond = qCondV, qLift = qLiftV, qCoverage = qCov,
+                             qScBin = qScB, qTdBin = qTdB)
                         predSeq += 1
                         array.push(records, rec)
                         cntCreated += 1
@@ -2272,6 +2283,14 @@ f_qrow(table t, int r, string lbl, int s, float baseAll) =>
     table.cell(t, 1, r, str.tostring(n),  text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
     table.cell(t, 2, r, na(hr) ? "—" : str.tostring(hr, "#.#"), text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
     table.cell(t, 3, r, na(lf) ? "—" : (lf >= 0 ? "+" : "") + str.tostring(lf, "#.#"), text_color = color.white, bgcolor = f_liftColor(lf), text_size = size.small, text_halign = text.align_right)
+
+// THRESHOLD-STUDY EXPORT — son barda hâlâ ACTIVE (çözülmemiş) prediction'ları
+// bir kez "U" olarak yaz (walk-forward toplam/coverage paydası eşleşsin diye).
+if qStudyExport and barstate.islast and array.size(records) > 0
+    for ri = 0 to array.size(records) - 1
+        PredRec pr = array.get(records, ri)
+        if pr.status == 0
+            log.info("QSTUDY," + str.tostring(pr.id) + "," + str.tostring(pr.creationBar) + ",NA,U," + str.tostring(pr.qScBin) + "," + str.tostring(pr.qTdBin))
 
 // UNKNOWN neden satırı: etiket + adet + toplam UNKNOWN içindeki yüzde.
 f_qureason(table t, int r, string lbl, int idx, int unkTot) =>

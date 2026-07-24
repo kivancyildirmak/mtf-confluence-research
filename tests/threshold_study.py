@@ -19,10 +19,15 @@ A per-prediction event log per symbol. Each prediction:
       outcome   : "H" hit | "F" fail | "E" expired | "U" unresolved(active)
       scB       : score fine-bin 0..5   (f_scBin at creation)
       tdB       : target-distance bin 0..3 (f_tdBin at creation)
-This log does NOT exist in the repo yet — it must be exported from Pine (see
-the schema note at the bottom / the study report). Until then this file runs on
-a clearly-labelled deterministic TOY dataset so the machinery is proven and the
-output format is exact. TOY numbers are NOT real symbol behaviour.
+Export it from Pine by enabling the "Export per-prediction log (threshold
+study)" input (qStudyExport). Pine then writes one `QSTUDY,...` line per
+prediction to the Pine Logs; save each symbol's log to a file and run:
+
+    python3 tests/threshold_study.py AYGAZ=aygaz.log BTCUSD=btc.log ...
+
+With no arguments this file runs a clearly-labelled deterministic TOY dataset
+so the machinery is proven and the output format is exact. TOY numbers are NOT
+real symbol behaviour.
 
 WALK-FORWARD INTEGRITY (PART 2)
 -------------------------------
@@ -289,7 +294,82 @@ def toy_dataset(n=120, seed=1):
     return preds
 
 
+def parse_qstudy(text):
+    """Parse Pine QSTUDY log lines into a preds list. Each line:
+        QSTUDY,id,createBar,resolveBar|NA,H|F|E|U,scB,tdB
+    Lines may carry a TradingView log timestamp/prefix; we scan for the token.
+    createBar/resolveBar drive the chronological timeline; if a symbol's log has
+    no bar (older format) we fall back to line order for create_t."""
+    preds = []
+    for ln, raw in enumerate(text.splitlines()):
+        i = raw.find("QSTUDY,")
+        if i < 0:
+            continue
+        parts = raw[i:].strip().split(",")
+        if len(parts) < 7:
+            continue
+        _, pid, cbar, rbar, outcome, scb, tdb = parts[:7]
+        create_t = int(cbar) if cbar.strip().lstrip("-").isdigit() else ln
+        resolve_t = None if rbar.strip().upper() in ("NA", "", "NAN") else int(rbar)
+        preds.append(dict(id=int(pid) if pid.strip().lstrip("-").isdigit() else ln,
+                          create_t=create_t, resolve_t=resolve_t,
+                          outcome=outcome.strip().upper()[:1],
+                          scB=int(scb), tdB=int(tdb)))
+    return preds
+
+
+def study_from_logs(paths):
+    """Run the full study on one or more real QSTUDY logs. A path may be
+    'SYMBOL=file.log' to label the symbol; otherwise the filename stem is used."""
+    per_symbol = {}
+    for path in paths:
+        if "=" in path:
+            sym, fn = path.split("=", 1)
+        else:
+            sym, fn = os.path.splitext(os.path.basename(path))[0], path
+        with open(fn) as fh:
+            preds = parse_qstudy(fh.read())
+        if not preds:
+            print(f"[skip] {sym}: no QSTUDY lines in {fn}")
+            continue
+        name, rows = run_symbol(sym, preds)
+        print_symbol_table(name, rows)
+        per_symbol[sym] = rows
+    if per_symbol:
+        cross_symbol_summary(per_symbol)
+        reliability_table()
+
+
+def cross_symbol_summary(per_symbol):
+    """PART 4 — aggregate across symbols WITHOUT pooling evidence (each symbol's
+    counters stay separate; we only aggregate the resulting metrics). Reports, for
+    each threshold combo: median & worst-symbol coverage, and unweighted vs
+    volume-weighted mean coverage."""
+    print("\n===== CROSS-SYMBOL aggregate (metrics aggregated, evidence NOT pooled) =====")
+    print("MKT BKT  medCov  worstCov  meanCov(unw)  meanCov(wt-by-total)  symbols")
+    combos = [(mm, mb) for mm in MARKET_GRID for mb in BUCKET_GRID]
+    by_combo = {c: [] for c in combos}
+    for sym, rows in per_symbol.items():
+        for r in rows:
+            by_combo[(r["mm"], r["mb"])].append((sym, r["coverage"], r["total"]))
+    for (mm, mb) in combos:
+        entries = by_combo[(mm, mb)]
+        covs = [c for (_s, c, _t) in entries]
+        tot = sum(t for (_s, _c, t) in entries)
+        wcov = (sum(c * t for (_s, c, t) in entries) / tot) if tot else None
+        med = statistics.median(covs) if covs else None
+        worst = min(covs) if covs else None
+        unw = statistics.mean(covs) if covs else None
+        print(f"{mm:>3} {mb:>3}  {_f(med):>5}  {_f(worst):>7}  {_f(unw):>11}  {_f(wcov):>18}  {len(entries)}")
+
+
 def main():
+    import sys
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if args:
+        # Real study: one or more QSTUDY logs (optionally SYMBOL=path).
+        study_from_logs(args)
+        return
     print(__doc__.strip().splitlines()[0])
     print("\n### TOY DEMONSTRATION — synthetic, NOT real symbol behaviour ###")
     name, rows = run_symbol("TOY(mid-vol)", toy_dataset())
