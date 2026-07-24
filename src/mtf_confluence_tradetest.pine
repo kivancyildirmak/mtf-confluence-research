@@ -1,0 +1,2468 @@
+//@version=6
+// =============================================================================
+// HARMONIC PREDICTION ENGINE — Historical Prediction Display
+// -----------------------------------------------------------------------------
+// AMAÇ: confirmed XABC anında üretilen "Primary D Target" prediction'larını
+//   geçmişte BAR BAR üretip, her birini SNAPSHOT kayıt olarak saklamak ve
+//   seçilen görüntüleme moduna göre çizmek. Böylece geçmiş prediction'ların
+//   gerçekten oluştuğu görsel olarak doğrulanabilir.
+//
+// KORUNAN ALTYAPI (davranış değişmedi): repaint-safe pivot motoru, XABC
+//   doğrulaması, XA/BC projection hesapları, P0 cluster/confluence motoru,
+//   adaptif tolerans, minimum support ve Primary D Target mantığı.
+//
+// BU SÜRÜMDE YOK (henüz): strategy(), entry/exit, HIT/FAILED/EXPIRED, trade logic.
+//   Yalnızca historical prediction ÜRETİMİ ve GÖRÜNTÜLEME davranışı.
+//
+// REPAINT/TEST GÜVENLİĞİ: motor yalnızca barstate.isconfirmed içinde ilerler;
+//   her kutu, prediction'ın OLUŞTUĞU (confirmed C) bardan itibaren çizilir;
+//   geçmişe gelecek bilgisi taşınmaz; request.security/lookahead yok; kayıtlar
+//   bir daha hesaplanmaz.
+// =============================================================================
+
+// =============================================================================
+// STRATEGY WRAPPER (Strategy Tester). Bu dosya, gösterge dosyasının BİREBİR
+// kopyası + long-only trade katmanıdır. Pivot / harmonik / qualification /
+// evaluation mantığı DEĞİŞTİRİLMEDİ (satır satır aynı). Eklenen tek şey: onaylı
+// BUY sinyali barında (C-confirmation bar) emir üretimi.
+//
+// ÖNEMLİ: Giriş, C'nin OLUŞTUĞU tarihsel fiyattan DEĞİL, C'nin ONAYLANDIĞI
+// (sinyalin doğduğu) bardan yapılır. Emir sinyal barının KAPANIŞINDA verilir ve
+// Strategy Tester varsayimi ile BİR SONRAKİ barın açılışında dolar (lookahead
+// yok). Etiketlerde C→giriş bar farkı açıkça gösterilir.
+// =============================================================================
+strategy("Harmonic Prediction Strategy", overlay = true, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, pyramiding = 0, initial_capital = 10000, default_qty_type = strategy.fixed, default_qty_value = 1, calc_on_every_tick = false, process_orders_on_close = false, commission_type = strategy.commission.percent, commission_value = input.float(0.04, "Commission %", minval = 0.0, step = 0.01, group = "Strategy"), slippage = input.int(1, "Slippage (ticks)", minval = 0, group = "Strategy"))
+
+// --- Strategy katmanı input'ları ---
+grpStrat   = "Strategy"
+tradeMode  = input.string("QUALIFIED + WEAK", "Trade mode", options = ["All", "QUALIFIED only", "QUALIFIED + WEAK"], group = grpStrat, tooltip = "Hangi qStatus'lu sinyaller işleme girer. QUALIFIED=1, WEAK=2 (SHADOW etiketleri; qualification mantığı DEĞİŞMEZ).")
+minRR      = input.float(1.0, "Minimum R:R", minval = 0.0, step = 0.1, group = grpStrat)
+riskPct    = input.float(1.0, "Risk % of equity per trade", minval = 0.01, maxval = 100.0, step = 0.1, group = grpStrat)
+
+// =============================================================================
+// Girdiler
+// =============================================================================
+atrLen      = input.int(14,  "ATR uzunluğu",              minval = 1, group = "Pivot Engine")
+pivK        = input.float(3.0, "Pivot sapma eşiği (× ATR)", minval = 0.1, step = 0.1, group = "Pivot Engine")
+pivMinBars  = input.int(8,     "Pivot minimum bar",         minval = 1, group = "Pivot Engine")
+
+grpPred     = "Prediction / Cluster"
+projLen     = input.int(50, "Kutu uzunluğu (bar)",        minval = 5, group = grpPred)
+patternTolPct = input.float(0.50, "Pattern tolerance (% of XA)", minval = 0.01, maxval = 5.0, step = 0.01, group = grpPred)
+atrFloorMult  = input.float(0.10, "ATR floor multiplier",         minval = 0.0,  step = 0.01, group = grpPred)
+minTolTicks   = input.int(5,      "Minimum tolerance ticks",      minval = 1, group = grpPred)
+minSupport    = input.int(2,      "Minimum projections per cluster", minval = 2, group = grpPred)
+showSecond  = input.bool(false, "Secondary D Target göster (yalnız görsel)", group = grpPred)
+showSources = input.bool(false, "Kutuda kaynakları göster (XA/BC ratio)", group = grpPred)
+colPrimary  = input.color(color.new(color.lime,   0), "Primary kutu rengi",   group = grpPred)
+colSecond   = input.color(color.new(color.orange, 0), "Secondary kutu rengi", group = grpPred)
+
+grpFilt     = "XABC Geçerlilik Filtreleri"
+abXaMin     = input.float(0.25, "AB/XA min", step = 0.01, group = grpFilt)
+abXaMax     = input.float(0.90, "AB/XA max", step = 0.01, group = grpFilt)
+bcAbMin     = input.float(0.30, "BC/AB min", step = 0.01, group = grpFilt)
+bcAbMax     = input.float(2.00, "BC/AB max", step = 0.01, group = grpFilt)
+
+grpView     = "Görünüm / Historical"
+histDisplay = input.string("All historical", "Historical display mode", options = ["Latest only", "All historical", "Last N predictions"], group = grpView)
+histCount   = input.int(50, "Historical prediction count", minval = 1, group = grpView)
+showXABC    = input.bool(false, "X/A/B/C harflerini göster", group = grpView)
+
+grpEval       = "Evaluation Engine"
+failMode      = input.string("C ± ATR", "Failure Mode", options = ["C ± ATR", "X Pivot", "None"], group = grpEval)
+evalAtrMult   = input.float(0.50, "ATR Multiplier", minval = 0.0, step = 0.05, group = grpEval)
+maxActiveBars = input.int(50, "Maximum Active Bars", minval = 1, group = grpEval)
+ambigMode     = input.string("Conservative", "Ambiguous Handling", options = ["Conservative", "Optimistic", "Ignore"], group = grpEval)
+
+grpAn         = "Prediction Analytics"
+analyticsView = input.string("Evaluation Summary", "Analytics View", options = ["Evaluation Summary", "Score Thresholds", "Support Thresholds", "Direction", "Cluster Width", "Target Distance", "XA Scale", "BC Ratio"], group = grpAn)
+minReliableN  = input.int(20, "Minimum Reliable Sample", minval = 1, group = grpAn)
+
+grpRes         = "Prediction Research"
+researchView   = input.string("Research Summary", "Research View", options = ["Research Summary", "Top Features", "Negative Features", "Top Combinations", "Stability", "Recommendations"], group = grpRes)
+minStrongN     = input.int(50, "Minimum Strong Sample", minval = 1, group = grpRes)
+coverageFloor  = input.float(10.0, "Coverage Floor (%)", minval = 0.0, step = 1.0, group = grpRes)
+maxPerFamily   = input.int(2, "Maximum Results Per Feature Family", minval = 1, group = grpRes)
+
+grpConf      = "Confidence Engine"
+confGain     = input.float(2.0, "Confidence spread (gain)", minval = 0.5, maxval = 5.0, step = 0.1, group = grpConf)
+showConfBox  = input.bool(true, "Kutuda Confidence göster", group = grpConf)
+
+// =============================================================================
+// DASHBOARD MANAGER — tek yerden yerleşim/görünürlük yönetimi (motor matematiği
+// değişmez; yalnızca hangi tablonun nerede/nasıl gösterileceğini belirler).
+// =============================================================================
+grpDash       = "Dashboard"
+dashLayout    = input.string("Single Panel", "Dashboard Layout", options = ["Single Panel", "Multi Panel", "Minimal"], group = grpDash)
+dashView      = input.string("Evaluation", "Dashboard View (Single Panel)", options = ["Evaluation", "Analytics", "Research", "Confidence", "Debug"], group = grpDash)
+mShowEval     = input.bool(true,  "Show Evaluation (Multi)", group = grpDash)
+mShowConf     = input.bool(true,  "Show Confidence (Multi)", group = grpDash)
+mShowAnalytic = input.bool(false, "Show Analytics (Multi)",  group = grpDash)
+mShowResearch = input.bool(false, "Show Research (Multi)",   group = grpDash)
+mShowDebug    = input.bool(false, "Show Debug (Multi)",      group = grpDash)
+
+grpMeta      = "Meta Research"
+researchMode = input.string("Local", "Research Mode", options = ["Local", "Export"], group = grpMeta)
+exportFmt    = input.string("CSV", "Export Format", options = ["CSV", "JSON"], group = grpMeta)
+
+// Qualification V1 — SHADOW MODE. Sınıflandırır ama HİÇBİR prediction'ı bastırmaz.
+grpQual            = "Qualification (Shadow)"
+qMinMarketResolved = input.int(40,   "Min market resolved (N0)", minval = 1, group = grpQual)
+qMinBucketResolved = input.int(20,   "Min bucket resolved",      minval = 1, group = grpQual)
+qMinCoverage       = input.float(0.05, "Min coverage",           minval = 0.0, step = 0.01, group = grpQual)
+qQualifiedMinLift  = input.float(0.05, "Qualified min lift",     step = 0.01, group = grpQual)
+qRejectedMaxLift   = input.float(-0.05,"Rejected max lift",      step = 0.01, group = grpQual)
+showQual           = input.bool(true, "Show Qualification panel (orta)", group = grpQual)
+qStudyExport       = input.bool(false, "Export per-prediction log (threshold study)", group = grpQual, tooltip = "Pine Logs'a her prediction için tek satır: QSTUDY,id,createBar,resolveBar,outcome,scB,tdB. tests/threshold_study.py bunu okur. SHADOW; hiçbir kararı etkilemez.")
+
+// =============================================================================
+// Veri yapıları
+// =============================================================================
+// Onaylanmış pivot. kind: +1 = HIGH (tepe), -1 = LOW (dip).
+type Pivot
+    float price
+    int   bidx
+    int   ptime
+    int   kind
+    int   confIdx
+    float theta
+
+// Pivot motoru durumu (state machine).
+type Engine
+    bool  init
+    bool  booted
+    int   dir
+    float curPrice
+    int   curIdx
+    int   curTime
+    float curTheta
+    float oppPrice
+    int   oppIdx
+    int   oppTime
+    float oppTheta
+
+// Tek bir ham projeksiyon seviyesi. src: 0 = XA, 1 = BC.
+type Proj
+    float price
+    int   src
+    float ratio
+
+// Bir prediction'ın çizim nesneleri (grup bazlı gizleme/silme için).
+type PredGroup
+    array<label> labels
+    array<box>   boxes
+
+// Prediction SNAPSHOT kaydı. Oluşturulunca yazılır, bir daha DEĞİŞMEZ/SİLİNMEZ.
+// direction: +1 = D yukarıda (H-L-H-L), -1 = D aşağıda (L-H-L-H).
+type PredRec
+    int   id
+    int   creationBar
+    int   pivotCBar
+    int   direction
+    float targetLow
+    float targetHigh
+    float centerPrice
+    float score
+    int   support
+    PredGroup viz        // canlı çizim nesneleri (yoksa boş/na)
+    // --- Evaluation Engine snapshot alanları (oluşumda yazılır, bir daha değişmez) ---
+    int   status             // 0 ACTIVE, 1 HIT, 2 FAILED, 3 EXPIRED
+    int   resolvedBar        // çözüldüğü bar (na = henüz ACTIVE)
+    float resultPrice        // çözümü tetikleyen fiyat (hedef / invalidation / expire close)
+    int   barsAlive          // resolvedBar - creationBar
+    float invalidationPrice  // FAILED seviyesi (snapshot; na = invalidation yok)
+    float creationATR        // oluşum anındaki ATR (snapshot)
+    // --- Analytics snapshot alanları (oluşumda dondurulur, pasif; algoritmayı etkilemez) ---
+    float clusterSpread
+    float clusterTolerance
+    float normalizedClusterWidth
+    float xaLength
+    float bcLength
+    float xaAtrMultiple
+    float bcAtrMultiple
+    float abXaRatio
+    float bcAbRatio
+    float targetDistance
+    float targetDistanceATR
+    float targetDistanceXA
+    // --- Confidence Engine (oluşum anında, yalnız geçmiş istatistikten; dondurulur) ---
+    float confidence
+    // --- Qualification V1 (SHADOW) — oluşumda dondurulur; hiçbir kararı ETKİLEMEZ ---
+    // qStatus: 0 UNKNOWN, 1 QUALIFIED, 2 WEAK, 3 REJECTED
+    // qReason: 0 evaluated | 1 MARKET_SAMPLE_LOW | 2 INVALID_BASELINE | 3 NO_BUCKET
+    //          4 SINGLE_SAMPLE_LOW | 5 COVERAGE_LOW | 6 OTHER
+    // qBucketType: 0 none, 1 joint(Score×Dist), 2 single Score, 3 single Dist
+    int   qStatus
+    int   qReason
+    int   qBucketType
+    int   qBucketN
+    int   qMarketN
+    float qBaseline
+    float qCond
+    float qLift
+    float qCoverage
+    // Threshold-study export (as-of-creation, lookahead-safe): raw score/dist bins.
+    int   qScBin
+    int   qTdBin
+    // --- Feature Engineering bin'leri (oluşumda dondurulur; pasif; yalnız analytics/research) ---
+    int   emaTrendBin    // 0 bull (EMA50>EMA200), 1 bear
+    int   emaSlopeBin    // 0 up, 1 flat, 2 down
+    int   adxBin         // 0 <20, 1 20-30, 2 30-40, 3 40+
+    int   rsiBin         // 0 <40, 1 40-50, 2 50-60, 3 60-70, 4 70+
+    int   volBin         // 0 low, 1 normal, 2 high (ATR percentile)
+    int   distE50Bin     // 0 near, 1 mid, 2 far
+    int   distE200Bin    // 0 near, 1 mid, 2 far
+    int   trendStrBin    // 0 HH-HL, 1 LH-LL, 2 range
+    int   swingBin       // 0 small, 1 mid, 2 large (XA impulse in ATR)
+    int   volExpBin      // 0 expanding, 1 contracting
+    int   timePivBin     // 0 short, 1 mid, 2 long (bars since C pivot)
+    int   ageBin         // 0 trend start, 1 mid, 2 end (ADX regime proxy)
+
+// Research Engine aday temsili (yalnızca son barda, sıralama/sınıflandırma için).
+// fam: 0 Score 1 Support 2 Direction 3 ClusterWidth 4 TargetDist 5 XA 6 BC 7 Combo
+// Tekil adayda kindB = -1. kind kodları: 0 Score,1 Support,2 TargetDist,3 ClusterWidth,4 Direction.
+type Cand
+    int    fam
+    int    ord
+    string label
+    string cond2
+    int    kindA
+    int    lvlA
+    int    kindB
+    int    lvlB
+    int    hit
+    int    fail
+    int    exp
+
+// =============================================================================
+// Repaint-safe pivot motoru (KORUNAN ALTYAPI — davranış değişmedi)
+// -----------------------------------------------------------------------------
+// "Dual-Tracker Confirmed Deviation ZigZag": bir uç, fiyat ondan (dondurulmuş)
+// theta = k*ATR kadar TERS çekildiğinde VE en az minBars kapanmış bar geçince
+// KESİNLEŞİR. Konservatif bar-içi kural: aynı mumda hem yeni ekstrem hem ters
+// sapma oluşursa o barda onay verilmez. Yalnızca KAPANMIŞ barlarda çağrılır.
+// =============================================================================
+f_engine_new() =>
+    Engine.new(init = false, booted = false, dir = 0,
+         curPrice = na, curIdx = na, curTime = na, curTheta = na,
+         oppPrice = na, oppIdx = na, oppTime = na, oppTheta = na)
+
+f_engine_step(Engine e, float k, int minBars, float atr) =>
+    Pivot result = na
+
+    if not na(atr)
+        if not e.init
+            e.init     := true
+            e.booted   := false
+            e.curPrice := high
+            e.curIdx   := bar_index
+            e.curTime  := time
+            e.curTheta := k * atr
+            e.oppPrice := low
+            e.oppIdx   := bar_index
+            e.oppTime  := time
+            e.oppTheta := k * atr
+
+        else if not e.booted
+            newHigh = high > e.curPrice
+            newLow  = low  < e.oppPrice
+            if newHigh
+                e.curPrice := high
+                e.curIdx   := bar_index
+                e.curTime  := time
+                e.curTheta := k * atr
+            if newLow
+                e.oppPrice := low
+                e.oppIdx   := bar_index
+                e.oppTime  := time
+                e.oppTheta := k * atr
+
+            dropFromHigh = (not newHigh) and (e.curPrice - low) >= e.curTheta and (bar_index - e.curIdx) >= minBars
+            riseFromLow  = (not newLow)  and (high - e.oppPrice) >= e.oppTheta and (bar_index - e.oppIdx) >= minBars
+
+            bool doHigh = false
+            bool doLow  = false
+            if dropFromHigh and riseFromLow
+                if e.curIdx < e.oppIdx
+                    doHigh := true
+                else if e.oppIdx < e.curIdx
+                    doLow  := true
+            else if dropFromHigh
+                doHigh := true
+            else if riseFromLow
+                doLow  := true
+
+            if doHigh
+                result := Pivot.new(e.curPrice, e.curIdx, e.curTime, 1, bar_index, e.curTheta)
+                e.booted := true
+                e.dir    := -1
+                e.curPrice := low
+                e.curIdx   := bar_index
+                e.curTime  := time
+                e.curTheta := k * atr
+                e.oppPrice := high
+                e.oppIdx   := bar_index
+                e.oppTime  := time
+                e.oppTheta := k * atr
+            else if doLow
+                result := Pivot.new(e.oppPrice, e.oppIdx, e.oppTime, -1, bar_index, e.oppTheta)
+                e.booted := true
+                e.dir    := 1
+                e.curPrice := high
+                e.curIdx   := bar_index
+                e.curTime  := time
+                e.curTheta := k * atr
+                e.oppPrice := low
+                e.oppIdx   := bar_index
+                e.oppTime  := time
+                e.oppTheta := k * atr
+
+        else
+            if e.dir == 1
+                if high > e.curPrice
+                    e.curPrice := high
+                    e.curIdx   := bar_index
+                    e.curTime  := time
+                    e.curTheta := k * atr
+                    e.oppPrice := low
+                    e.oppIdx   := bar_index
+                    e.oppTime  := time
+                    e.oppTheta := k * atr
+                else
+                    if low < e.oppPrice
+                        e.oppPrice := low
+                        e.oppIdx   := bar_index
+                        e.oppTime  := time
+                        e.oppTheta := k * atr
+                    if (e.curPrice - e.oppPrice) >= e.curTheta and (bar_index - e.curIdx) >= minBars
+                        result := Pivot.new(e.curPrice, e.curIdx, e.curTime, 1, bar_index, e.curTheta)
+                        e.dir      := -1
+                        e.curPrice := e.oppPrice
+                        e.curIdx   := e.oppIdx
+                        e.curTime  := e.oppTime
+                        e.curTheta := e.oppTheta
+                        e.oppPrice := high
+                        e.oppIdx   := bar_index
+                        e.oppTime  := time
+                        e.oppTheta := k * atr
+            else
+                if low < e.curPrice
+                    e.curPrice := low
+                    e.curIdx   := bar_index
+                    e.curTime  := time
+                    e.curTheta := k * atr
+                    e.oppPrice := high
+                    e.oppIdx   := bar_index
+                    e.oppTime  := time
+                    e.oppTheta := k * atr
+                else
+                    if high > e.oppPrice
+                        e.oppPrice := high
+                        e.oppIdx   := bar_index
+                        e.oppTime  := time
+                        e.oppTheta := k * atr
+                    if (e.oppPrice - e.curPrice) >= e.curTheta and (bar_index - e.curIdx) >= minBars
+                        result := Pivot.new(e.curPrice, e.curIdx, e.curTime, -1, bar_index, e.curTheta)
+                        e.dir      := 1
+                        e.curPrice := e.oppPrice
+                        e.curIdx   := e.oppIdx
+                        e.curTime  := e.oppTime
+                        e.curTheta := e.oppTheta
+                        e.oppPrice := low
+                        e.oppIdx   := bar_index
+                        e.oppTime  := time
+                        e.oppTheta := k * atr
+    result
+
+// =============================================================================
+// Prediction / Cluster yardımcıları (KORUNAN ALTYAPI)
+// =============================================================================
+
+// XABC geçerlilik kontrolü (oranlar GRAFİKTE gösterilmez; yalnızca filtre).
+f_xabc_valid(Pivot X, Pivot A, Pivot B, Pivot C) =>
+    bool chrono = X.bidx < A.bidx and A.bidx < B.bidx and B.bidx < C.bidx
+    bool alt    = X.kind != A.kind and A.kind != B.kind and B.kind != C.kind
+    bool form   = (X.kind == -1 and A.kind == 1 and B.kind == -1 and C.kind == 1) or (X.kind == 1 and A.kind == -1 and B.kind == 1 and C.kind == -1)
+    float xa = math.abs(A.price - X.price)
+    float ab = math.abs(B.price - A.price)
+    float bc = math.abs(C.price - B.price)
+    bool legs = xa > 0 and ab > 0 and bc > 0
+    bool ratios = false
+    if legs
+        float abXa = ab / xa
+        float bcAb = bc / ab
+        ratios := abXa >= abXaMin and abXa <= abXaMax and bcAb >= bcAbMin and bcAb <= bcAbMax
+    chrono and alt and form and legs and ratios
+
+// En YÜKSEK SKORLU kümeyi bulur (used=true olanlar hariç). Skor = ağırlıklı:
+//   + farklı ratio sayısı (aynı ratio tekrarına ekstra yok)
+//   + XA ve BC birlikte varsa mix bonusu (+2)  (yalnız-BC / yalnız-XA daha düşük)
+//   + sıkılık bonusu: 2*max(0, 1 - spread/(2*tol))  (spread=0→2, =tol→1, =2*tol→0)
+// Bir küme aday olabilmek için en az minSupport DISTINCT projeksiyon içermelidir
+//   (aynı fiyat+aynı oran kopyası ayrı destek saymaz). Uygun küme yoksa bestIdx=-1.
+// DÖNÜŞ: [merkezIndex, skor, altFiyat, üstFiyat, destekSayısı].
+f_best_cluster(array<Proj> projs, array<bool> used, float tol, int minSupport) =>
+    int   nD = array.size(projs)
+    int   bestIdx = -1
+    float bestScore = -1.0
+    float bestLo = na
+    float bestHi = na
+    int   bestSupport = 0
+    // Sıfıra bölünmeye karşı güvenli alt sınır (tol zaten tickFloor ile > 0'dır).
+    float safeTol = math.max(tol, syminfo.mintick)
+    for i = 0 to nD - 1
+        if not array.get(used, i)
+            float center = array.get(projs, i).price
+            float lo = na
+            float hi = na
+            bool  hasXA = false
+            bool  hasBC = false
+            int   distinct = 0
+            int   support  = 0
+            for j = 0 to nD - 1
+                if not array.get(used, j)
+                    Proj pj = array.get(projs, j)
+                    if math.abs(pj.price - center) <= tol
+                        lo := na(lo) ? pj.price : math.min(lo, pj.price)
+                        hi := na(hi) ? pj.price : math.max(hi, pj.price)
+                        if pj.src == 0
+                            hasXA := true
+                        else
+                            hasBC := true
+                        bool firstOfRatio  = true
+                        bool firstOfMember = true
+                        for k = 0 to j - 1
+                            if not array.get(used, k)
+                                Proj pk = array.get(projs, k)
+                                if math.abs(pk.price - center) <= tol
+                                    if pk.ratio == pj.ratio
+                                        firstOfRatio := false
+                                    // Aynı fiyat VE aynı oran = kaza eseri kopya; destek saymaz.
+                                    if pk.ratio == pj.ratio and pk.price == pj.price
+                                        firstOfMember := false
+                        if firstOfRatio
+                            distinct += 1
+                        if firstOfMember
+                            support += 1
+            float spread     = na(hi) ? 0.0 : hi - lo
+            float normSpread = spread / (2.0 * safeTol)
+            float tight      = 2.0 * math.max(0.0, 1.0 - normSpread)
+            float score      = distinct + (hasXA and hasBC ? 2.0 : 0.0) + tight
+            // En az minSupport DISTINCT projeksiyon içeren kümeler aday olabilir.
+            if support >= minSupport and score > bestScore
+                bestIdx     := i
+                bestScore   := score
+                bestLo      := lo
+                bestHi      := hi
+                bestSupport := support
+    [bestIdx, bestScore, bestLo, bestHi, bestSupport]
+
+// Merkez etrafındaki (tol içi, used olmayan) üyeleri işaretler ve kaynak metnini
+// ("XA 0.886, BC 2.240") döndürür. Skorlama sonrası kutu metni + used için tek geçiş.
+f_cluster_src_and_mark(array<Proj> projs, array<bool> used, float tol, int centerIdx) =>
+    float center = array.get(projs, centerIdx).price
+    string s = ""
+    for j = 0 to array.size(projs) - 1
+        if not array.get(used, j)
+            Proj pj = array.get(projs, j)
+            if math.abs(pj.price - center) <= tol
+                s := s + (s == "" ? "" : ", ") + (pj.src == 0 ? "XA " : "BC ") + str.tostring(pj.ratio, "#.###")
+                array.set(used, j, true)
+    s
+
+// Bir pivotu harf etiketiyle işaretler ve label'ı döndürür.
+f_mark(int bidx, float price, string txt) =>
+    label.new(bidx, price, txt, xloc = xloc.bar_index, style = label.style_label_center,
+         color = color.new(color.gray, 25), textcolor = color.white, size = size.small,
+         force_overlay = true)
+
+// D-target kümesini kutu olarak çizer ve kutuyu DÖNDÜRÜR (grup çağıran tarafından yönetilir).
+// conf: na değilse "Confidence NN%" satırı eklenir (yalnız Score'un YANINDA; Score değişmez).
+f_target_box(int x1, int x2, float lo, float hi, float score, string title, color col, float atrv, string srcText, float conf) =>
+    float pad = (hi - lo) < atrv * 0.05 ? atrv * 0.20 : 0.0
+    string txt = title + "\n" + str.tostring(lo, format.mintick) + " – " + str.tostring(hi, format.mintick) + "\nScore " + str.tostring(score, "#.#")
+    if showConfBox and not na(conf)
+        txt := txt + "\nConfidence " + str.tostring(conf, "#") + "%"
+    if showSources and str.length(srcText) > 0
+        txt := txt + "\n" + srcText
+    box.new(x1, hi + pad, x2, lo - pad, border_color = col, bgcolor = color.new(col, 82),
+         text = txt, text_color = col, text_size = size.small,
+         text_halign = text.align_left, text_valign = text.align_center, force_overlay = true)
+
+// Bir prediction grubunun tüm ÇİZİM nesnelerini güvenle siler (KAYIT silinmez).
+f_group_delete(PredGroup g) =>
+    if array.size(g.labels) > 0
+        for lb in g.labels
+            label.delete(lb)
+        array.clear(g.labels)
+    if array.size(g.boxes) > 0
+        for bx in g.boxes
+            box.delete(bx)
+        array.clear(g.boxes)
+
+// Debug tabloya bir "etiket | değer" satırı yazar.
+f_drow(table t, int r, string lbl, string val, color bg) =>
+    table.cell(t, 0, r, lbl, text_color = color.white, bgcolor = bg, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, val, text_color = color.white, bgcolor = bg, text_size = size.small, text_halign = text.align_right)
+
+// =============================================================================
+// Evaluation Engine yardımcıları (saf; prediction algoritmasına dokunmaz)
+// =============================================================================
+f_scoreBucket(float s) => s < 5.0 ? 0 : s < 6.0 ? 1 : s < 7.0 ? 2 : 3
+f_supBucket(int sup)   => sup <= 2 ? 0 : sup == 3 ? 1 : sup == 4 ? 2 : 3
+f_pctS(int num, int den) => den > 0 ? str.tostring(100.0 * num / den, "#.#") + "%" : "—"
+f_avgS(int sum, int den) => den > 0 ? str.tostring(sum / den, "#.#") : "—"
+
+// Dashboard renk paleti (Light/Dark okunabilir, yüksek kontrast).
+var color EV_TITLE  = color.rgb(35, 35, 35)
+var color EV_LEFT   = color.rgb(55, 55, 55)
+var color EV_RIGHT  = color.rgb(20, 20, 20)
+var color EV_HIT    = color.rgb(0, 90, 0)
+var color EV_FAIL   = color.rgb(120, 0, 0)
+var color EV_EXP    = color.rgb(120, 70, 0)
+var color EV_ACTIVE = color.rgb(0, 50, 120)
+var color EV_SECT   = color.rgb(45, 45, 45)
+
+// "etiket | değer" metrik satırı (kalan sütunlar valBg ile doldurulur, kompakt görünüm).
+f_evMetric(table t, int r, string lbl, string val, color lblBg, color valBg) =>
+    table.cell(t, 0, r, lbl, text_color = color.white, bgcolor = lblBg, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, val, text_color = color.white, bgcolor = valBg, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 2, r, "", bgcolor = valBg)
+    table.cell(t, 3, r, "", bgcolor = valBg)
+    table.cell(t, 4, r, "", bgcolor = valBg)
+    table.cell(t, 5, r, "", bgcolor = valBg)
+
+// Bölüm başlığı satırı (sarı yazı).
+f_evSection(table t, int r, string title) =>
+    for c = 0 to 5
+        table.cell(t, c, r, c == 0 ? title : "", text_color = color.yellow, bgcolor = EV_SECT, text_size = size.small, text_halign = text.align_left)
+
+// Analiz alt-tablosu başlık satırı.
+f_evAnalyseHdr(table t, int r) =>
+    table.cell(t, 0, r, "Group", text_color = color.white, bgcolor = EV_TITLE, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, "N",     text_color = color.white, bgcolor = EV_TITLE, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 2, r, "Hit",   text_color = color.white, bgcolor = EV_TITLE, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 3, r, "Fail",  text_color = color.white, bgcolor = EV_TITLE, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 4, r, "Exp",   text_color = color.white, bgcolor = EV_TITLE, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 5, r, "Hit%",  text_color = color.white, bgcolor = EV_TITLE, text_size = size.small, text_halign = text.align_right)
+
+// Analiz alt-tablosu veri satırı.
+f_evAnalyseRow(table t, int r, string lbl, int c, int h, int f, int e) =>
+    table.cell(t, 0, r, lbl,               text_color = color.white, bgcolor = EV_LEFT,  text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, str.tostring(c),   text_color = color.white, bgcolor = EV_RIGHT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 2, r, str.tostring(h),   text_color = color.white, bgcolor = EV_RIGHT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 3, r, str.tostring(f),   text_color = color.white, bgcolor = EV_RIGHT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 4, r, str.tostring(e),   text_color = color.white, bgcolor = EV_RIGHT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 5, r, f_pctS(h, h + f),  text_color = color.white, bgcolor = EV_RIGHT, text_size = size.small, text_halign = text.align_right)
+
+// =============================================================================
+// PREDICTION ANALYTICS yardımcıları (pasif; prediction/evaluation'a dokunmaz)
+// =============================================================================
+// Bucket / bin fonksiyonları (saf).
+f_scBin(float s) => s < 5.0 ? 0 : s < 5.5 ? 1 : s < 6.0 ? 2 : s < 6.5 ? 3 : s < 7.0 ? 4 : 5
+f_spBin(int sup) => sup <= 2 ? 0 : sup == 3 ? 1 : sup == 4 ? 2 : 3
+f_cwBin(float w) => na(w) ? 3 : w <= 0.25 ? 0 : w <= 0.50 ? 1 : w <= 1.00 ? 2 : 3
+f_tdBin(float t) => na(t) ? 3 : t <= 1.0 ? 0 : t <= 2.0 ? 1 : t <= 4.0 ? 2 : 3
+f_xaBin(float x) => na(x) ? 0 : x < 3.0 ? 0 : x < 6.0 ? 1 : x < 10.0 ? 2 : 3
+f_bcBin(float r) => na(r) ? 0 : r < 0.382 ? 0 : r < 0.50 ? 1 : r < 0.618 ? 2 : r < 0.786 ? 3 : 4
+
+// CONFIDENCE v2 — evidence-weighted LOG-ODDS kanıt birikimi (Naive-Bayes tarzı).
+// Bir feature bucket'ının log-odds kaymasını (δ) ve kanıt ağırlığını (evidence-weighted
+// feature weight) döndürür: [wNum, wDen]. Bunlar dış tarafta ağırlıklı ORTALAMA'ya girer.
+//   δ  = clamp( logit(hitRate_bucket) - logit(baseline), ±dmax )   (tek feature domine edemez)
+//   ev = (h+f) / ((h+f)+K)   → düşük örneklem yumuşak biçimde sönümlenir (K = prior)
+//   wNum = wFeat*ev*δ , wDen = wFeat*ev
+// Veri yoksa (h+f=0) katkı 0. Additif "lift/10" sıkıştırması KALDIRILDI.
+f_confAcc(int h, int f, float p0, int K, float dmax, float wFeat) =>
+    float wn = 0.0
+    float wd = 0.0
+    if (h + f) >= 1 and not na(p0) and p0 > 0.0 and p0 < 1.0
+        float pb = math.max(0.02, math.min(0.98, h / (h + f)))
+        float d  = math.max(-dmax, math.min(dmax, math.log(pb / (1.0 - pb)) - math.log(p0 / (1.0 - p0))))
+        float ev = (h + f) / (float(h + f) + K)
+        wn := wFeat * ev * d
+        wd := wFeat * ev
+    [wn, wd]
+
+// Confidence kalibrasyon bini: 0:0-20 1:20-40 2:40-60 3:60-80 4:80-100.
+f_confBin(float conf) => na(conf) ? 2 : conf < 20 ? 0 : conf < 40 ? 1 : conf < 60 ? 2 : conf < 80 ? 3 : 4
+
+// ---- FEATURE ENGINEERING bin fonksiyonları (saf; değerleri parametre alır) ----
+f_binEmaTrend(float e50, float e200) => (na(e50) or na(e200)) ? 0 : e50 > e200 ? 0 : 1
+f_binEmaSlope(float s)  => na(s) ? 1 : s > 0.15 ? 0 : s < -0.15 ? 2 : 1
+f_binAdx(float a)       => na(a) ? 0 : a < 20 ? 0 : a < 30 ? 1 : a < 40 ? 2 : 3
+f_binRsi(float r)       => na(r) ? 1 : r < 40 ? 0 : r < 50 ? 1 : r < 60 ? 2 : r < 70 ? 3 : 4
+f_binVol(float pct)     => na(pct) ? 1 : pct < 33 ? 0 : pct < 66 ? 1 : 2
+f_binDist(float dATR)   => na(dATR) ? 1 : dATR < 1.0 ? 0 : dATR < 2.5 ? 1 : 2
+f_binSwing(float xaATR) => na(xaATR) ? 0 : xaATR < 3.0 ? 0 : xaATR < 6.0 ? 1 : 2
+f_binVolExp(bool exp)   => exp ? 0 : 1
+f_binTimePiv(int bars)  => bars < 10 ? 0 : bars < 25 ? 1 : 2
+f_binAge(float adx, bool rising) => na(adx) ? 0 : adx < 25.0 ? 0 : rising ? 1 : 2
+
+// Bir üçlü (hit/fail/exp) sayaç dizisinde bucket b'yi rs sonucuna göre artırır.
+f_bump3(array<int> h, array<int> f, array<int> e, int b, int rs) =>
+    if rs == 1
+        array.set(h, b, array.get(h, b) + 1)
+    else if rs == 2
+        array.set(f, b, array.get(f, b) + 1)
+    else
+        array.set(e, b, array.get(e, b) + 1)
+
+// start bin'den sona kümülatif toplam (threshold tabloları için).
+f_cumFrom(array<int> a, int start) =>
+    int s = 0
+    for i = start to array.size(a) - 1
+        s += array.get(a, i)
+    s
+
+// Analytics renk paleti (task 14).
+var color ANA_TITLE = color.rgb(25, 25, 25)
+var color ANA_HDR   = color.rgb(50, 50, 50)
+var color ANA_CELL  = color.rgb(20, 20, 20)
+var color ANA_LEFT  = color.rgb(55, 55, 55)
+var color ANA_LOWN  = color.rgb(90, 70, 0)   // koyu sarı/kahve
+var color ANA_POS   = color.rgb(0, 90, 0)    // pozitif lift
+var color ANA_NEG   = color.rgb(120, 0, 0)   // negatif lift
+
+// Analytics sütun başlığı satırı (11 sütun).
+f_anHeader(table t, int r) =>
+    table.cell(t, 0,  r, "Group",   text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1,  r, "N",       text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 2,  r, "Hit",     text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 3,  r, "Fail",    text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 4,  r, "Exp",     text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 5,  r, "ResHit%", text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 6,  r, "Ovr%",    text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 7,  r, "Cov%",    text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 8,  r, "Lift",    text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 9,  r, "AvgH",    text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 10, r, "AvgF",    text_color = color.white, bgcolor = ANA_HDR, text_size = size.small, text_halign = text.align_right)
+
+// Analytics veri satırı. sumHit/sumFail < 0 => AvgH/AvgF sütunu boş. base100 na olabilir.
+f_anRow(table t, int r, string lbl, int h, int f, int e, int totRes, float base100, int minN, int sumHit, int sumFail) =>
+    int   n     = h + f + e
+    bool  lowN  = n < minN
+    color cb    = lowN ? ANA_LOWN : ANA_CELL
+    int   resDen = h + f
+    string resStr  = resDen > 0 ? str.tostring(100.0 * h / resDen, "#.#") + "%" + (lowN ? " LOW N" : "") : "—"
+    string ovStr   = n > 0 ? str.tostring(100.0 * h / n, "#.#") + "%" : "—"
+    string covStr  = totRes > 0 ? str.tostring(100.0 * n / totRes, "#.#") + "%" : "—"
+    float  lift    = resDen > 0 ? (100.0 * h / resDen - base100) : na
+    string liftStr = na(lift) ? "—" : (lift >= 0 ? "+" : "") + str.tostring(lift, "#.#") + " pp"
+    color  liftBg  = lowN ? ANA_LOWN : na(lift) ? ANA_CELL : lift > 0 ? ANA_POS : lift < 0 ? ANA_NEG : ANA_CELL
+    string ahStr   = sumHit  < 0 ? "" : (h > 0 ? str.tostring(sumHit  / h, "#.#") : "—")
+    string afStr   = sumFail < 0 ? "" : (f > 0 ? str.tostring(sumFail / f, "#.#") : "—")
+    color  ahBg    = sumHit  < 0 ? ANA_CELL : cb
+    color  afBg    = sumFail < 0 ? ANA_CELL : cb
+    table.cell(t, 0,  r, lbl,             text_color = color.white, bgcolor = ANA_LEFT, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1,  r, str.tostring(n), text_color = color.white, bgcolor = cb,     text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 2,  r, str.tostring(h), text_color = color.white, bgcolor = cb,     text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 3,  r, str.tostring(f), text_color = color.white, bgcolor = cb,     text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 4,  r, str.tostring(e), text_color = color.white, bgcolor = cb,     text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 5,  r, resStr,          text_color = color.white, bgcolor = cb,     text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 6,  r, ovStr,           text_color = color.white, bgcolor = cb,     text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 7,  r, covStr,          text_color = color.white, bgcolor = cb,     text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 8,  r, liftStr,         text_color = color.white, bgcolor = liftBg, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 9,  r, ahStr,           text_color = color.white, bgcolor = ahBg,   text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 10, r, afStr,           text_color = color.white, bgcolor = afBg,   text_size = size.small, text_halign = text.align_right)
+
+// Analytics özet metrik satırı (label | value; kalan sütunlar doldurulur).
+f_anMetric(table t, int r, string lbl, string val) =>
+    table.cell(t, 0, r, lbl, text_color = color.white, bgcolor = ANA_LEFT, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, val, text_color = color.white, bgcolor = ANA_CELL, text_size = size.small, text_halign = text.align_right)
+    for c = 2 to 10
+        table.cell(t, c, r, "", bgcolor = ANA_CELL)
+
+// =============================================================================
+// Motor örneği + confirmed pivot ring buffer (KORUNAN ALTYAPI, çizilmez)
+// =============================================================================
+var Engine        pivEng = f_engine_new()
+var array<Pivot>  pivots = array.new<Pivot>()
+BUFFER_MAX = 16
+
+atr = ta.atr(atrLen)
+
+// =============================================================================
+// FEATURE ENGINEERING — bağımsız pasif göstergeler (yalnızca snapshot/analytics
+// için; prediction/target/confidence'ı ETKİLEMEZ). Global scope'ta her barda
+// hesaplanır (repaint-safe); oluşum anında değerleri dondurulur.
+// =============================================================================
+grpFeat    = "Feature Engineering"
+feEmaFast  = input.int(50,  "EMA fast",  minval = 2, group = grpFeat)
+feEmaSlow  = input.int(200, "EMA slow",  minval = 5, group = grpFeat)
+feAdxLen   = input.int(14,  "ADX length", minval = 2, group = grpFeat)
+feRsiLen   = input.int(14,  "RSI length", minval = 2, group = grpFeat)
+feVolLook  = input.int(100, "ATR percentile lookback", minval = 10, group = grpFeat)
+feSlopeLb  = input.int(5,   "EMA slope / expansion lookback", minval = 1, group = grpFeat)
+
+feEma50  = ta.ema(close, feEmaFast)
+feEma200 = ta.ema(close, feEmaSlow)
+[feDiP, feDiM, feAdx] = ta.dmi(feAdxLen, feAdxLen)
+feRsi    = ta.rsi(close, feRsiLen)
+feAtrPct = ta.percentrank(atr, feVolLook)
+feSlopeAtr  = atr > 0 ? (feEma50 - feEma50[feSlopeLb]) / atr : na
+feAtrExpand = atr > atr[feSlopeLb]
+feAdxRising = feAdx >= feAdx[feSlopeLb]
+
+var array<float> xaRatios = array.from(0.786, 0.886, 1.000, 1.130, 1.272, 1.618)
+var array<float> bcRatios = array.from(1.272, 1.414, 1.618, 2.000, 2.240, 2.618, 3.140, 3.618)
+
+// =============================================================================
+// KAYITLAR + ÇİZİM DURUMU
+// -----------------------------------------------------------------------------
+// records : TÜM prediction snapshot'ları (asla silinmez).  drawn : şu an çizili
+// olan kayıtlara referanslar (obje limiti / display moduna göre budanır).
+// =============================================================================
+var array<PredRec> records = array.new<PredRec>()
+var array<PredRec> drawn   = array.new<PredRec>()
+var int predSeq = 0
+
+// Duplicate engelleme: en son üretilen X-A-B-C bar imzası.
+var int lastX = na
+var int lastA = na
+var int lastB = na
+var int lastC = na
+
+// Debug sayaçları.
+var int cntXabc     = 0   // geçerli (confirmed) XABC sayısı
+var int cntClusters = 0   // geçerli Primary cluster sayısı
+var int cntCreated  = 0   // gerçekten oluşturulan prediction sayısı
+var int cntDup      = 0   // atlanan duplicate sayısı
+
+// -----------------------------------------------------------------------------
+// EVALUATION ENGINE durumu (incremental). activeList yalnızca ACTIVE kayıtları
+// tutar; çözülen kayıt listeden çıkar ve sayaçlar bir kez güncellenir.
+// -----------------------------------------------------------------------------
+var array<PredRec> activeList = array.new<PredRec>()
+var int evTotal   = 0
+var int evHit     = 0
+var int evFail    = 0
+var int evExp     = 0
+var int evSumHitBars  = 0
+var int evSumFailBars = 0
+var int evSumLifeBars = 0
+var array<int> scCount = array.from(0, 0, 0, 0)
+var array<int> scHit   = array.from(0, 0, 0, 0)
+var array<int> scFail  = array.from(0, 0, 0, 0)
+var array<int> scExp   = array.from(0, 0, 0, 0)
+var array<int> spCount = array.from(0, 0, 0, 0)
+var array<int> spHit   = array.from(0, 0, 0, 0)
+var array<int> spFail  = array.from(0, 0, 0, 0)
+var array<int> spExp   = array.from(0, 0, 0, 0)
+
+// -----------------------------------------------------------------------------
+// PREDICTION ANALYTICS sayaçları (incremental, çözüm anında O(1) güncellenir).
+// Yalnızca çözülen kayıtları (HIT/FAILED/EXPIRED) sınıflandırır; pasif.
+// -----------------------------------------------------------------------------
+// Score fine-bins: 0:<5.0 1:[5,5.5) 2:[5.5,6) 3:[6,6.5) 4:[6.5,7) 5:>=7
+var array<int> anSc_hit  = array.from(0, 0, 0, 0, 0, 0)
+var array<int> anSc_fail = array.from(0, 0, 0, 0, 0, 0)
+var array<int> anSc_exp  = array.from(0, 0, 0, 0, 0, 0)
+// Support bins: 0:2 1:3 2:4 3:5+
+var array<int> anSp_hit  = array.from(0, 0, 0, 0)
+var array<int> anSp_fail = array.from(0, 0, 0, 0)
+var array<int> anSp_exp  = array.from(0, 0, 0, 0)
+// Direction: 0:bull 1:bear (+ bars toplamları)
+var array<int> anDir_hit     = array.from(0, 0)
+var array<int> anDir_fail    = array.from(0, 0)
+var array<int> anDir_exp     = array.from(0, 0)
+var array<int> anDir_hitBars = array.from(0, 0)
+var array<int> anDir_failBars= array.from(0, 0)
+// Cluster width bins: 0:<=0.25 1:(0.25,0.50] 2:(0.50,1.00] 3:>1.00
+var array<int> anCw_hit  = array.from(0, 0, 0, 0)
+var array<int> anCw_fail = array.from(0, 0, 0, 0)
+var array<int> anCw_exp  = array.from(0, 0, 0, 0)
+// Target distance (ATR) bins: 0:<=1 1:(1,2] 2:(2,4] 3:>4 (+ hit bars)
+var array<int> anTd_hit     = array.from(0, 0, 0, 0)
+var array<int> anTd_fail    = array.from(0, 0, 0, 0)
+var array<int> anTd_exp     = array.from(0, 0, 0, 0)
+var array<int> anTd_hitBars = array.from(0, 0, 0, 0)
+// XA scale (ATR) bins: 0:<3 1:[3,6) 2:[6,10) 3:>=10
+var array<int> anXa_hit  = array.from(0, 0, 0, 0)
+var array<int> anXa_fail = array.from(0, 0, 0, 0)
+var array<int> anXa_exp  = array.from(0, 0, 0, 0)
+// BC/AB ratio bins: 0:<0.382 1:[0.382,0.50) 2:[0.50,0.618) 3:[0.618,0.786) 4:>=0.786
+var array<int> anBc_hit  = array.from(0, 0, 0, 0, 0)
+var array<int> anBc_fail = array.from(0, 0, 0, 0, 0)
+var array<int> anBc_exp  = array.from(0, 0, 0, 0, 0)
+
+// -----------------------------------------------------------------------------
+// CONFIDENCE ENGINE accumulators (incremental, çözümde O(1); yalnızca okur).
+// -----------------------------------------------------------------------------
+var float cfSumAll  = 0.0
+var float cfSumHit  = 0.0
+var float cfSumFail = 0.0
+var float cfSumExp  = 0.0
+// Kalibrasyon binleri: 0:0-20 1:20-40 2:40-60 3:60-80 4:80-100
+var array<int> cfHit  = array.from(0, 0, 0, 0, 0)
+var array<int> cfFail = array.from(0, 0, 0, 0, 0)
+var array<int> cfExp  = array.from(0, 0, 0, 0, 0)
+var array<int> cfLife = array.from(0, 0, 0, 0, 0)   // resolved barsAlive toplamı / bin
+// Korelasyon toplamları (success = HIT?1:0, resolved üzerinde).
+var int   cfN   = 0
+var float cfSx  = 0.0
+var float cfSy  = 0.0
+var float cfSxy = 0.0
+var float cfSxx = 0.0
+var float cfSyy = 0.0
+// Score/Support grubuna göre confidence toplamı (ortalama için; sayım an* sayaçlarından).
+var array<float> cfScSum = array.from(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+var array<float> cfSpSum = array.from(0.0, 0.0, 0.0, 0.0)
+
+// -----------------------------------------------------------------------------
+// QUALIFICATION V1 (SHADOW) sayaçları. Index = qStatus (0 UNKNOWN 1 QUALIFIED
+// 2 WEAK 3 REJECTED). qCount oluşumda, qHit/qFail/qExp çözümde (frozen status).
+// -----------------------------------------------------------------------------
+var array<int> qCount = array.from(0, 0, 0, 0)
+var array<int> qHit   = array.from(0, 0, 0, 0)
+var array<int> qFail  = array.from(0, 0, 0, 0)
+var array<int> qExp   = array.from(0, 0, 0, 0)
+// UNKNOWN neden partisyonu (index = qReason). TÜM UNKNOWN'lar tam olarak bir
+// koda düşer → toplam(qUnkReason[1..6]) == qCount[0]. 0=classified (kullanılmaz).
+//   1 MARKET_SAMPLE_LOW 2 INVALID_BASELINE 3 NO_BUCKET
+//   4 SINGLE_SAMPLE_LOW 5 COVERAGE_LOW 6 OTHER
+var array<int> qUnkReason = array.from(0, 0, 0, 0, 0, 0, 0)
+var int qJointLow = 0   // tanısal: joint aday anahtarına uydu ama yetersizdi (partisyon dışı)
+
+// --- STRATEGY katmanı durum değişkenleri (açık pozisyon için aktif seviyeler) ---
+var float stActiveStop   = na   // aktif long'un stop fiyatı (C.price - 0.5*ATR)
+var float stActiveTarget = na   // aktif long'un target fiyatı (pLo)
+var int   stSignalBar    = na   // sinyalin doğduğu (C-confirmation) bar_index
+var int   stCbar         = na   // C pivotunun OLUŞTUĞU tarihsel bar_index
+var float stCprice       = na   // C pivot fiyatı
+var float stEntryRef     = na   // sinyal barı kapanışı (giriş referansı; gerçek dolum sonraki açılış)
+var float stRRrec        = na   // hesaplanan R:R (kayıt)
+var bool  stDrew         = false // bu pozisyon için etiket/çizgi çizildi mi
+
+// -----------------------------------------------------------------------------
+// FEATURE ENGINEERING analytics sayaçları (partition bucket; çözümde O(1) bump).
+// -----------------------------------------------------------------------------
+var array<int> feEmaT_hit  = array.from(0, 0)
+var array<int> feEmaT_fail = array.from(0, 0)
+var array<int> feEmaT_exp  = array.from(0, 0)
+var array<int> feSlp_hit   = array.from(0, 0, 0)
+var array<int> feSlp_fail  = array.from(0, 0, 0)
+var array<int> feSlp_exp   = array.from(0, 0, 0)
+var array<int> feAdx_hit   = array.from(0, 0, 0, 0)
+var array<int> feAdx_fail  = array.from(0, 0, 0, 0)
+var array<int> feAdx_exp   = array.from(0, 0, 0, 0)
+var array<int> feRsi_hit   = array.from(0, 0, 0, 0, 0)
+var array<int> feRsi_fail  = array.from(0, 0, 0, 0, 0)
+var array<int> feRsi_exp   = array.from(0, 0, 0, 0, 0)
+var array<int> feVol_hit   = array.from(0, 0, 0)
+var array<int> feVol_fail  = array.from(0, 0, 0)
+var array<int> feVol_exp   = array.from(0, 0, 0)
+var array<int> feD50_hit   = array.from(0, 0, 0)
+var array<int> feD50_fail  = array.from(0, 0, 0)
+var array<int> feD50_exp   = array.from(0, 0, 0)
+var array<int> feD200_hit  = array.from(0, 0, 0)
+var array<int> feD200_fail = array.from(0, 0, 0)
+var array<int> feD200_exp  = array.from(0, 0, 0)
+var array<int> feTr_hit    = array.from(0, 0, 0)
+var array<int> feTr_fail   = array.from(0, 0, 0)
+var array<int> feTr_exp    = array.from(0, 0, 0)
+var array<int> feSw_hit    = array.from(0, 0, 0)
+var array<int> feSw_fail   = array.from(0, 0, 0)
+var array<int> feSw_exp    = array.from(0, 0, 0)
+var array<int> feEx_hit    = array.from(0, 0)
+var array<int> feEx_fail   = array.from(0, 0)
+var array<int> feEx_exp    = array.from(0, 0)
+var array<int> feTm_hit    = array.from(0, 0, 0)
+var array<int> feTm_fail   = array.from(0, 0, 0)
+var array<int> feTm_exp    = array.from(0, 0, 0)
+var array<int> feAg_hit    = array.from(0, 0, 0)
+var array<int> feAg_fail   = array.from(0, 0, 0)
+var array<int> feAg_exp    = array.from(0, 0, 0)
+// Feature bucket etiketleri (research tekil aday satırları için).
+var array<string> feEmaT_lbl = array.from("EMA Bull", "EMA Bear")
+var array<string> feSlp_lbl  = array.from("Slope Up", "Slope Flat", "Slope Down")
+var array<string> feAdx_lbl  = array.from("ADX<20", "ADX20-30", "ADX30-40", "ADX40+")
+var array<string> feRsi_lbl  = array.from("RSI<40", "RSI40-50", "RSI50-60", "RSI60-70", "RSI70+")
+var array<string> feVol_lbl  = array.from("Vol Low", "Vol Norm", "Vol High")
+var array<string> feD50_lbl  = array.from("E50 Near", "E50 Mid", "E50 Far")
+var array<string> feD200_lbl = array.from("E200 Near", "E200 Mid", "E200 Far")
+var array<string> feTr_lbl   = array.from("HH-HL", "LH-LL", "Range")
+var array<string> feSw_lbl   = array.from("Swing S", "Swing M", "Swing L")
+var array<string> feEx_lbl   = array.from("ATR Exp", "ATR Contr")
+var array<string> feTm_lbl   = array.from("Piv Short", "Piv Mid", "Piv Long")
+var array<string> feAg_lbl   = array.from("Trend Start", "Trend Mid", "Trend End")
+
+// -----------------------------------------------------------------------------
+// RESEARCH ENGINE — iki-feature kombinasyon sayaçları (sınırlı, incremental).
+// Kondisyon kind kodları: 0 Score(scBin>=lvl), 1 Support(spBin>=lvl),
+//   2 TargetDist(tdBin<=lvl), 3 ClusterWidth(cwBin<=lvl), 4 Direction(dBin==lvl).
+// Metadata bir kez (barstate.isfirst) kurulur; sayaçlar çözümde O(1) artırılır.
+// -----------------------------------------------------------------------------
+var array<int>    cbKindA = array.new<int>()
+var array<int>    cbLvlA  = array.new<int>()
+var array<int>    cbKindB = array.new<int>()
+var array<int>    cbLvlB  = array.new<int>()
+var array<string> cbFam   = array.new<string>()
+var array<int>    cbHit   = array.new<int>()
+var array<int>    cbFail  = array.new<int>()
+var array<int>    cbExp   = array.new<int>()
+
+// Kombinasyonlarda kullanılan eşik seviyeleri (bin indeksleri cinsinden).
+var array<int> lvScore = array.from(2, 3, 4, 5)   // Score >= 5.5/6.0/6.5/7.0
+var array<int> lvSup   = array.from(1, 2, 3)      // Support >= 3/4/5
+var array<int> lvTd    = array.from(0, 1, 2)      // Dist <= 1/2/4 ATR
+var array<int> lvCw    = array.from(0, 1, 2)      // Width <= 0.25/0.50/1.00
+var array<int> lvDir   = array.from(0, 1)         // Bullish / Bearish
+var array<int> lvEmaB  = array.from(0)            // EMA bull
+var array<int> lvAdxT  = array.from(1, 2, 3)      // ADX >= 20/30/40
+var array<int> lvRsiH  = array.from(2)            // RSI >= 50
+var array<int> lvVolL  = array.from(0)            // Low volatility
+
+// =============================================================================
+// RESEARCH ENGINE yardımcıları (pasif; yalnızca mevcut sayaçları okur)
+// =============================================================================
+// Kondisyon üyeliği (prediction bin'lerinden). kind: 0 Score,1 Support,2 TD,3 CW,
+//   4 Dir, 5 EMAtrend(==), 6 ADX(>=), 7 RSI(>=), 8 Volatility(==).
+f_condMet(int kind, int lvl, int scB, int spB, int tdB, int cwB, int dB, int emaB, int adxB, int rsiB, int volB) =>
+    kind == 0 ? scB >= lvl : kind == 1 ? spB >= lvl : kind == 2 ? tdB <= lvl : kind == 3 ? cwB <= lvl : kind == 4 ? dB == lvl : kind == 5 ? emaB == lvl : kind == 6 ? adxB >= lvl : kind == 7 ? rsiB >= lvl : volB == lvl
+
+// Kondisyon etiketi (dashboard için).
+f_condLabel(int kind, int lvl) =>
+    kind == 0 ? "Sc>=" + (lvl == 2 ? "5.5" : lvl == 3 ? "6.0" : lvl == 4 ? "6.5" : "7.0") : kind == 1 ? "Sup>=" + str.tostring(lvl + 2) : kind == 2 ? "Dist<=" + (lvl == 0 ? "1" : lvl == 1 ? "2" : "4") + "A" : kind == 3 ? "Wid<=" + (lvl == 0 ? "0.25" : lvl == 1 ? "0.50" : "1.00") : kind == 4 ? (lvl == 0 ? "Bull" : "Bear") : kind == 5 ? (lvl == 0 ? "EMAbull" : "EMAbear") : kind == 6 ? "ADX>=" + (lvl == 1 ? "20" : lvl == 2 ? "30" : "40") : kind == 7 ? "RSI>=50" : "LowVol"
+
+// 0..last kümülatif toplam (<= eşikleri için).
+f_cumUpTo(array<int> a, int last) =>
+    int s = 0
+    for i = 0 to last
+        s += array.get(a, i)
+    s
+
+// =============================================================================
+// QUALIFICATION V1 (SHADOW) — pasif sınıflandırma. Yalnız GEÇMİŞ (as-of-creation,
+// prior-resolved) sayaçları okur: market baseline (evHit/evFail/evExp), joint
+// Score×Dist kombinasyon bucket'ları (cb*) ve tekil Score/Dist bucket'ları
+// (anSc/anTd). Adayın kendisi bu sayaçlarda YOKTUR (kendi sonucunu göremez).
+// Korele lift'ler TOPLANMAZ: tek bir bucket seçilir (en spesifik yeterli joint,
+// yoksa en güçlü yeterli tekil). DÖNÜŞ:
+//   [status, reason, bucketType, bucketN, marketDec, baseline, cond, lift, coverage, jointLow]
+//   status: 0 UNKNOWN 1 QUALIFIED 2 WEAK 3 REJECTED
+//   reason (UNKNOWN nedeni; TÜM UNKNOWN'lar bu partisyonu doldurur, toplam=UNKNOWN):
+//     0 evaluated (QUALIFIED/WEAK/REJECTED — UNKNOWN değil)
+//     1 MARKET_SAMPLE_LOW  — 0<marketDec<MIN_MARKET (karara bağlanmış piyasa örneği yetersiz)
+//     2 INVALID_BASELINE   — marketDec==0 (hiç hit/fail yok → baseline tanımsız)
+//     3 NO_BUCKET          — piyasa yeterli; ilgili hiçbir tekil bucket'ta resolved yok
+//     4 SINGLE_SAMPLE_LOW  — bucket var ama resolved<MIN_BUCKET
+//     5 COVERAGE_LOW       — bucket resolved>=MIN_BUCKET ama coverage<MIN_COVERAGE
+//     6 OTHER              — beklenmeyen (bins total fonksiyon olduğundan MISSING_FEATURE /
+//                            OUT_OF_RANGE / INVALID_KEY / HISTORY_NOT_ACCUMULATED oluşamaz → 0)
+//   jointLow: 1 = joint kombosu ADAYA UYDU ama yetersizdi (tanısal; partisyon dışı).
+//   NOT (PART 2): piyasa örneği = hit+failed (marketDec). EXPIRED resolved kanıt SAYILMAZ;
+//   yalnız coverage/populasyon paydasında yer alır. marketN (hit+fail+exp) artık kapı DEĞİL.
+// =============================================================================
+f_qualify(int scB, int tdB, int mH, int mF, int mE) =>
+    int   marketDec = mH + mF          // PART 2: resolved sample = hit+failed (expired hariç)
+    float baseline  = marketDec > 0 ? mH / marketDec : na
+    int   status  = 0
+    int   reason  = 6
+    int   bType   = 0
+    int   bN      = 0
+    float cond    = na
+    float lift    = na
+    float cov     = na
+    int   jointLow = 0
+    if marketDec == 0 or na(baseline)
+        status := 0
+        reason := 2                       // INVALID_BASELINE
+    else if marketDec < qMinMarketResolved
+        status := 0
+        reason := 1                       // MARKET_SAMPLE_LOW (PART 2: hit+failed, expired hariç)
+    else
+        // (a) En spesifik YETERLİ joint Score×Dist bucket (cbKindA=0 Score>=, cbKindB=2 Dist<=).
+        int  jH = 0
+        int  jF = 0
+        int  jE = 0
+        int  jSpec = -1
+        bool jFound   = false
+        bool jMatched = false             // aday combo anahtarına uydu (yeterli olmasa da)
+        for ci = 0 to array.size(cbFam) - 1
+            if array.get(cbKindA, ci) == 0 and array.get(cbKindB, ci) == 2
+                int lvA = array.get(cbLvlA, ci)
+                int lvB = array.get(cbLvlB, ci)
+                if scB >= lvA and tdB <= lvB
+                    int h = array.get(cbHit, ci)
+                    int f = array.get(cbFail, ci)
+                    int e = array.get(cbExp, ci)
+                    int dec = h + f
+                    int tot = h + f + e
+                    if dec > 0
+                        jMatched := true
+                    if dec >= qMinBucketResolved and tot / marketDec >= qMinCoverage
+                        int spec = lvA * 10 - lvB
+                        if not jFound or spec > jSpec
+                            jFound := true
+                            jSpec  := spec
+                            jH := h
+                            jF := f
+                            jE := e
+        if jFound
+            bType := 1
+            bN    := jH + jF
+            cond  := (jH + jF) > 0 ? jH / (jH + jF) : na
+            cov   := (jH + jF + jE) / marketDec
+        else
+            // (b) Tekil: Score (>= scB kümülatif) ve Dist (<= tdB kümülatif); en güçlü |lift| kazanır.
+            int sH = f_cumFrom(anSc_hit, scB)
+            int sF = f_cumFrom(anSc_fail, scB)
+            int sE = f_cumFrom(anSc_exp, scB)
+            int dH = f_cumUpTo(anTd_hit, tdB)
+            int dF = f_cumUpTo(anTd_fail, tdB)
+            int dE = f_cumUpTo(anTd_exp, tdB)
+            bool  sOk   = (sH + sF) >= qMinBucketResolved and (sH + sF + sE) / marketDec >= qMinCoverage
+            bool  dOk   = (dH + dF) >= qMinBucketResolved and (dH + dF + dE) / marketDec >= qMinCoverage
+            float sCond = (sH + sF) > 0 ? sH / (sH + sF) : na
+            float dCond = (dH + dF) > 0 ? dH / (dH + dF) : na
+            float sLift = na(sCond) ? na : sCond - baseline
+            float dLift = na(dCond) ? na : dCond - baseline
+            if sOk and (not dOk or math.abs(sLift) >= math.abs(dLift))
+                bType := 2
+                bN    := sH + sF
+                cond  := sCond
+                cov   := (sH + sF + sE) / marketDec
+            else if dOk
+                bType := 3
+                bN    := dH + dF
+                cond  := dCond
+                cov   := (dH + dF + dE) / marketDec
+            else
+                // Yeterli bucket yok → nedeni ayır (en geniş tekil bucket'a göre).
+                int bestDec = math.max(sH + sF, dH + dF)
+                if bestDec == 0
+                    reason := 3   // NO_BUCKET (ilgili bin'lerde hiç resolved yok)
+                else if bestDec < qMinBucketResolved
+                    reason := 4   // SINGLE_SAMPLE_LOW
+                else
+                    reason := 5   // COVERAGE_LOW
+        // joint aday anahtarına uydu ama seçilemedi → tanısal işaret.
+        if jMatched and not jFound
+            jointLow := 1
+        if bType == 0
+            status := 0
+            // reason yukarıda belirlendi (3/4/5)
+        else
+            reason := 0
+            lift   := cond - baseline
+            status := lift >= qQualifiedMinLift ? 1 : lift <= qRejectedMaxLift ? 3 : 2
+    [status, reason, bType, bN, marketDec, baseline, cond, lift, cov, jointLow]
+
+// Bir tekil kondisyonun (kind,lvl) resolved sayacı [h,f,e].
+f_condCounts(int kind, int lvl) =>
+    int h = 0
+    int f = 0
+    int e = 0
+    if kind == 0
+        h := f_cumFrom(anSc_hit, lvl)
+        f := f_cumFrom(anSc_fail, lvl)
+        e := f_cumFrom(anSc_exp, lvl)
+    else if kind == 1
+        h := f_cumFrom(anSp_hit, lvl)
+        f := f_cumFrom(anSp_fail, lvl)
+        e := f_cumFrom(anSp_exp, lvl)
+    else if kind == 2
+        h := f_cumUpTo(anTd_hit, lvl)
+        f := f_cumUpTo(anTd_fail, lvl)
+        e := f_cumUpTo(anTd_exp, lvl)
+    else if kind == 3
+        h := f_cumUpTo(anCw_hit, lvl)
+        f := f_cumUpTo(anCw_fail, lvl)
+        e := f_cumUpTo(anCw_exp, lvl)
+    else if kind == 4
+        h := array.get(anDir_hit, lvl)
+        f := array.get(anDir_fail, lvl)
+        e := array.get(anDir_exp, lvl)
+    else if kind == 5
+        h := array.get(feEmaT_hit, lvl)
+        f := array.get(feEmaT_fail, lvl)
+        e := array.get(feEmaT_exp, lvl)
+    else if kind == 6
+        h := f_cumFrom(feAdx_hit, lvl)
+        f := f_cumFrom(feAdx_fail, lvl)
+        e := f_cumFrom(feAdx_exp, lvl)
+    else if kind == 7
+        h := f_cumFrom(feRsi_hit, lvl)
+        f := f_cumFrom(feRsi_fail, lvl)
+        e := f_cumFrom(feRsi_exp, lvl)
+    else
+        h := array.get(feVol_hit, lvl)
+        f := array.get(feVol_fail, lvl)
+        e := array.get(feVol_exp, lvl)
+    [h, f, e]
+
+// Bir aile için tüm (lvA × lvB) kombinasyonlarını metadata dizilerine ekler (bir kez).
+f_addFamily(int kindA, array<int> lvA, int kindB, array<int> lvB, string fam, array<int> kA, array<int> lA, array<int> kB, array<int> lB, array<string> fm, array<int> hh, array<int> ff, array<int> ee) =>
+    for ia = 0 to array.size(lvA) - 1
+        for ib = 0 to array.size(lvB) - 1
+            array.push(kA, kindA)
+            array.push(lA, array.get(lvA, ia))
+            array.push(kB, kindB)
+            array.push(lB, array.get(lvB, ib))
+            array.push(fm, fam)
+            array.push(hh, 0)
+            array.push(ff, 0)
+            array.push(ee, 0)
+
+// Aile kodundan görünen ad (tekil aday satırlarında "Feature" sütunu).
+f_famName(int fam) =>
+    fam == 0 ? "Score" : fam == 1 ? "Support" : fam == 2 ? "Direction" : fam == 3 ? "ClusterW" : fam == 4 ? "TargetD" : fam == 5 ? "XA" : fam == 6 ? "BC" : fam == 8 ? "EMAtrend" : fam == 9 ? "EMAslope" : fam == 10 ? "ADX" : fam == 11 ? "RSI" : fam == 12 ? "Vol" : fam == 13 ? "DistE50" : fam == 14 ? "DistE200" : fam == 15 ? "TrendStr" : fam == 16 ? "Swing" : fam == 17 ? "VolExp" : fam == 18 ? "TimePiv" : fam == 19 ? "AgeCtx" : "?"
+
+// Bir feature engineering ailesinin partition bucket'larını tekil aday listesine ekler.
+f_addFeatSingles(array<Cand> cs, int fam, array<string> labels, array<int> hh, array<int> ff, array<int> ee) =>
+    for i = 0 to array.size(labels) - 1
+        array.push(cs, Cand.new(fam, i, array.get(labels, i), "", -1, i, -1, -1, array.get(hh, i), array.get(ff, i), array.get(ee, i)))
+
+// Tüm tekil aday listesini (klasik + feature engineering) kurar ve döndürür.
+// Research dashboard ve Minimal panel bunu paylaşır (tek kaynak; sayaçları OKUR).
+f_buildSingles() =>
+    array<Cand> cs = array.new<Cand>()
+    for li = 1 to 5
+        [h, f, e] = f_condCounts(0, li)
+        array.push(cs, Cand.new(0, li - 1, "Score>=" + (li == 1 ? "5.0" : li == 2 ? "5.5" : li == 3 ? "6.0" : li == 4 ? "6.5" : "7.0"), "", 0, li, -1, -1, h, f, e))
+    for li = 0 to 3
+        [h, f, e] = f_condCounts(1, li)
+        array.push(cs, Cand.new(1, li, "Support>=" + str.tostring(li + 2), "", 1, li, -1, -1, h, f, e))
+    for li = 0 to 1
+        [h, f, e] = f_condCounts(4, li)
+        array.push(cs, Cand.new(2, li, li == 0 ? "Bullish" : "Bearish", "", 4, li, -1, -1, h, f, e))
+    for li = 0 to 2
+        [h, f, e] = f_condCounts(3, li)
+        array.push(cs, Cand.new(3, li, "Width<=" + (li == 0 ? "0.25" : li == 1 ? "0.50" : "1.00"), "", 3, li, -1, -1, h, f, e))
+    for li = 0 to 2
+        [h, f, e] = f_condCounts(2, li)
+        array.push(cs, Cand.new(4, li, "Dist<=" + (li == 0 ? "1" : li == 1 ? "2" : "4") + "ATR", "", 2, li, -1, -1, h, f, e))
+    for li = 0 to 3
+        array.push(cs, Cand.new(5, li, li == 0 ? "XA<3" : li == 1 ? "XA3-6" : li == 2 ? "XA6-10" : "XA>10", "", -1, li, -1, -1, array.get(anXa_hit, li), array.get(anXa_fail, li), array.get(anXa_exp, li)))
+    for li = 0 to 4
+        string bl = li == 0 ? "BC<.382" : li == 1 ? "BC.382-.5" : li == 2 ? "BC.5-.618" : li == 3 ? "BC.618-.786" : "BC>.786"
+        array.push(cs, Cand.new(6, li, bl, "", -1, li, -1, -1, array.get(anBc_hit, li), array.get(anBc_fail, li), array.get(anBc_exp, li)))
+    f_addFeatSingles(cs, 8,  feEmaT_lbl, feEmaT_hit, feEmaT_fail, feEmaT_exp)
+    f_addFeatSingles(cs, 9,  feSlp_lbl,  feSlp_hit,  feSlp_fail,  feSlp_exp)
+    f_addFeatSingles(cs, 10, feAdx_lbl,  feAdx_hit,  feAdx_fail,  feAdx_exp)
+    f_addFeatSingles(cs, 11, feRsi_lbl,  feRsi_hit,  feRsi_fail,  feRsi_exp)
+    f_addFeatSingles(cs, 12, feVol_lbl,  feVol_hit,  feVol_fail,  feVol_exp)
+    f_addFeatSingles(cs, 13, feD50_lbl,  feD50_hit,  feD50_fail,  feD50_exp)
+    f_addFeatSingles(cs, 14, feD200_lbl, feD200_hit, feD200_fail, feD200_exp)
+    f_addFeatSingles(cs, 15, feTr_lbl,   feTr_hit,   feTr_fail,   feTr_exp)
+    f_addFeatSingles(cs, 16, feSw_lbl,   feSw_hit,   feSw_fail,   feSw_exp)
+    f_addFeatSingles(cs, 17, feEx_lbl,   feEx_hit,   feEx_fail,   feEx_exp)
+    f_addFeatSingles(cs, 18, feTm_lbl,   feTm_hit,   feTm_fail,   feTm_exp)
+    f_addFeatSingles(cs, 19, feAg_lbl,   feAg_hit,   feAg_fail,   feAg_exp)
+    cs
+
+// Türev metrikler (h,f,e + baseline + toplamlar). Lift = yüzde puan; oranlar ayrı.
+f_hitRateV(int h, int f) => (h + f) > 0 ? 100.0 * h / (h + f) : na
+f_liftV(int h, int f, float base100) => (h + f) > 0 ? (100.0 * h / (h + f) - base100) : na
+f_relLiftV(int h, int f, float base100) => (base100 > 0 and (h + f) > 0) ? (100.0 * h / (h + f)) / base100 - 1.0 : na
+f_covV(int h, int f, int e, int totRes) => totRes > 0 ? 100.0 * (h + f + e) / totRes : 0.0
+
+// Research Score (yalnızca sıralama; confidence DEĞİL). Normalize edilmiş.
+f_rScoreV(int h, int f, int e, float base100, int minStrong, int totRes) =>
+    int   n         = h + f + e
+    float lift      = f_liftV(h, f, base100)
+    float posLift   = na(lift) ? 0.0 : math.max(lift, 0.0)
+    float evidence  = math.min(1.0, minStrong > 0 ? n / minStrong : 0.0)
+    float covFrac   = totRes > 0 ? n / totRes : 0.0
+    float covFactor = math.min(1.0, covFrac / 0.5)
+    posLift * evidence * (0.5 + 0.5 * covFactor)
+
+// Sınıflandırma kodu (öncelik: LOW N > LOW COV > STRONG > PROMISING > NEGATIVE > NEUTRAL).
+// 4 LOWN, 5 LOWCOV, 2 STRONG, 1 PROMISING, 3 NEGATIVE, 0 NEUTRAL.
+f_classV(int h, int f, int e, float base100, int minRel, int minStrong, float covFloor, int totRes) =>
+    int   n    = h + f + e
+    float lift = f_liftV(h, f, base100)
+    float cov  = f_covV(h, f, e, totRes)
+    n < minRel ? 4 : cov < covFloor ? 5 : (not na(lift) and lift >= 8.0 and n >= minStrong) ? 2 : (not na(lift) and lift >= 5.0 and n >= minRel) ? 1 : (not na(lift) and lift <= -5.0 and n >= minRel) ? 3 : 0
+
+f_clsLabel(int c) => c == 2 ? "STRONG" : c == 1 ? "PROMISING" : c == 3 ? "NEGATIVE" : c == 4 ? "LOW N" : c == 5 ? "LOW COV" : "NEUTRAL"
+f_clsColor(int c) => c == 2 ? color.rgb(0, 90, 0) : c == 1 ? color.rgb(20, 70, 20) : c == 3 ? color.rgb(120, 0, 0) : c == 4 ? color.rgb(120, 70, 0) : c == 5 ? color.rgb(100, 60, 0) : color.rgb(60, 60, 60)
+f_liftColor(float lift) => na(lift) ? color.rgb(25, 25, 25) : lift > 1.0 ? color.rgb(0, 90, 0) : lift < -1.0 ? color.rgb(120, 0, 0) : color.rgb(60, 60, 60)
+f_liftStr(float lift) => na(lift) ? "—" : (lift >= 0 ? "+" : "") + str.tostring(lift, "#.#") + " pp"
+f_pctF(float v) => na(v) ? "—" : str.tostring(v, "#.#") + "%"
+// Meta Research export biçimlendiricileri (pasif; DAİMA geçerli string üretir).
+// na hiçbir zaman propagate etmez: sayılar "NA" (CSV) / null (JSON), string'ler "NA".
+f_n1(float v)   => na(v) ? "NA" : str.tostring(v, "#.#")
+f_n2(float v)   => na(v) ? "NA" : str.tostring(v, "#.##")
+f_sgn1(float v) => na(v) ? "NA" : (v >= 0 ? "+" : "") + str.tostring(v, "#.#")
+f_jn(float v)   => na(v) ? "null" : str.tostring(v, "#.#")
+f_s(string s)   => na(s) or s == "" ? "NA" : s
+
+// Komşu eşik kararlılığı (STABLE / MIXED / ISOLATED / —).
+f_stab3(float lp, float lc, float ln) =>
+    string res = "—"
+    if not na(lc)
+        int nb = 0
+        int same = 0
+        if not na(lp)
+            nb += 1
+            same += (lp > 0) == (lc > 0) ? 1 : 0
+        if not na(ln)
+            nb += 1
+            same += (ln > 0) == (lc > 0) ? 1 : 0
+        res := nb == 0 ? "—" : same == nb ? "STABLE" : (lc > 0 and same == 0) ? "ISOLATED" : "MIXED"
+    res
+
+// Research tablo renkleri.
+var color RES_HDR  = color.rgb(20, 20, 20)
+var color RES_SECT = color.rgb(45, 45, 45)
+var color RES_CELL = color.rgb(25, 25, 25)
+
+// 9 sütunlu başlık satırı.
+f_resHdr9(table t, int r, string h0, string h1, string h2, string h3, string h4, string h5, string h6, string h7, string h8) =>
+    table.cell(t, 0, r, h0, text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, h1, text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 2, r, h2, text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 3, r, h3, text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 4, r, h4, text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 5, r, h5, text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 6, r, h6, text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 7, r, h7, text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 8, r, h8, text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+
+// 9 sütunlu aday satırı: a b c | N Hit% Lift Cov RScore Class.
+f_resRow9(table t, int r, string a, string b, string c, int h, int f, int e, float base100, int totRes, int minRel, int minStrong, float covFloor) =>
+    int   n    = h + f + e
+    float hr   = f_hitRateV(h, f)
+    float lift = f_liftV(h, f, base100)
+    float cov  = f_covV(h, f, e, totRes)
+    float rs   = f_rScoreV(h, f, e, base100, minStrong, totRes)
+    int   cls  = f_classV(h, f, e, base100, minRel, minStrong, covFloor, totRes)
+    table.cell(t, 0, r, a, text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 1, r, b, text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 2, r, c, text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 3, r, str.tostring(n),            text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 4, r, f_pctF(hr),                 text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 5, r, f_liftStr(lift),            text_color = color.white, bgcolor = f_liftColor(lift), text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 6, r, f_pctF(cov),                text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 7, r, na(rs) ? "—" : str.tostring(rs, "#.##"), text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 8, r, f_clsLabel(cls),            text_color = color.white, bgcolor = f_clsColor(cls), text_size = size.small, text_halign = text.align_right)
+
+// Özet metrik satırı (label | value; kalan sütunlar doldurulur).
+f_resMetric(table t, int r, string lbl, string val) =>
+    table.cell(t, 0, r, lbl, text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, val, text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    for c = 2 to 8
+        table.cell(t, c, r, "", bgcolor = RES_CELL)
+
+// Tekil adayları Research Score'a göre sırala (pozitif lift, aile başına perFam sınırı).
+f_rankSingles(array<Cand> cs, int k, int perFam, float base100, int totRes, int minRel, int minStrong, float covFloor) =>
+    array<int> chosen = array.new<int>()
+    array<int> famCnt = array.new<int>(24, 0)
+    bool go = true
+    while array.size(chosen) < k and go
+        int   bestI = -1
+        float bestS = -1.0
+        for i = 0 to array.size(cs) - 1
+            if not array.includes(chosen, i)
+                Cand c = array.get(cs, i)
+                float lift = f_liftV(c.hit, c.fail, base100)
+                if not na(lift) and lift > 0 and array.get(famCnt, c.fam) < perFam
+                    float rs = f_rScoreV(c.hit, c.fail, c.exp, base100, minStrong, totRes)
+                    if rs > bestS
+                        bestS := rs
+                        bestI := i
+        if bestI < 0
+            go := false
+        else
+            array.push(chosen, bestI)
+            Cand cb = array.get(cs, bestI)
+            array.set(famCnt, cb.fam, array.get(famCnt, cb.fam) + 1)
+    chosen
+
+// Kombinasyonları guardrail + aile sınırı ile sırala. Tüm array.get erişimleri
+// sınır-korumalı: boş/tutarsız dizi durumunda CRASH etmez (fail-safe).
+f_rankCombos(array<Cand> cs, int k, int perFam, float base100, int totRes, int minRel, int minStrong, float covFloor) =>
+    array<int> chosen = array.new<int>()
+    int csN = array.size(cs)
+    int cbN = array.size(cbFam)
+    if csN > 0
+        bool go = true
+        while array.size(chosen) < k and go
+            int   bestI = -1
+            float bestS = -1.0
+            for i = 0 to csN - 1
+                if not array.includes(chosen, i)
+                    Cand c = array.get(cs, i)
+                    int   n    = c.hit + c.fail + c.exp
+                    float lift = f_liftV(c.hit, c.fail, base100)
+                    float cov  = f_covV(c.hit, c.fail, c.exp, totRes)
+                    if n >= minRel and cov >= covFloor and not na(lift) and lift >= 5.0
+                        string fam = (c.ord >= 0 and c.ord < cbN) ? array.get(cbFam, c.ord) : ""
+                        int cnt = 0
+                        int chN = array.size(chosen)
+                        if chN > 0
+                            for j = 0 to chN - 1
+                                int oi = array.get(chosen, j)
+                                int od = (oi >= 0 and oi < csN) ? array.get(cs, oi).ord : -1
+                                string ofam = (od >= 0 and od < cbN) ? array.get(cbFam, od) : ""
+                                if ofam == fam
+                                    cnt += 1
+                        if cnt < perFam
+                            float rs = f_rScoreV(c.hit, c.fail, c.exp, base100, minStrong, totRes)
+                            if rs > bestS
+                                bestS := rs
+                                bestI := i
+            if bestI < 0
+                go := false
+            else
+                array.push(chosen, bestI)
+    chosen
+
+// Negatif adayları (güvenilir örneklem, lift<0) en düşük lift'e göre sırala.
+f_rankNeg(array<Cand> cs, int k, float base100, int totRes, int minRel, float covFloor) =>
+    array<int> chosen = array.new<int>()
+    bool go = true
+    while array.size(chosen) < k and go
+        int   worstI = -1
+        float worstL = 1000000.0
+        for i = 0 to array.size(cs) - 1
+            if not array.includes(chosen, i)
+                Cand c = array.get(cs, i)
+                int   n    = c.hit + c.fail + c.exp
+                float lift = f_liftV(c.hit, c.fail, base100)
+                float cov  = f_covV(c.hit, c.fail, c.exp, totRes)
+                if n >= minRel and cov >= covFloor and not na(lift) and lift < 0.0 and lift < worstL
+                    worstL := lift
+                    worstI := i
+        if worstI < 0
+            go := false
+        else
+            array.push(chosen, worstI)
+    chosen
+
+// Bir threshold ailesinin komşu-eşik kararlılığını satır satır yazar; sonraki satırı döndürür.
+f_resStab(table t, int startR, int famCode, string famName, array<Cand> cs, float base100) =>
+    array<int> idx = array.new<int>()
+    for i = 0 to array.size(cs) - 1
+        if array.get(cs, i).fam == famCode
+            array.push(idx, i)
+    int r = startR
+    for m = 0 to array.size(idx) - 1
+        Cand  c  = array.get(cs, array.get(idx, m))
+        float lc = f_liftV(c.hit, c.fail, base100)
+        float lp = m > 0 ? f_liftV(array.get(cs, array.get(idx, m - 1)).hit, array.get(cs, array.get(idx, m - 1)).fail, base100) : na
+        float ln = m < array.size(idx) - 1 ? f_liftV(array.get(cs, array.get(idx, m + 1)).hit, array.get(cs, array.get(idx, m + 1)).fail, base100) : na
+        string stab = f_stab3(lp, lc, ln)
+        int n = c.hit + c.fail + c.exp
+        table.cell(t, 0, r, famName,          text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+        table.cell(t, 1, r, c.label,          text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+        table.cell(t, 2, r, str.tostring(n),  text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+        table.cell(t, 3, r, "", bgcolor = RES_CELL)
+        table.cell(t, 4, r, "", bgcolor = RES_CELL)
+        table.cell(t, 5, r, f_liftStr(lc),    text_color = color.white, bgcolor = f_liftColor(lc), text_size = size.small, text_halign = text.align_right)
+        table.cell(t, 6, r, "", bgcolor = RES_CELL)
+        table.cell(t, 7, r, "", bgcolor = RES_CELL)
+        table.cell(t, 8, r, stab,             text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+        r += 1
+    r
+
+// Confidence: özet/reliability metrik satırı (label | value; 8 sütun).
+f_cfMetric(table t, int r, string lbl, string val) =>
+    table.cell(t, 0, r, lbl, text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, val, text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    for c = 2 to 7
+        table.cell(t, c, r, "", bgcolor = RES_CELL)
+
+// Confidence: kalibrasyon başlık satırı (8 sütun).
+f_cfHdr(table t, int r) =>
+    table.cell(t, 0, r, "Range",   text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, "N",       text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 2, r, "Hit",     text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 3, r, "Fail",    text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 4, r, "Exp",     text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 5, r, "ResHit%", text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 6, r, "Ovr%",    text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 7, r, "Life",    text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+
+// Confidence: kalibrasyon veri satırı.
+f_cfCalRow(table t, int r, string lbl, int h, int f, int e, int sumLife) =>
+    int n = h + f + e
+    table.cell(t, 0, r, lbl,             text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, str.tostring(n), text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 2, r, str.tostring(h), text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 3, r, str.tostring(f), text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 4, r, str.tostring(e), text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 5, r, f_pctS(h, h + f), text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 6, r, f_pctS(h, n),     text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 7, r, n > 0 ? str.tostring(sumLife / n, "#.#") : "—", text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+
+// -----------------------------------------------------------------------------
+// Görüntüleme penceresi: kaç prediction ÇİZİLİ tutulacak (kayıt sayısını etkilemez).
+// Obje limitine (500) göre güvenli üst sınır hesaplanır.
+// -----------------------------------------------------------------------------
+int boxesPer  = 1 + (showSecond ? 1 : 0)
+int labelsPer = showXABC ? 4 : 0
+int capBox    = int(490 / boxesPer)
+int capLbl    = labelsPer > 0 ? int(490 / labelsPer) : 1000000
+int allCap    = math.min(capBox, capLbl)
+int maxDrawn  = histDisplay == "Latest only" ? 1 : histDisplay == "Last N predictions" ? math.min(histCount, allCap) : allCap
+
+// RESEARCH: kombinasyon metadata'sını kur. barstate.isfirst yerine "boşsa kur"
+// kullanılır (self-healing): uzun geçmişli sembollerde isfirst güvenilmez olabilir;
+// bu blok ANA AKIŞ'tan ÖNCE her barda kontrol edilir, bir kez (boşken) doldurur.
+if array.size(cbFam) == 0
+    f_addFamily(0, lvScore, 1, lvSup, "Sc+Sup",  cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
+    f_addFamily(0, lvScore, 2, lvTd,  "Sc+Dist", cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
+    f_addFamily(0, lvScore, 3, lvCw,  "Sc+Wid",  cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
+    f_addFamily(1, lvSup,   2, lvTd,  "Sup+Dist",cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
+    f_addFamily(1, lvSup,   3, lvCw,  "Sup+Wid", cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
+    f_addFamily(4, lvDir,   0, lvScore,"Dir+Sc", cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
+    f_addFamily(4, lvDir,   2, lvTd,  "Dir+Dist",cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
+    f_addFamily(0, lvScore, 5, lvEmaB, "Sc+EMA", cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
+    f_addFamily(0, lvScore, 6, lvAdxT, "Sc+ADX", cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
+    f_addFamily(0, lvScore, 7, lvRsiH, "Sc+RSI", cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
+    f_addFamily(0, lvScore, 8, lvVolL, "Sc+Vol", cbKindA, cbLvlA, cbKindB, cbLvlB, cbFam, cbHit, cbFail, cbExp)
+
+// =============================================================================
+// ANA AKIŞ — yalnızca KAPANMIŞ (confirmed) barlarda; ileri doğru, bar bar.
+// =============================================================================
+if barstate.isconfirmed
+    // 0) Pivot motorunu ilerlet (repaint-safe).
+    Pivot newPiv = f_engine_step(pivEng, pivK, pivMinBars, atr)
+    if not na(newPiv)
+        array.push(pivots, newPiv)
+        if array.size(pivots) > BUFFER_MAX
+            array.shift(pivots)
+
+    // -------------------------------------------------------------------------
+    // 0b) EVALUATION ENGINE — yalnızca ACTIVE prediction'ları bu barın high/low'u
+    //     ile ileri doğru değerlendir. Oluşum barının kendi high/low'u kullanılmaz
+    //     (creationBar < bar_index). Çözülen kayıt bir kez işlenir, listeden çıkar.
+    // -------------------------------------------------------------------------
+    int ai = 0
+    while ai < array.size(activeList)
+        PredRec p = array.get(activeList, ai)
+        bool resolved = false
+        if p.creationBar < bar_index
+            bool bull     = p.direction == 1
+            bool hitCond  = bull ? (high >= p.targetLow) : (low <= p.targetHigh)
+            bool hasInval = not na(p.invalidationPrice)
+            bool failCond = hasInval ? (bull ? (low <= p.invalidationPrice) : (high >= p.invalidationPrice)) : false
+
+            int   rs     = 0
+            float rprice = na
+            if hitCond and failCond
+                // Aynı mumda hem hedef hem invalidation: sıra bilinemez.
+                if ambigMode == "Optimistic"
+                    rs     := 1
+                    rprice := bull ? p.targetLow : p.targetHigh
+                else if ambigMode == "Ignore"
+                    rs     := 0   // çözme; sonraki barda takip devam
+                else
+                    rs     := 2   // Conservative
+                    rprice := p.invalidationPrice
+            else if hitCond
+                rs     := 1
+                rprice := bull ? p.targetLow : p.targetHigh
+            else if failCond
+                rs     := 2
+                rprice := p.invalidationPrice
+            else if (bar_index - p.creationBar) >= maxActiveBars
+                rs     := 3
+                rprice := close
+
+            if rs != 0
+                // Snapshot'a çözüm yaz (bir daha değişmez).
+                p.status      := rs
+                p.resolvedBar := bar_index
+                p.resultPrice := rprice
+                p.barsAlive   := bar_index - p.creationBar
+
+                int sb  = f_scoreBucket(p.score)
+                int spb = f_supBucket(p.support)
+                if rs == 1
+                    evHit         += 1
+                    evSumHitBars  += p.barsAlive
+                    array.set(scHit, sb,  array.get(scHit, sb)  + 1)
+                    array.set(spHit, spb, array.get(spHit, spb) + 1)
+                else if rs == 2
+                    evFail        += 1
+                    evSumFailBars += p.barsAlive
+                    array.set(scFail, sb,  array.get(scFail, sb)  + 1)
+                    array.set(spFail, spb, array.get(spFail, spb) + 1)
+                else
+                    evExp         += 1
+                    array.set(scExp, sb,  array.get(scExp, sb)  + 1)
+                    array.set(spExp, spb, array.get(spExp, spb) + 1)
+                evSumLifeBars += p.barsAlive
+
+                // ---- ANALYTICS incremental güncelleme (pasif; yalnızca çözülen kayıt) ----
+                f_bump3(anSc_hit, anSc_fail, anSc_exp, f_scBin(p.score), rs)
+                f_bump3(anSp_hit, anSp_fail, anSp_exp, f_spBin(p.support), rs)
+                int dbin = p.direction == 1 ? 0 : 1
+                f_bump3(anDir_hit, anDir_fail, anDir_exp, dbin, rs)
+                if rs == 1
+                    array.set(anDir_hitBars, dbin, array.get(anDir_hitBars, dbin) + p.barsAlive)
+                else if rs == 2
+                    array.set(anDir_failBars, dbin, array.get(anDir_failBars, dbin) + p.barsAlive)
+                f_bump3(anCw_hit, anCw_fail, anCw_exp, f_cwBin(p.normalizedClusterWidth), rs)
+                int tbin = f_tdBin(p.targetDistanceATR)
+                f_bump3(anTd_hit, anTd_fail, anTd_exp, tbin, rs)
+                if rs == 1
+                    array.set(anTd_hitBars, tbin, array.get(anTd_hitBars, tbin) + p.barsAlive)
+                f_bump3(anXa_hit, anXa_fail, anXa_exp, f_xaBin(p.xaAtrMultiple), rs)
+                f_bump3(anBc_hit, anBc_fail, anBc_exp, f_bcBin(p.bcAbRatio), rs)
+
+                // ---- RESEARCH: iki-feature kombinasyon sayaçlarını incremental güncelle ----
+                int scB = f_scBin(p.score)
+                int spB = f_spBin(p.support)
+                int tdB = f_tdBin(p.targetDistanceATR)
+                int cwB = f_cwBin(p.normalizedClusterWidth)
+                int dB  = p.direction == 1 ? 0 : 1
+                int emB = p.emaTrendBin
+                int axB = p.adxBin
+                int rsB = p.rsiBin
+                int vlB = p.volBin
+                for ci = 0 to array.size(cbFam) - 1
+                    if f_condMet(array.get(cbKindA, ci), array.get(cbLvlA, ci), scB, spB, tdB, cwB, dB, emB, axB, rsB, vlB) and f_condMet(array.get(cbKindB, ci), array.get(cbLvlB, ci), scB, spB, tdB, cwB, dB, emB, axB, rsB, vlB)
+                        f_bump3(cbHit, cbFail, cbExp, ci, rs)
+
+                // ---- CONFIDENCE: çözülen kaydın (dondurulmuş) confidence'ını istatistiğe kat ----
+                float pc = na(p.confidence) ? 50.0 : p.confidence
+                cfSumAll += pc
+                if rs == 1
+                    cfSumHit += pc
+                else if rs == 2
+                    cfSumFail += pc
+                else
+                    cfSumExp += pc
+                int cbn = f_confBin(pc)
+                if rs == 1
+                    array.set(cfHit, cbn, array.get(cfHit, cbn) + 1)
+                else if rs == 2
+                    array.set(cfFail, cbn, array.get(cfFail, cbn) + 1)
+                else
+                    array.set(cfExp, cbn, array.get(cfExp, cbn) + 1)
+                array.set(cfLife, cbn, array.get(cfLife, cbn) + p.barsAlive)
+                float succ = rs == 1 ? 1.0 : 0.0
+                cfN   += 1
+                cfSx  += pc
+                cfSy  += succ
+                cfSxy += pc * succ
+                cfSxx += pc * pc
+                cfSyy += succ * succ
+                array.set(cfScSum, scB, array.get(cfScSum, scB) + pc)
+                array.set(cfSpSum, spB, array.get(cfSpSum, spB) + pc)
+
+                // ---- FEATURE ENGINEERING: yeni feature bucket sayaçları (pasif) ----
+                f_bump3(feEmaT_hit, feEmaT_fail, feEmaT_exp, p.emaTrendBin, rs)
+                f_bump3(feSlp_hit,  feSlp_fail,  feSlp_exp,  p.emaSlopeBin, rs)
+                f_bump3(feAdx_hit,  feAdx_fail,  feAdx_exp,  p.adxBin,      rs)
+                f_bump3(feRsi_hit,  feRsi_fail,  feRsi_exp,  p.rsiBin,      rs)
+                f_bump3(feVol_hit,  feVol_fail,  feVol_exp,  p.volBin,      rs)
+                f_bump3(feD50_hit,  feD50_fail,  feD50_exp,  p.distE50Bin,  rs)
+                f_bump3(feD200_hit, feD200_fail, feD200_exp, p.distE200Bin, rs)
+                f_bump3(feTr_hit,   feTr_fail,   feTr_exp,   p.trendStrBin, rs)
+                f_bump3(feSw_hit,   feSw_fail,   feSw_exp,   p.swingBin,    rs)
+                f_bump3(feEx_hit,   feEx_fail,   feEx_exp,   p.volExpBin,   rs)
+                f_bump3(feTm_hit,   feTm_fail,   feTm_exp,   p.timePivBin,  rs)
+                f_bump3(feAg_hit,   feAg_fail,   feAg_exp,   p.ageBin,      rs)
+
+                // ---- QUALIFICATION (SHADOW): çözülen kaydın FROZEN qStatus'una göre say ----
+                int qs = p.qStatus
+                if rs == 1
+                    array.set(qHit, qs, array.get(qHit, qs) + 1)
+                else if rs == 2
+                    array.set(qFail, qs, array.get(qFail, qs) + 1)
+                else
+                    array.set(qExp, qs, array.get(qExp, qs) + 1)
+
+                // ---- THRESHOLD-STUDY EXPORT (opt-in; SHADOW): tek satır/prediction ----
+                if qStudyExport
+                    string qoc = rs == 1 ? "H" : rs == 2 ? "F" : "E"
+                    log.info("QSTUDY," + str.tostring(p.id) + "," + str.tostring(p.creationBar) + "," + str.tostring(p.resolvedBar) + "," + qoc + "," + str.tostring(p.qScBin) + "," + str.tostring(p.qTdBin))
+
+                array.remove(activeList, ai)
+                resolved := true
+        if not resolved
+            ai += 1
+
+    // 1) Yeni confirmed pivot (yeni C): doğrula, projeksiyon, kümelendir, kaydet+çiz.
+    if not na(newPiv) and array.size(pivots) >= 4
+        int n = array.size(pivots)
+        Pivot X = array.get(pivots, n - 4)
+        Pivot A = array.get(pivots, n - 3)
+        Pivot B = array.get(pivots, n - 2)
+        Pivot C = array.get(pivots, n - 1)
+
+        if f_xabc_valid(X, A, B, C)
+            cntXabc += 1
+            bool wantDown = X.kind == -1   // L-H-L-H -> D aşağı ; H-L-H-L -> D yukarı
+
+            // 1a) Geçerli D seviyelerini (price, src, ratio) havuza topla (HAM ÇİZME).
+            array<Proj> projs = array.new<Proj>()
+            float xaDelta = A.price - X.price
+            float bcDelta = C.price - B.price
+            for i = 0 to array.size(xaRatios) - 1
+                float r = array.get(xaRatios, i)
+                float d = A.price - r * xaDelta
+                if (wantDown ? d < C.price : d > C.price)
+                    array.push(projs, Proj.new(d, 0, r))
+            for i = 0 to array.size(bcRatios) - 1
+                float r = array.get(bcRatios, i)
+                float d = C.price - r * bcDelta
+                if (wantDown ? d < C.price : d > C.price)
+                    array.push(projs, Proj.new(d, 1, r))
+
+            if array.size(projs) > 0
+                // Adaptif tolerans: pattern boyutuna (XA) orantılı, ATR ve tick tabanı ile.
+                // C onaylanınca bir kez hesaplanır (snapshot) — sonradan yeniden hesaplanmaz.
+                float patternTolerance = math.abs(A.price - X.price) * (patternTolPct / 100.0)
+                float atrFloor  = atr * atrFloorMult
+                float tickFloor = syminfo.mintick * minTolTicks
+                float tol = math.max(patternTolerance, math.max(atrFloor, tickFloor))
+                array<bool> used = array.new<bool>(array.size(projs), false)
+
+                // Primary = en yüksek skorlu küme (en az minSupport üye şart).
+                [pIdx, pScore, pLo, pHi, pSupport] = f_best_cluster(projs, used, tol, minSupport)
+                if pIdx >= 0
+                    cntClusters += 1
+
+                    // 1b) Duplicate engelle: aynı X-A-B-C bar imzası tekrar üretilmesin.
+                    bool dup = not na(lastC) and X.bidx == lastX and A.bidx == lastA and B.bidx == lastB and C.bidx == lastC
+                    if dup
+                        cntDup += 1
+                    else
+                        lastX := X.bidx
+                        lastA := A.bidx
+                        lastB := B.bidx
+                        lastC := C.bidx
+
+                        float pCenter = array.get(projs, pIdx).price
+                        int   dir     = wantDown ? -1 : 1
+
+                        // 1c) Evaluation snapshot: invalidation seviyesi + ATR (oluşum anında sabitlenir).
+                        float cATR = atr
+                        float invalP = na
+                        if failMode == "C ± ATR"
+                            invalP := dir == 1 ? C.price - cATR * evalAtrMult : C.price + cATR * evalAtrMult
+                        else if failMode == "X Pivot"
+                            invalP := X.price
+                        // "None" -> invalP = na (yalnız HIT/EXPIRED)
+
+                        // 1d) Analytics snapshot — oluşum anında dondurulan pasif özellikler.
+                        float anSpread   = pHi - pLo
+                        float anNormW    = anSpread / math.max(tol, syminfo.mintick)
+                        float anXaLen    = math.abs(X.price - A.price)
+                        float anBcLen    = math.abs(B.price - C.price)
+                        float anAbLen    = math.abs(B.price - A.price)
+                        float anXaAtr    = cATR > 0 ? anXaLen / cATR : na
+                        float anBcAtr    = cATR > 0 ? anBcLen / cATR : na
+                        float anAbXa     = anXaLen > 0 ? anAbLen / anXaLen : na
+                        float anBcAb     = anAbLen > 0 ? anBcLen / anAbLen : na
+                        float anTDist    = math.abs(pCenter - close)
+                        float anTDistAtr = cATR > 0 ? anTDist / cATR : na
+                        float anTDistXa  = anXaLen > 0 ? anTDist / anXaLen : na
+
+                        // 1e) CONFIDENCE v2 — YALNIZCA GEÇMİŞ istatistikten (as-of-now; lookahead yok).
+                        //     Her feature bucket'ı log-odds kanıt kayması verir; bunların EVIDENCE
+                        //     ağırlıklı ORTALAMASI alınır (güçlü örneklem baskın, zayıf yok sayılır),
+                        //     gain ile keskinleştirilir ve sigmoid ile 0-100'e taşınır (kalibre olasılık
+                        //     tahmini). Score DEĞİŞMEZ; Confidence tamamen ayrı istatistikseldir.
+                        float p0f = (evHit + evFail) > 0 ? evHit / (evHit + evFail) : na
+                        float l0  = (not na(p0f) and p0f > 0.0 and p0f < 1.0) ? math.log(p0f / (1.0 - p0f)) : na
+                        int   cDir = dir == 1 ? 0 : 1
+                        int   cScB = f_scBin(pScore)
+                        int   cSpB = f_spBin(pSupport)
+                        int   cCwB = f_cwBin(anNormW)
+                        int   cTdB = f_tdBin(anTDistAtr)
+                        int   cXaB = f_xaBin(anXaAtr)
+                        int   cBcB = f_bcBin(anBcAb)
+                        float cNum = 0.0
+                        float cDen = 0.0
+                        [n1, d1] = f_confAcc(array.get(anSc_hit, cScB), array.get(anSc_fail, cScB), p0f, minReliableN, 1.2, 6.0)
+                        [n2, d2] = f_confAcc(array.get(anSp_hit, cSpB), array.get(anSp_fail, cSpB), p0f, minReliableN, 1.2, 5.0)
+                        [n3, d3] = f_confAcc(array.get(anDir_hit, cDir), array.get(anDir_fail, cDir), p0f, minReliableN, 1.2, 3.0)
+                        [n4, d4] = f_confAcc(array.get(anCw_hit, cCwB), array.get(anCw_fail, cCwB), p0f, minReliableN, 1.2, 4.0)
+                        [n5, d5] = f_confAcc(array.get(anTd_hit, cTdB), array.get(anTd_fail, cTdB), p0f, minReliableN, 1.2, 5.0)
+                        [n6, d6] = f_confAcc(array.get(anXa_hit, cXaB), array.get(anXa_fail, cXaB), p0f, minReliableN, 1.2, 3.0)
+                        [n7, d7] = f_confAcc(array.get(anBc_hit, cBcB), array.get(anBc_fail, cBcB), p0f, minReliableN, 1.2, 2.0)
+                        cNum := n1 + n2 + n3 + n4 + n5 + n6 + n7
+                        cDen := d1 + d2 + d3 + d4 + d5 + d6 + d7
+                        float avgShift = cDen > 0 ? cNum / cDen : 0.0
+                        float confidence = na(l0) ? 50.0 : math.round(100.0 / (1.0 + math.exp(-(l0 + confGain * avgShift))))
+                        confidence := math.max(0.0, math.min(100.0, confidence))
+
+                        // 1e2) FEATURE ENGINEERING snapshot — oluşum anındaki bağımsız göstergeler
+                        //      dondurulur (pasif; prediction/target/confidence'ı ETKİLEMEZ).
+                        int feEmaTB = f_binEmaTrend(feEma50, feEma200)
+                        int feSlpB  = f_binEmaSlope(feSlopeAtr)
+                        int feAdxB  = f_binAdx(feAdx)
+                        int feRsiB  = f_binRsi(feRsi)
+                        int feVolB  = f_binVol(feAtrPct)
+                        int feD50B  = f_binDist(atr > 0 ? math.abs(close - feEma50) / atr : na)
+                        int feD200B = f_binDist(atr > 0 ? math.abs(close - feEma200) / atr : na)
+                        float prevHigh = X.kind == -1 ? A.price : X.price
+                        float lastHigh = X.kind == -1 ? C.price : B.price
+                        float prevLow  = X.kind == -1 ? X.price : A.price
+                        float lastLow  = X.kind == -1 ? B.price : C.price
+                        bool  feHH = lastHigh > prevHigh
+                        bool  feHL = lastLow > prevLow
+                        int   feTrB = (feHH and feHL) ? 0 : ((not feHH) and (not feHL)) ? 1 : 2
+                        int feSwB   = f_binSwing(anXaAtr)
+                        int feExB   = f_binVolExp(feAtrExpand)
+                        int feTmB   = f_binTimePiv(bar_index - C.bidx)
+                        int feAgB   = f_binAge(feAdx, feAdxRising)
+
+                        // 1e3) QUALIFICATION V1 (SHADOW) — yalnız GEÇMİŞ (prior-resolved) sayaçlardan
+                        //      sınıflandır. evHit/evFail/evExp bu bar itibarıyla yalnız önceden
+                        //      çözülenleri içerir; bu aday henüz çözülmedi → kendini göremez (lookahead yok).
+                        //      HİÇBİR prediction'ı bastırmaz/değiştirmez (SHADOW).
+                        int qScB = f_scBin(pScore)
+                        int qTdB = f_tdBin(anTDistAtr)
+                        [qSt, qRs, qBt, qBN, qMN, qBase, qCondV, qLiftV, qCov, qJLow] = f_qualify(qScB, qTdB, evHit, evFail, evExp)
+
+                        // 1f) Çizim: kutu, oluştuğu (confirmed C) bardan sağa (Score + Confidence).
+                        PredGroup g = PredGroup.new(array.new<label>(), array.new<box>())
+                        int x1 = bar_index
+                        int x2 = bar_index + projLen
+                        string pSrc = f_cluster_src_and_mark(projs, used, tol, pIdx)
+                        array.push(g.boxes, f_target_box(x1, x2, pLo, pHi, pScore, "D Target", colPrimary, atr, pSrc, confidence))
+                        if showXABC
+                            array.push(g.labels, f_mark(X.bidx, X.price, "X"))
+                            array.push(g.labels, f_mark(A.bidx, A.price, "A"))
+                            array.push(g.labels, f_mark(B.bidx, B.price, "B"))
+                            array.push(g.labels, f_mark(C.bidx, C.price, "C"))
+                        if showSecond
+                            [sIdx, sScore, sLo, sHi, sSupport] = f_best_cluster(projs, used, tol, minSupport)
+                            if sIdx >= 0 and sScore > 0
+                                string sSrc = f_cluster_src_and_mark(projs, used, tol, sIdx)
+                                array.push(g.boxes, f_target_box(x1, x2, sLo, sHi, sScore, "Secondary", colSecond, atr, sSrc, na))
+
+                        // 1g) Snapshot kaydı — asla silinmez/yeniden hesaplanmaz. status = ACTIVE.
+                        PredRec rec = PredRec.new(id = predSeq + 1, creationBar = bar_index, pivotCBar = C.bidx,
+                             direction = dir, targetLow = pLo, targetHigh = pHi, centerPrice = pCenter,
+                             score = pScore, support = pSupport, viz = g,
+                             status = 0, resolvedBar = na, resultPrice = na, barsAlive = na,
+                             invalidationPrice = invalP, creationATR = cATR,
+                             clusterSpread = anSpread, clusterTolerance = tol, normalizedClusterWidth = anNormW,
+                             xaLength = anXaLen, bcLength = anBcLen, xaAtrMultiple = anXaAtr, bcAtrMultiple = anBcAtr,
+                             abXaRatio = anAbXa, bcAbRatio = anBcAb, targetDistance = anTDist,
+                             targetDistanceATR = anTDistAtr, targetDistanceXA = anTDistXa, confidence = confidence,
+                             emaTrendBin = feEmaTB, emaSlopeBin = feSlpB, adxBin = feAdxB, rsiBin = feRsiB,
+                             volBin = feVolB, distE50Bin = feD50B, distE200Bin = feD200B, trendStrBin = feTrB,
+                             swingBin = feSwB, volExpBin = feExB, timePivBin = feTmB, ageBin = feAgB,
+                             qStatus = qSt, qReason = qRs, qBucketType = qBt, qBucketN = qBN, qMarketN = qMN,
+                             qBaseline = qBase, qCond = qCondV, qLift = qLiftV, qCoverage = qCov,
+                             qScBin = qScB, qTdBin = qTdB)
+                        predSeq += 1
+                        array.push(records, rec)
+                        cntCreated += 1
+                        // Qualification (SHADOW) oluşum dağılımı — emisyonu ETKİLEMEZ.
+                        array.set(qCount, qSt, array.get(qCount, qSt) + 1)
+                        // UNKNOWN neden partisyonu (toplam = UNKNOWN adedi). reason 0 = classified.
+                        if qSt == 0
+                            array.set(qUnkReason, qRs, array.get(qUnkReason, qRs) + 1)
+                        // Tanısal: joint kombosu adaya uydu ama seçilemedi (partisyon dışı).
+                        qJointLow += qJLow
+
+                        // 1g2) STRATEGY — onaylı BUY sinyali (C-confirmation) barında long emir.
+                        //      Giriş = sinyal barı kapanışı referansı; gerçek dolum SONRAKİ barın
+                        //      açılışı (Strategy Tester varsayılanı). C tarihsel fiyatından GİRİLMEZ.
+                        if dir == 1
+                            float stEntry  = close                 // sinyal barı kapanışı (referans)
+                            float stStop   = C.price - 0.5 * cATR  // yapısal stop: onaylı C dibinin 0.5*ATR altı
+                            float stTarget = pLo                   // en yakın D küme kenarı (HIT seviyesi)
+                            float stRisk   = stEntry - stStop
+                            float stRew    = stTarget - stEntry
+                            float stRR     = stRisk > 0 ? stRew / stRisk : na
+                            bool modeOk = tradeMode == "All" or (tradeMode == "QUALIFIED only" and qSt == 1) or (tradeMode == "QUALIFIED + WEAK" and (qSt == 1 or qSt == 2))
+                            // Reddet: target<=giriş, stop>=giriş, veya R:R < minRR.
+                            bool geomOk = stTarget > stEntry and stStop < stEntry and not na(stRR) and stRR >= minRR
+                            if modeOk and geomOk and strategy.position_size == 0
+                                float riskCash = strategy.equity * (riskPct / 100.0)
+                                float qty = stRisk > 0 ? riskCash / stRisk : na
+                                if not na(qty) and qty > 0
+                                    strategy.entry("L", strategy.long, qty = qty, alert_message = "HPS BUY entry")
+                                    stActiveStop   := stStop
+                                    stActiveTarget := stTarget
+                                    stSignalBar    := bar_index
+                                    stCbar         := C.bidx
+                                    stCprice       := C.price
+                                    stEntryRef     := stEntry
+                                    stRRrec        := stRR
+                                    stDrew         := false
+
+                        // 1h) Evaluation kaydı: ACTIVE olarak izlemeye al + oluşum sayaçları.
+                        array.push(activeList, rec)
+                        evTotal += 1
+                        int csb  = f_scoreBucket(pScore)
+                        int cspb = f_supBucket(pSupport)
+                        array.set(scCount, csb,  array.get(scCount, csb)  + 1)
+                        array.set(spCount, cspb, array.get(spCount, cspb) + 1)
+
+                        // 1e) Görüntüleme penceresini uygula: yalnızca ÇİZİMLERİ buda.
+                        //     En eski çizim silinir; ilgili KAYIT records içinde kalır.
+                        array.push(drawn, rec)
+                        while array.size(drawn) > maxDrawn
+                            PredRec old = array.shift(drawn)
+                            f_group_delete(old.viz)
+
+// =============================================================================
+// DASHBOARD MANAGER — yerleşim/görünürlük çözümü (tek yer; motorlara dokunmaz).
+// Single Panel: yalnız seçilen view, top_right. Multi Panel: sabit konumlar +
+// panel bazlı toggle. Minimal: yalnız küçük özet panel (top_right).
+// =============================================================================
+bool dSingle  = dashLayout == "Single Panel"
+bool dMulti   = dashLayout == "Multi Panel"
+bool dMinimal = dashLayout == "Minimal"
+bool evShow = dSingle ? dashView == "Evaluation" : dMulti ? mShowEval     : false
+bool cfShow = dSingle ? dashView == "Confidence" : dMulti ? mShowConf     : false
+bool anShow = dSingle ? dashView == "Analytics"  : dMulti ? mShowAnalytic : false
+bool reShow = dSingle ? dashView == "Research"   : dMulti ? mShowResearch : false
+bool dbShow = dSingle ? dashView == "Debug"      : dMulti ? mShowDebug    : false
+
+// =============================================================================
+// DEBUG TABLO (yalnızca son barda güncellenir)
+// =============================================================================
+var table dbg = na
+if dbShow and barstate.islast
+    if na(dbg)
+        dbg := table.new(dSingle ? position.top_right : position.bottom_right, 2, 6, border_width = 1, frame_width = 1, frame_color = color.gray)
+    color hdr = color.new(color.blue, 20)
+    color bg1 = color.new(color.gray, 90)
+    color bg2 = color.new(color.gray, 80)
+    table.cell(dbg, 0, 0, "Prediction Debug", text_color = color.white, bgcolor = hdr, text_size = size.small, text_halign = text.align_left)
+    table.cell(dbg, 1, 0, "", bgcolor = hdr)
+    f_drow(dbg, 1, "Total confirmed XABC",        str.tostring(cntXabc),           bg1)
+    f_drow(dbg, 2, "Total valid clusters",        str.tostring(cntClusters),       bg2)
+    f_drow(dbg, 3, "Total predictions created",   str.tostring(cntCreated),        bg1)
+    f_drow(dbg, 4, "Predictions currently drawn", str.tostring(array.size(drawn)), bg2)
+    f_drow(dbg, 5, "Duplicate predictions skipped", str.tostring(cntDup),          bg1)
+
+// =============================================================================
+// EVALUATION DASHBOARD (sağ üst; yalnızca son barda)
+// =============================================================================
+var table ev = na
+if evShow and barstate.islast
+    if na(ev)
+        ev := table.new(position.top_right, 6, 23, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
+
+    int evActive = array.size(activeList)
+
+    // Başlık
+    table.cell(ev, 0, 0, "PREDICTION EVALUATION", text_color = color.white, bgcolor = EV_TITLE, text_size = size.normal, text_halign = text.align_left)
+    table.cell(ev, 1, 0, "", bgcolor = EV_TITLE)
+    table.cell(ev, 2, 0, "", bgcolor = EV_TITLE)
+    table.cell(ev, 3, 0, "", bgcolor = EV_TITLE)
+    table.cell(ev, 4, 0, "", bgcolor = EV_TITLE)
+    table.cell(ev, 5, 0, "", bgcolor = EV_TITLE)
+
+    // Özet metrikler
+    f_evMetric(ev, 1,  "Total Predictions",      str.tostring(evTotal),                       EV_LEFT, EV_RIGHT)
+    f_evMetric(ev, 2,  "Active",                 str.tostring(evActive),                      EV_ACTIVE, EV_ACTIVE)
+    f_evMetric(ev, 3,  "Hit",                    str.tostring(evHit),                         EV_HIT, EV_HIT)
+    f_evMetric(ev, 4,  "Failed",                 str.tostring(evFail),                        EV_FAIL, EV_FAIL)
+    f_evMetric(ev, 5,  "Expired",                str.tostring(evExp),                         EV_EXP, EV_EXP)
+    f_evMetric(ev, 6,  "Hit Rate",               f_pctS(evHit, evHit + evFail),               EV_LEFT, EV_RIGHT)
+    f_evMetric(ev, 7,  "Overall Success",        f_pctS(evHit, evTotal),                      EV_LEFT, EV_RIGHT)
+    f_evMetric(ev, 8,  "Average Bars To Hit",    f_avgS(evSumHitBars, evHit),                 EV_LEFT, EV_RIGHT)
+    f_evMetric(ev, 9,  "Average Bars To Failure",f_avgS(evSumFailBars, evFail),               EV_LEFT, EV_RIGHT)
+    f_evMetric(ev, 10, "Average Lifetime",       f_avgS(evSumLifeBars, evHit + evFail + evExp), EV_LEFT, EV_RIGHT)
+
+    // Score analysis
+    f_evSection(ev, 11, "SCORE ANALYSIS")
+    f_evAnalyseHdr(ev, 12)
+    f_evAnalyseRow(ev, 13, "Score < 5",  array.get(scCount, 0), array.get(scHit, 0), array.get(scFail, 0), array.get(scExp, 0))
+    f_evAnalyseRow(ev, 14, "5.0 - 5.99", array.get(scCount, 1), array.get(scHit, 1), array.get(scFail, 1), array.get(scExp, 1))
+    f_evAnalyseRow(ev, 15, "6.0 - 6.99", array.get(scCount, 2), array.get(scHit, 2), array.get(scFail, 2), array.get(scExp, 2))
+    f_evAnalyseRow(ev, 16, "Score >= 7", array.get(scCount, 3), array.get(scHit, 3), array.get(scFail, 3), array.get(scExp, 3))
+
+    // Support analysis
+    f_evSection(ev, 17, "SUPPORT ANALYSIS")
+    f_evAnalyseHdr(ev, 18)
+    f_evAnalyseRow(ev, 19, "Support 2",  array.get(spCount, 0), array.get(spHit, 0), array.get(spFail, 0), array.get(spExp, 0))
+    f_evAnalyseRow(ev, 20, "Support 3",  array.get(spCount, 1), array.get(spHit, 1), array.get(spFail, 1), array.get(spExp, 1))
+    f_evAnalyseRow(ev, 21, "Support 4",  array.get(spCount, 2), array.get(spHit, 2), array.get(spFail, 2), array.get(spExp, 2))
+    f_evAnalyseRow(ev, 22, "Support 5+", array.get(spCount, 3), array.get(spHit, 3), array.get(spFail, 3), array.get(spExp, 3))
+
+// =============================================================================
+// PREDICTION ANALYTICS DASHBOARD (sol üst; yalnızca son barda; tek görünüm)
+// =============================================================================
+var table ana = na
+if anShow and barstate.islast
+    if na(ana)
+        ana := table.new(dSingle ? position.top_right : position.bottom_left, 11, 12, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
+
+    int   totRes  = evHit + evFail + evExp
+    float base100 = (evHit + evFail) > 0 ? 100.0 * evHit / (evHit + evFail) : na
+    string baseStr = na(base100) ? "—" : str.tostring(base100, "#.#") + "%"
+
+    // Başlık + bilgi satırı
+    table.cell(ana, 0, 0, "PREDICTION ANALYTICS · " + analyticsView, text_color = color.white, bgcolor = ANA_TITLE, text_size = size.normal, text_halign = text.align_left)
+    for c = 1 to 10
+        table.cell(ana, c, 0, "", bgcolor = ANA_TITLE)
+    table.cell(ana, 0, 1, "Baseline " + baseStr + " · Resolved N " + str.tostring(totRes) + " · minN " + str.tostring(minReliableN), text_color = color.white, bgcolor = ANA_CELL, text_size = size.small, text_halign = text.align_left)
+    for c = 1 to 10
+        table.cell(ana, c, 1, "", bgcolor = ANA_CELL)
+
+    if analyticsView == "Evaluation Summary"
+        f_anMetric(ana, 2, "Total Predictions",  str.tostring(evTotal))
+        f_anMetric(ana, 3, "Active",             str.tostring(array.size(activeList)))
+        f_anMetric(ana, 4, "Hit",                str.tostring(evHit))
+        f_anMetric(ana, 5, "Failed",             str.tostring(evFail))
+        f_anMetric(ana, 6, "Expired",            str.tostring(evExp))
+        f_anMetric(ana, 7, "Resolved Hit Rate",  f_pctS(evHit, evHit + evFail))
+        f_anMetric(ana, 8, "Overall Success",    f_pctS(evHit, totRes))
+    else
+        f_anHeader(ana, 2)
+        if analyticsView == "Score Thresholds"
+            f_anRow(ana, 3, "Score >= 5.0", f_cumFrom(anSc_hit, 1), f_cumFrom(anSc_fail, 1), f_cumFrom(anSc_exp, 1), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 4, "Score >= 5.5", f_cumFrom(anSc_hit, 2), f_cumFrom(anSc_fail, 2), f_cumFrom(anSc_exp, 2), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 5, "Score >= 6.0", f_cumFrom(anSc_hit, 3), f_cumFrom(anSc_fail, 3), f_cumFrom(anSc_exp, 3), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 6, "Score >= 6.5", f_cumFrom(anSc_hit, 4), f_cumFrom(anSc_fail, 4), f_cumFrom(anSc_exp, 4), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 7, "Score >= 7.0", f_cumFrom(anSc_hit, 5), f_cumFrom(anSc_fail, 5), f_cumFrom(anSc_exp, 5), totRes, base100, minReliableN, -1, -1)
+        else if analyticsView == "Support Thresholds"
+            f_anRow(ana, 3, "Support >= 2", f_cumFrom(anSp_hit, 0), f_cumFrom(anSp_fail, 0), f_cumFrom(anSp_exp, 0), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 4, "Support >= 3", f_cumFrom(anSp_hit, 1), f_cumFrom(anSp_fail, 1), f_cumFrom(anSp_exp, 1), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 5, "Support >= 4", f_cumFrom(anSp_hit, 2), f_cumFrom(anSp_fail, 2), f_cumFrom(anSp_exp, 2), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 6, "Support >= 5", f_cumFrom(anSp_hit, 3), f_cumFrom(anSp_fail, 3), f_cumFrom(anSp_exp, 3), totRes, base100, minReliableN, -1, -1)
+        else if analyticsView == "Direction"
+            f_anRow(ana, 3, "Bullish", array.get(anDir_hit, 0), array.get(anDir_fail, 0), array.get(anDir_exp, 0), totRes, base100, minReliableN, array.get(anDir_hitBars, 0), array.get(anDir_failBars, 0))
+            f_anRow(ana, 4, "Bearish", array.get(anDir_hit, 1), array.get(anDir_fail, 1), array.get(anDir_exp, 1), totRes, base100, minReliableN, array.get(anDir_hitBars, 1), array.get(anDir_failBars, 1))
+        else if analyticsView == "Cluster Width"
+            f_anRow(ana, 3, "W <= 0.25",   array.get(anCw_hit, 0), array.get(anCw_fail, 0), array.get(anCw_exp, 0), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 4, "0.25 - 0.50", array.get(anCw_hit, 1), array.get(anCw_fail, 1), array.get(anCw_exp, 1), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 5, "0.50 - 1.00", array.get(anCw_hit, 2), array.get(anCw_fail, 2), array.get(anCw_exp, 2), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 6, "W > 1.00",    array.get(anCw_hit, 3), array.get(anCw_fail, 3), array.get(anCw_exp, 3), totRes, base100, minReliableN, -1, -1)
+        else if analyticsView == "Target Distance"
+            f_anRow(ana, 3, "<= 1 ATR",  array.get(anTd_hit, 0), array.get(anTd_fail, 0), array.get(anTd_exp, 0), totRes, base100, minReliableN, array.get(anTd_hitBars, 0), -1)
+            f_anRow(ana, 4, "1 - 2 ATR", array.get(anTd_hit, 1), array.get(anTd_fail, 1), array.get(anTd_exp, 1), totRes, base100, minReliableN, array.get(anTd_hitBars, 1), -1)
+            f_anRow(ana, 5, "2 - 4 ATR", array.get(anTd_hit, 2), array.get(anTd_fail, 2), array.get(anTd_exp, 2), totRes, base100, minReliableN, array.get(anTd_hitBars, 2), -1)
+            f_anRow(ana, 6, "> 4 ATR",   array.get(anTd_hit, 3), array.get(anTd_fail, 3), array.get(anTd_exp, 3), totRes, base100, minReliableN, array.get(anTd_hitBars, 3), -1)
+        else if analyticsView == "XA Scale"
+            f_anRow(ana, 3, "< 3 ATR",    array.get(anXa_hit, 0), array.get(anXa_fail, 0), array.get(anXa_exp, 0), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 4, "3 - 6 ATR",  array.get(anXa_hit, 1), array.get(anXa_fail, 1), array.get(anXa_exp, 1), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 5, "6 - 10 ATR", array.get(anXa_hit, 2), array.get(anXa_fail, 2), array.get(anXa_exp, 2), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 6, "> 10 ATR",   array.get(anXa_hit, 3), array.get(anXa_fail, 3), array.get(anXa_exp, 3), totRes, base100, minReliableN, -1, -1)
+        else if analyticsView == "BC Ratio"
+            f_anRow(ana, 3, "< 0.382",       array.get(anBc_hit, 0), array.get(anBc_fail, 0), array.get(anBc_exp, 0), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 4, "0.382 - 0.50",  array.get(anBc_hit, 1), array.get(anBc_fail, 1), array.get(anBc_exp, 1), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 5, "0.50 - 0.618",  array.get(anBc_hit, 2), array.get(anBc_fail, 2), array.get(anBc_exp, 2), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 6, "0.618 - 0.786", array.get(anBc_hit, 3), array.get(anBc_fail, 3), array.get(anBc_exp, 3), totRes, base100, minReliableN, -1, -1)
+            f_anRow(ana, 7, "> 0.786",       array.get(anBc_hit, 4), array.get(anBc_fail, 4), array.get(anBc_exp, 4), totRes, base100, minReliableN, -1, -1)
+
+// =============================================================================
+// PREDICTION RESEARCH DASHBOARD (alt orta; yalnızca son barda; tek görünüm)
+// =============================================================================
+var table res = na
+if reShow and barstate.islast
+    if na(res)
+        res := table.new(dSingle ? position.top_right : position.bottom_center, 9, 22, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
+
+    int   totCreated = evTotal
+    int   totRes     = evHit + evFail + evExp
+    float base100    = (evHit + evFail) > 0 ? 100.0 * evHit / (evHit + evFail) : na
+    string baseStr   = na(base100) ? "—" : str.tostring(base100, "#.#") + "%"
+
+    // ---- Tekil aday listesi (paylaşılan kaynak; sayaçları OKUR) ----
+    array<Cand> singles = f_buildSingles()
+
+    // ---- Kombinasyon aday listesi (mevcut kombinasyon sayaçlarından) ----
+    array<Cand> combos = array.new<Cand>()
+    for ci = 0 to array.size(cbFam) - 1
+        array.push(combos, Cand.new(7, ci, f_condLabel(array.get(cbKindA, ci), array.get(cbLvlA, ci)), f_condLabel(array.get(cbKindB, ci), array.get(cbLvlB, ci)), array.get(cbKindA, ci), array.get(cbLvlA, ci), array.get(cbKindB, ci), array.get(cbLvlB, ci), array.get(cbHit, ci), array.get(cbFail, ci), array.get(cbExp, ci)))
+
+    // Başlık + bilgi satırı
+    table.cell(res, 0, 0, "PREDICTION RESEARCH · " + researchView, text_color = color.white, bgcolor = RES_HDR, text_size = size.normal, text_halign = text.align_left)
+    for c = 1 to 8
+        table.cell(res, c, 0, "", bgcolor = RES_HDR)
+    table.cell(res, 0, 1, "Baseline " + baseStr + " · Resolved " + str.tostring(totRes) + " · Çoklu test: sonuçlar KANIT değil, yalnız aday", text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    for c = 1 to 8
+        table.cell(res, c, 1, "", bgcolor = RES_CELL)
+
+    if researchView == "Research Summary"
+        int cntStrong    = 0
+        int cntPromising = 0
+        int cntNegative  = 0
+        int cntLowN      = 0
+        int   bestSingleI  = -1
+        float bestSingleRS = -1.0
+        float highRelLift  = na
+        for i = 0 to array.size(singles) - 1
+            Cand c = array.get(singles, i)
+            int cls = f_classV(c.hit, c.fail, c.exp, base100, minReliableN, minStrongN, coverageFloor, totRes)
+            cntStrong    += cls == 2 ? 1 : 0
+            cntPromising += cls == 1 ? 1 : 0
+            cntNegative  += cls == 3 ? 1 : 0
+            cntLowN      += cls == 4 ? 1 : 0
+            int   n    = c.hit + c.fail + c.exp
+            float lift = f_liftV(c.hit, c.fail, base100)
+            float cov  = f_covV(c.hit, c.fail, c.exp, totRes)
+            if n >= minReliableN and cov >= coverageFloor and not na(lift)
+                highRelLift := na(highRelLift) ? lift : math.max(highRelLift, lift)
+            float rs = f_rScoreV(c.hit, c.fail, c.exp, base100, minStrongN, totRes)
+            if not na(lift) and lift > 0 and rs > bestSingleRS
+                bestSingleRS := rs
+                bestSingleI  := i
+        int   bestComboI  = -1
+        float bestComboRS = -1.0
+        for i = 0 to array.size(combos) - 1
+            Cand c = array.get(combos, i)
+            int   n    = c.hit + c.fail + c.exp
+            float lift = f_liftV(c.hit, c.fail, base100)
+            float cov  = f_covV(c.hit, c.fail, c.exp, totRes)
+            if n >= minReliableN and cov >= coverageFloor and not na(lift) and lift >= 5.0
+                float rs = f_rScoreV(c.hit, c.fail, c.exp, base100, minStrongN, totRes)
+                if rs > bestComboRS
+                    bestComboRS := rs
+                    bestComboI  := i
+        string bestSingleStr = bestSingleI < 0 ? "—" : array.get(singles, bestSingleI).label + " (" + f_liftStr(f_liftV(array.get(singles, bestSingleI).hit, array.get(singles, bestSingleI).fail, base100)) + ")"
+        string bestComboStr  = bestComboI < 0 ? "—" : array.get(combos, bestComboI).label + "&" + array.get(combos, bestComboI).cond2 + " (" + f_liftStr(f_liftV(array.get(combos, bestComboI).hit, array.get(combos, bestComboI).fail, base100)) + ")"
+        float bestCov = bestSingleI < 0 ? na : f_covV(array.get(singles, bestSingleI).hit, array.get(singles, bestSingleI).fail, array.get(singles, bestSingleI).exp, totRes)
+        f_resMetric(res, 2,  "Baseline Hit Rate",     baseStr)
+        f_resMetric(res, 3,  "Total Predictions",     str.tostring(totCreated))
+        f_resMetric(res, 4,  "Resolved Predictions",  str.tostring(totRes))
+        f_resMetric(res, 5,  "Feature candidates",    str.tostring(array.size(singles)))
+        f_resMetric(res, 6,  "Combinations tested",   str.tostring(array.size(combos)))
+        f_resMetric(res, 7,  "Strong / Promising",    str.tostring(cntStrong) + " / " + str.tostring(cntPromising))
+        f_resMetric(res, 8,  "Negative / Low-N",      str.tostring(cntNegative) + " / " + str.tostring(cntLowN))
+        f_resMetric(res, 9,  "Best single feature",   bestSingleStr)
+        f_resMetric(res, 10, "Best combination",      bestComboStr)
+        f_resMetric(res, 11, "Highest reliable lift", f_liftStr(highRelLift))
+        f_resMetric(res, 12, "Coverage of best",      f_pctF(bestCov))
+    else if researchView == "Top Features"
+        f_resHdr9(res, 2, "#", "Feature", "Group", "N", "Hit%", "Lift", "Cov", "RScr", "Class")
+        array<int> top = f_rankSingles(singles, 5, maxPerFamily, base100, totRes, minReliableN, minStrongN, coverageFloor)
+        if array.size(top) > 0
+            for m = 0 to array.size(top) - 1
+                Cand c = array.get(singles, array.get(top, m))
+                int cf = c.fam
+                string famN = f_famName(cf)
+                f_resRow9(res, 3 + m, str.tostring(m + 1), famN, c.label, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
+        if array.size(top) == 0
+            f_resMetric(res, 3, "No positive candidates", "—")
+    else if researchView == "Negative Features"
+        f_resHdr9(res, 2, "", "Feature", "Group", "N", "Hit%", "Lift", "Cov", "RScr", "Class")
+        array<int> neg = f_rankNeg(singles, 5, base100, totRes, minReliableN, coverageFloor)
+        if array.size(neg) > 0
+            for m = 0 to array.size(neg) - 1
+                Cand c = array.get(singles, array.get(neg, m))
+                int cf = c.fam
+                string famN = f_famName(cf)
+                f_resRow9(res, 3 + m, "", famN, c.label, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
+        if array.size(neg) == 0
+            f_resMetric(res, 3, "No reliable negatives", "—")
+    else if researchView == "Top Combinations"
+        f_resHdr9(res, 2, "#", "Cond1", "Cond2", "N", "Hit%", "Lift", "Cov", "RScr", "Class")
+        array<int> topc = f_rankCombos(combos, 5, maxPerFamily, base100, totRes, minReliableN, minStrongN, coverageFloor)
+        if array.size(topc) > 0
+            for m = 0 to array.size(topc) - 1
+                Cand c = array.get(combos, array.get(topc, m))
+                f_resRow9(res, 3 + m, str.tostring(m + 1), c.label, c.cond2, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
+        if array.size(topc) > 0
+            Cand c0 = array.get(combos, array.get(topc, 0))
+            float cLift = f_liftV(c0.hit, c0.fail, base100)
+            [h1, f1, e1] = f_condCounts(c0.kindA, c0.lvlA)
+            [h2, f2, e2] = f_condCounts(c0.kindB, c0.lvlB)
+            float l1 = f_liftV(h1, f1, base100)
+            float l2 = f_liftV(h2, f2, base100)
+            float comp = math.max(na(l1) ? -1000000.0 : l1, na(l2) ? -1000000.0 : l2)
+            float benefit = (na(cLift) or comp <= -1000000.0) ? na : cLift - comp
+            f_resMetric(res, 4 + array.size(topc), "Best Combo Benefit", f_liftStr(benefit))
+        if array.size(topc) == 0
+            f_resMetric(res, 3, "No combos pass guardrails", "—")
+    else if researchView == "Stability"
+        f_resHdr9(res, 2, "Family", "Group", "N", "", "", "Lift", "", "", "Stab")
+        int rr = 3
+        rr := f_resStab(res, rr, 0, "Score",    singles, base100)
+        rr := f_resStab(res, rr, 1, "Support",  singles, base100)
+        rr := f_resStab(res, rr, 4, "TargetD",  singles, base100)
+        rr := f_resStab(res, rr, 3, "ClusterW", singles, base100)
+    else
+        f_resHdr9(res, 2, "#", "Feature", "Group", "N", "Hit%", "Lift", "Cov", "RScr", "Class")
+        array<int> rec = f_rankSingles(singles, 3, maxPerFamily, base100, totRes, minReliableN, minStrongN, coverageFloor)
+        int shown = 0
+        int rrow  = 3
+        if array.size(rec) > 0
+            for m = 0 to array.size(rec) - 1
+                Cand c = array.get(singles, array.get(rec, m))
+                int cls = f_classV(c.hit, c.fail, c.exp, base100, minReliableN, minStrongN, coverageFloor, totRes)
+                if cls == 2 or cls == 1
+                    int cf = c.fam
+                    string famN = f_famName(cf)
+                    f_resRow9(res, rrow, str.tostring(shown + 1), famN, c.label, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
+                    rrow  += 1
+                    shown += 1
+        f_resMetric(res, rrow, "Next step", "Forward test only — do not activate")
+        rrow += 1
+        table.cell(res, 0, rrow, "NOT SUPPORTED", text_color = color.yellow, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_left)
+        for c = 1 to 8
+            table.cell(res, c, rrow, "", bgcolor = RES_SECT)
+        rrow += 1
+        array<int> rej = f_rankNeg(singles, 3, base100, totRes, minReliableN, coverageFloor)
+        if array.size(rej) > 0
+            for m = 0 to array.size(rej) - 1
+                Cand c = array.get(singles, array.get(rej, m))
+                int cf = c.fam
+                string famN = f_famName(cf)
+                f_resRow9(res, rrow, "", famN, c.label, c.hit, c.fail, c.exp, base100, totRes, minReliableN, minStrongN, coverageFloor)
+                rrow += 1
+        if shown == 0 and array.size(rej) == 0
+            f_resMetric(res, rrow, "No candidates", "—")
+
+// =============================================================================
+// CONFIDENCE DASHBOARD (sol üst; yalnızca son barda)
+// =============================================================================
+var table cf = na
+if cfShow and barstate.islast
+    if na(cf)
+        cf := table.new(dSingle ? position.top_right : position.top_left, 8, 17, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
+
+    int   cTotRes = evHit + evFail + evExp
+    float avgConf     = cTotRes > 0 ? cfSumAll / cTotRes : na
+    float avgConfHit  = evHit > 0 ? cfSumHit / evHit : na
+    float avgConfFail = evFail > 0 ? cfSumFail / evFail : na
+    float avgConfExp  = evExp > 0 ? cfSumExp / evExp : na
+
+    // Başlık
+    table.cell(cf, 0, 0, "CONFIDENCE SUMMARY", text_color = color.white, bgcolor = RES_HDR, text_size = size.normal, text_halign = text.align_left)
+    for c = 1 to 7
+        table.cell(cf, c, 0, "", bgcolor = RES_HDR)
+    f_cfMetric(cf, 1, "Average Confidence",       na(avgConf)     ? "—" : str.tostring(avgConf, "#.#"))
+    f_cfMetric(cf, 2, "Avg Confidence of Hits",   na(avgConfHit)  ? "—" : str.tostring(avgConfHit, "#.#"))
+    f_cfMetric(cf, 3, "Avg Confidence of Fails",  na(avgConfFail) ? "—" : str.tostring(avgConfFail, "#.#"))
+    f_cfMetric(cf, 4, "Avg Confidence of Expired",na(avgConfExp)  ? "—" : str.tostring(avgConfExp, "#.#"))
+
+    // Kalibrasyon
+    table.cell(cf, 0, 5, "CALIBRATION", text_color = color.yellow, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_left)
+    for c = 1 to 7
+        table.cell(cf, c, 5, "", bgcolor = RES_SECT)
+    f_cfHdr(cf, 6)
+    f_cfCalRow(cf, 7,  "0-20",   array.get(cfHit, 0), array.get(cfFail, 0), array.get(cfExp, 0), array.get(cfLife, 0))
+    f_cfCalRow(cf, 8,  "20-40",  array.get(cfHit, 1), array.get(cfFail, 1), array.get(cfExp, 1), array.get(cfLife, 1))
+    f_cfCalRow(cf, 9,  "40-60",  array.get(cfHit, 2), array.get(cfFail, 2), array.get(cfExp, 2), array.get(cfLife, 2))
+    f_cfCalRow(cf, 10, "60-80",  array.get(cfHit, 3), array.get(cfFail, 3), array.get(cfExp, 3), array.get(cfLife, 3))
+    f_cfCalRow(cf, 11, "80-100", array.get(cfHit, 4), array.get(cfFail, 4), array.get(cfExp, 4), array.get(cfLife, 4))
+
+    // Reliability
+    table.cell(cf, 0, 12, "RELIABILITY", text_color = color.yellow, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_left)
+    for c = 1 to 7
+        table.cell(cf, c, 12, "", bgcolor = RES_SECT)
+    float corr = na
+    float denomX = cfN * cfSxx - cfSx * cfSx
+    float denomY = cfN * cfSyy - cfSy * cfSy
+    if cfN > 1 and denomX > 0 and denomY > 0
+        corr := (cfN * cfSxy - cfSx * cfSy) / math.sqrt(denomX * denomY)
+    float confLift = (na(avgConfHit) or na(avgConfFail)) ? na : avgConfHit - avgConfFail
+    string scStr = ""
+    for b = 0 to 5
+        int cnt = array.get(anSc_hit, b) + array.get(anSc_fail, b) + array.get(anSc_exp, b)
+        float av = cnt > 0 ? array.get(cfScSum, b) / cnt : na
+        scStr := scStr + (b == 0 ? "" : "/") + (na(av) ? "-" : str.tostring(av, "#"))
+    string spStr = ""
+    for b = 0 to 3
+        int cnt = array.get(anSp_hit, b) + array.get(anSp_fail, b) + array.get(anSp_exp, b)
+        float av = cnt > 0 ? array.get(cfSpSum, b) / cnt : na
+        spStr := spStr + (b == 0 ? "" : "/") + (na(av) ? "-" : str.tostring(av, "#"))
+    f_cfMetric(cf, 13, "Corr(Conf, Success)",    na(corr) ? "—" : str.tostring(corr, "#.##"))
+    f_cfMetric(cf, 14, "Avg Conf Lift (Hit-Fail)", na(confLift) ? "—" : (confLift >= 0 ? "+" : "") + str.tostring(confLift, "#.#"))
+    f_cfMetric(cf, 15, "Avg Conf by Score", scStr)
+    f_cfMetric(cf, 16, "Avg Conf by Support", spStr)
+
+// =============================================================================
+// TABLE LIFECYCLE — görünür olmayan tabloları ekrandan TAMAMEN kaldır (kalıntı yok).
+// =============================================================================
+if barstate.islast
+    if not dbShow and not na(dbg)
+        table.delete(dbg)
+        dbg := na
+    if not evShow and not na(ev)
+        table.delete(ev)
+        ev := na
+    if not anShow and not na(ana)
+        table.delete(ana)
+        ana := na
+    if not reShow and not na(res)
+        table.delete(res)
+        res := na
+    if not cfShow and not na(cf)
+        table.delete(cf)
+        cf := na
+
+// =============================================================================
+// MINIMAL PANEL (yalnız Minimal modda; küçük özet; top_right)
+// =============================================================================
+var table mini = na
+if dMinimal and barstate.islast
+    if na(mini)
+        mini := table.new(position.top_right, 2, 8, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
+    int   mTotRes  = evHit + evFail + evExp
+    float mAvgConf = mTotRes > 0 ? cfSumAll / mTotRes : na
+    float mCorr = na
+    float mDx = cfN * cfSxx - cfSx * cfSx
+    float mDy = cfN * cfSyy - cfSy * cfSy
+    if cfN > 1 and mDx > 0 and mDy > 0
+        mCorr := (cfN * cfSxy - cfSx * cfSy) / math.sqrt(mDx * mDy)
+    array<Cand> mSingles = f_buildSingles()
+    float mBase   = (evHit + evFail) > 0 ? 100.0 * evHit / (evHit + evFail) : na
+    int   mBestI  = -1
+    float mBestRS = -1.0
+    for i = 0 to array.size(mSingles) - 1
+        Cand c = array.get(mSingles, i)
+        float lift = f_liftV(c.hit, c.fail, mBase)
+        float rs   = f_rScoreV(c.hit, c.fail, c.exp, mBase, minStrongN, mTotRes)
+        if not na(lift) and lift > 0 and rs > mBestRS
+            mBestRS := rs
+            mBestI  := i
+    string mBestStr = mBestI < 0 ? "—" : f_famName(array.get(mSingles, mBestI).fam) + " " + array.get(mSingles, mBestI).label
+    table.cell(mini, 0, 0, "SUMMARY", text_color = color.white, bgcolor = RES_HDR, text_size = size.small, text_halign = text.align_left)
+    table.cell(mini, 1, 0, "", bgcolor = RES_HDR)
+    f_drow(mini, 1, "Total Pred",     str.tostring(evTotal),                   RES_CELL)
+    f_drow(mini, 2, "Hit Rate",       f_pctS(evHit, evHit + evFail),           RES_CELL)
+    f_drow(mini, 3, "Overall",        f_pctS(evHit, mTotRes),                  RES_CELL)
+    f_drow(mini, 4, "Active",         str.tostring(array.size(activeList)),    RES_CELL)
+    f_drow(mini, 5, "Avg Conf",       na(mAvgConf) ? "—" : str.tostring(mAvgConf, "#.#"), RES_CELL)
+    f_drow(mini, 6, "Conf Corr",      na(mCorr) ? "—" : str.tostring(mCorr, "#.##"),      RES_CELL)
+    f_drow(mini, 7, "Best Feature",   mBestStr,                                RES_CELL)
+else
+    if not na(mini)
+        table.delete(mini)
+        mini := na
+
+// =============================================================================
+// META RESEARCH EXPORT (pasif; hiçbir motoru/matematiği DEĞİŞTİRMEZ; yalnız OKUR)
+// Research Mode = Export iken tek satırlık standart özet (CSV/JSON) üretir:
+// üstte kopyalanabilir panel (top_center) + Pine Logs'a bir kez log.info.
+// =============================================================================
+var table meta = na
+var bool metaLogged = false
+if researchMode == "Export"
+    if barstate.islast
+        string mSym = syminfo.ticker
+        string mTf  = timeframe.isdaily ? "1D" : timeframe.isweekly ? "1W" : timeframe.ismonthly ? "1M" : (timeframe.isminutes and timeframe.multiplier % 60 == 0) ? (str.tostring(timeframe.multiplier / 60, "#") + "H") : timeframe.isminutes ? (str.tostring(timeframe.multiplier) + "m") : timeframe.period
+        int   xResolved = evHit + evFail + evExp
+        float xBase     = (evHit + evFail) > 0 ? 100.0 * evHit / (evHit + evFail) : na
+        float xOverall  = xResolved > 0 ? 100.0 * evHit / xResolved : na
+        float xCorr = na
+        float xDx = cfN * cfSxx - cfSx * cfSx
+        float xDy = cfN * cfSyy - cfSy * cfSy
+        if cfN > 1 and xDx > 0 and xDy > 0
+            xCorr := (cfN * cfSxy - cfSx * cfSy) / math.sqrt(xDx * xDy)
+        float xAcHit    = evHit  > 0 ? cfSumHit  / evHit  : na
+        float xAcFail   = evFail > 0 ? cfSumFail / evFail : na
+        float xConfLift = (na(xAcHit) or na(xAcFail)) ? na : xAcHit - xAcFail
+        // En iyi tekil feature + score-threshold lift
+        array<Cand> xS = f_buildSingles()
+        array<int> xTop = f_rankSingles(xS, 1, 999, xBase, xResolved, minReliableN, minStrongN, coverageFloor)
+        string xBestSingle = "-"
+        float  xBestSingleLift = na
+        float  xCoverage = na
+        if array.size(xTop) > 0
+            Cand bcd = array.get(xS, array.get(xTop, 0))
+            xBestSingle := bcd.label
+            xBestSingleLift := f_liftV(bcd.hit, bcd.fail, xBase)
+            xCoverage := f_covV(bcd.hit, bcd.fail, bcd.exp, xResolved)
+        float xScThrLift = na
+        for i = 0 to array.size(xS) - 1
+            Cand c = array.get(xS, i)
+            if c.fam == 0 and (c.hit + c.fail + c.exp) >= minReliableN
+                float lf = f_liftV(c.hit, c.fail, xBase)
+                if not na(lf) and (na(xScThrLift) or lf > xScThrLift)
+                    xScThrLift := lf
+        // En iyi kombinasyon
+        array<Cand> xC = array.new<Cand>()
+        for ci = 0 to array.size(cbFam) - 1
+            array.push(xC, Cand.new(7, ci, f_condLabel(array.get(cbKindA, ci), array.get(cbLvlA, ci)), f_condLabel(array.get(cbKindB, ci), array.get(cbLvlB, ci)), array.get(cbKindA, ci), array.get(cbLvlA, ci), array.get(cbKindB, ci), array.get(cbLvlB, ci), array.get(cbHit, ci), array.get(cbFail, ci), array.get(cbExp, ci)))
+        array<int> xTopC = f_rankCombos(xC, 1, 999, xBase, xResolved, minReliableN, minStrongN, coverageFloor)
+        string xBestCombo = "-"
+        float  xBestComboLift = na
+        if array.size(xTopC) > 0
+            Cand ccd = array.get(xC, array.get(xTopC, 0))
+            xBestCombo := ccd.label + " & " + ccd.cond2
+            xBestComboLift := f_liftV(ccd.hit, ccd.fail, xBase)
+        // Ortalama score + confidence (tüm kayıtlar; records[] yalnız OKUNUR)
+        float xSumScore = 0.0
+        float xSumConf  = 0.0
+        int   xRn = array.size(records)
+        if xRn > 0
+            for i = 0 to xRn - 1
+                PredRec rr = array.get(records, i)
+                xSumScore += rr.score
+                xSumConf  += rr.confidence
+        float xAvgScore = xRn > 0 ? xSumScore / xRn : na
+        float xAvgConf  = xRn > 0 ? xSumConf / xRn : na
+        // Qualification V1 (SHADOW) aggregate alanları — APPEND-ONLY (mevcut alanlar değişmez).
+        int   qQ = array.get(qCount, 1)
+        int   qW = array.get(qCount, 2)
+        int   qU = array.get(qCount, 0)
+        int   qR = array.get(qCount, 3)
+        int   qQdec = array.get(qHit, 1) + array.get(qFail, 1)
+        float qQhitRate = qQdec > 0 ? 100.0 * array.get(qHit, 1) / qQdec : na
+        float qQlift    = na(qQhitRate) or na(xBase) ? na : qQhitRate - xBase
+        // PART 5: coverage = sınıflandırılan / toplam = (QUALIFIED+WEAK+REJECTED)/total.
+        int   qClassified = qQ + qW + qR
+        float qQcov     = evTotal > 0 ? 100.0 * qClassified / evTotal : na
+        // UNKNOWN neden partisyonu (export'a dahil; toplam == qU).
+        int   qrMkt = array.get(qUnkReason, 1)
+        int   qrBase = array.get(qUnkReason, 2)
+        int   qrNoB = array.get(qUnkReason, 3)
+        int   qrSgl = array.get(qUnkReason, 4)
+        int   qrCov = array.get(qUnkReason, 5)
+        int   qrOth = array.get(qUnkReason, 6)
+        string qualCsv  = ",SHADOW,Q1," + str.tostring(qQ) + "," + str.tostring(qW) + "," + str.tostring(qU) + "," + str.tostring(qR) + "," + f_n1(qQhitRate) + "," + f_sgn1(qQlift) + "," + f_n1(qQcov) + "," + str.tostring(qrMkt) + "," + str.tostring(qrBase) + "," + str.tostring(qrNoB) + "," + str.tostring(qrSgl) + "," + str.tostring(qrCov) + "," + str.tostring(qrOth) + "," + str.tostring(qJointLow)
+        string qualJson = ',"qualMode":"SHADOW","qualVersion":"Q1","qualQualified":' + str.tostring(qQ) + ',"qualWeak":' + str.tostring(qW) + ',"qualUnknown":' + str.tostring(qU) + ',"qualRejected":' + str.tostring(qR) + ',"qualQualifiedHitRate":' + f_jn(qQhitRate) + ',"qualQualifiedLift":' + f_jn(qQlift) + ',"qualCoverage":' + f_jn(qQcov) + ',"qualUnkMarketLow":' + str.tostring(qrMkt) + ',"qualUnkInvalidBaseline":' + str.tostring(qrBase) + ',"qualUnkNoBucket":' + str.tostring(qrNoB) + ',"qualUnkSingleLow":' + str.tostring(qrSgl) + ',"qualUnkCoverageLow":' + str.tostring(qrCov) + ',"qualUnkOther":' + str.tostring(qrOth) + ',"qualJointLow":' + str.tostring(qJointLow)
+        // Tek satır (CSV / JSON). TÜM string alanlar f_s ile korunur → na propagate ETMEZ.
+        string sSym    = f_s(mSym)
+        string sTf     = f_s(mTf)
+        string sSingle = f_s(xBestSingle)
+        string sCombo  = f_s(xBestCombo)
+        string exportStr = exportFmt == "JSON" ? '{"symbol":"' + sSym + '","timeframe":"' + sTf + '","predictionCount":' + str.tostring(evTotal) + ',"resolvedCount":' + str.tostring(xResolved) + ',"hitRate":' + f_jn(xBase) + ',"overallSuccess":' + f_jn(xOverall) + ',"confidenceCorrelation":' + f_jn(xCorr) + ',"avgConfidenceLift":' + f_jn(xConfLift) + ',"scoreThresholdLift":' + f_jn(xScThrLift) + ',"bestSingleFeature":"' + sSingle + '","bestSingleLift":' + f_jn(xBestSingleLift) + ',"bestCombination":"' + sCombo + '","bestCombinationLift":' + f_jn(xBestComboLift) + ',"coverage":' + f_jn(xCoverage) + ',"avgConfidence":' + f_jn(xAvgConf) + ',"avgScore":' + f_jn(xAvgScore) + qualJson + '}' : sSym + "," + sTf + "," + str.tostring(evTotal) + "," + str.tostring(xResolved) + "," + f_n1(xBase) + "," + f_n1(xOverall) + "," + f_n2(xCorr) + "," + f_sgn1(xConfLift) + "," + f_sgn1(xScThrLift) + "," + sSingle + "," + f_sgn1(xBestSingleLift) + "," + sCombo + "," + f_sgn1(xBestComboLift) + "," + f_n1(xCoverage) + "," + f_n1(xAvgConf) + "," + f_n1(xAvgScore) + qualCsv
+        // Son güvence: her ihtimale karşı exportStr asla na kalmasın.
+        string safeStr = na(exportStr) ? (f_s(mSym) + "," + f_s(mTf) + ",EXPORT_FALLBACK") : exportStr
+        if na(meta)
+            meta := table.new(position.top_center, 1, 2, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
+        table.cell(meta, 0, 0, "META EXPORT (" + exportFmt + ") — kopyala / Pine Logs", text_color = color.white, bgcolor = RES_HDR, text_size = size.small, text_halign = text.align_left)
+        table.cell(meta, 0, 1, safeStr, text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+        if not metaLogged
+            log.info(safeStr)
+            metaLogged := true
+else
+    if not na(meta)
+        table.delete(meta)
+        meta := na
+
+// =============================================================================
+// QUALIFICATION (SHADOW) PANEL — kompakt tanılama; hiçbir prediction'ı değiştirmez.
+// Lift = sınıfın resolved hit-rate'i − TÜM popülasyonun baseline hit-rate'i.
+// =============================================================================
+f_qrow(table t, int r, string lbl, int s, float baseAll) =>
+    int   n   = array.get(qCount, s)
+    int   dec = array.get(qHit, s) + array.get(qFail, s)
+    float hr  = dec > 0 ? 100.0 * array.get(qHit, s) / dec : na
+    float lf  = (na(hr) or na(baseAll)) ? na : hr - baseAll
+    table.cell(t, 0, r, lbl,              text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, str.tostring(n),  text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 2, r, na(hr) ? "—" : str.tostring(hr, "#.#"), text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 3, r, na(lf) ? "—" : (lf >= 0 ? "+" : "") + str.tostring(lf, "#.#"), text_color = color.white, bgcolor = f_liftColor(lf), text_size = size.small, text_halign = text.align_right)
+
+// THRESHOLD-STUDY EXPORT — son barda hâlâ ACTIVE (çözülmemiş) prediction'ları
+// bir kez "A" olarak yaz (walk-forward toplam/coverage paydası eşleşsin diye).
+// Kod A = Active/unresolved (UNKNOWN qualification ile KARIŞTIRILMASIN).
+// Her prediction ya çözümde (status!=0, H/F/E) ya da burada (status==0, A) TAM
+// BİR KEZ yazılır — ikisi karşılıklı dışlayıcı (resolved kayıt status!=0 olur).
+if qStudyExport and barstate.islast
+    int qExpActive = 0
+    if array.size(records) > 0
+        for ri = 0 to array.size(records) - 1
+            PredRec pr = array.get(records, ri)
+            if pr.status == 0
+                qExpActive += 1
+                log.info("QSTUDY," + str.tostring(pr.id) + "," + str.tostring(pr.creationBar) + ",NA,A," + str.tostring(pr.qScBin) + "," + str.tostring(pr.qTdBin))
+    // Heartbeat: HER ZAMAN yazılır (qStudyExport açıkken). log.WARNING kullanılır
+    // çünkü Pine Logs panelinin seviye filtresi "Info"yu gizleyebilir; warning her
+    // filtrede görünür. Bu satırı görüyor ama QSTUDY satırlarını görmüyorsan →
+    // filtre Info'yu gizliyor demektir (paneli "All / Info"ya al). Parser yok sayar.
+    log.warning("QSTUDY_SUMMARY,total=" + str.tostring(array.size(records)) + ",active=" + str.tostring(qExpActive) + ",resolved=" + str.tostring(array.size(records) - qExpActive) + " (QSTUDY satirlari log.info; panel filtresini Info'ya al)")
+
+// UNKNOWN neden satırı: etiket + adet + toplam UNKNOWN içindeki yüzde.
+f_qureason(table t, int r, string lbl, int idx, int unkTot) =>
+    int   n  = array.get(qUnkReason, idx)
+    float pc = unkTot > 0 ? 100.0 * n / unkTot : na
+    table.cell(t, 0, r, lbl,             text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, str.tostring(n), text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 2, r, na(pc) ? "—" : str.tostring(pc, "#.#") + "%", text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(t, 3, r, "", bgcolor = RES_CELL)
+
+var table qtab = na
+if showQual and barstate.islast
+    if na(qtab)
+        qtab := table.new(position.middle_left, 4, 16, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
+    float qBaseAll = (evHit + evFail) > 0 ? 100.0 * evHit / (evHit + evFail) : na
+    int   qU2 = array.get(qCount, 0)
+    int   qClassified2 = array.get(qCount, 1) + array.get(qCount, 2) + array.get(qCount, 3)
+    int   qUnkSum = array.get(qUnkReason, 1) + array.get(qUnkReason, 2) + array.get(qUnkReason, 3) + array.get(qUnkReason, 4) + array.get(qUnkReason, 5) + array.get(qUnkReason, 6)
+    table.cell(qtab, 0, 0, "QUALIFICATION · SHADOW · Q1", text_color = color.white, bgcolor = RES_HDR, text_size = size.small, text_halign = text.align_left)
+    table.cell(qtab, 1, 0, "", bgcolor = RES_HDR)
+    table.cell(qtab, 2, 0, "", bgcolor = RES_HDR)
+    table.cell(qtab, 3, 0, "", bgcolor = RES_HDR)
+    table.cell(qtab, 0, 1, "Class", text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_left)
+    table.cell(qtab, 1, 1, "N",     text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(qtab, 2, 1, "Hit%",  text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(qtab, 3, 1, "Lift",  text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    f_qrow(qtab, 2, "QUALIFIED", 1, qBaseAll)
+    f_qrow(qtab, 3, "WEAK",      2, qBaseAll)
+    f_qrow(qtab, 4, "UNKNOWN",   0, qBaseAll)
+    f_qrow(qtab, 5, "REJECTED",  3, qBaseAll)
+    // PART 5: coverage = sınıflandırılan / toplam = (QUALIFIED+WEAK+REJECTED)/total.
+    table.cell(qtab, 0, 6, "Coverage", text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    table.cell(qtab, 1, 6, evTotal > 0 ? str.tostring(100.0 * qClassified2 / evTotal, "#.#") + "%" : "—", text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(qtab, 2, 6, str.tostring(qClassified2) + "/" + str.tostring(evTotal), text_color = color.gray, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(qtab, 3, 6, "", bgcolor = RES_CELL)
+    // PART 1: UNKNOWN neden partisyonu (toplam == UNKNOWN N; jenerik UNKNOWN yok).
+    table.cell(qtab, 0, 7, "UNKNOWN reasons", text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_left)
+    table.cell(qtab, 1, 7, "N",  text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(qtab, 2, 7, "%",  text_color = color.white, bgcolor = RES_SECT, text_size = size.small, text_halign = text.align_right)
+    table.cell(qtab, 3, 7, "",   bgcolor = RES_SECT)
+    f_qureason(qtab, 8,  "MARKET_SAMPLE_LOW", 1, qU2)
+    f_qureason(qtab, 9,  "INVALID_BASELINE",  2, qU2)
+    f_qureason(qtab, 10, "NO_BUCKET",         3, qU2)
+    f_qureason(qtab, 11, "SINGLE_SAMPLE_LOW", 4, qU2)
+    f_qureason(qtab, 12, "COVERAGE_LOW",      5, qU2)
+    f_qureason(qtab, 13, "OTHER",             6, qU2)
+    // Partisyon bütünlüğü: reason toplamı == UNKNOWN N olmalı (OK/BAD).
+    table.cell(qtab, 0, 14, "sum == UNKNOWN", text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    table.cell(qtab, 1, 14, str.tostring(qUnkSum), text_color = color.white, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(qtab, 2, 14, qUnkSum == qU2 ? "OK" : "BAD", text_color = qUnkSum == qU2 ? color.lime : color.red, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(qtab, 3, 14, "", bgcolor = RES_CELL)
+    // Tanısal (partisyon dışı): joint aday anahtarına uydu ama yetersizdi.
+    table.cell(qtab, 0, 15, "joint matched-low", text_color = color.gray, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_left)
+    table.cell(qtab, 1, 15, str.tostring(qJointLow), text_color = color.gray, bgcolor = RES_CELL, text_size = size.small, text_halign = text.align_right)
+    table.cell(qtab, 2, 15, "", bgcolor = RES_CELL)
+    table.cell(qtab, 3, 15, "", bgcolor = RES_CELL)
+else
+    if not na(qtab)
+        table.delete(qtab)
+        qtab := na
+
+// =============================================================================
+// AÇIKLAMA
+// -----------------------------------------------------------------------------
+// ÜRETİM: her yeni confirmed pivot (yeni C) bar-close event'inde XABC doğrulanır,
+//   XA/BC projeksiyonları hesaplanır, adaptif tolerans + minimum support ile
+//   kümelenir; Primary D Target bulunursa bir SNAPSHOT kayıt (records) yazılır.
+// KALICILIK: records asla silinmez/yeniden hesaplanmaz. Yeni prediction gelince
+//   eski kayıt SİLİNMEZ; yalnızca display modu gerektirirse eski ÇİZİM budanır.
+// GÖRÜNTÜLEME: Latest only (1) / All historical (obje limitli üst sınır) /
+//   Last N predictions (histCount). Mod yalnızca ÇİZİMİ sınırlar; kayıtları,
+//   üretimi veya ileride yapılacak accuracy ölçümünü ETKİLEMEZ.
+// OBJE LİMİTİ: max_boxes_count/max_labels_count = 500. drawn kuyruğu maxDrawn'ı
+//   aşınca en eski ÇİZİM nesneleri silinir (kayıt korunur).
+// DUPLICATE: aynı X-A-B-C bar imzası tekrar üretilmez (atlananlar sayılır).
+// REPAINT YOK: motor yalnızca barstate.isconfirmed'de ilerler; her kutu
+//   oluştuğu (confirmed C) bardan itibaren, x1 = o anki bar_index ile çizilir;
+//   geçmişe gelecek bilgisi taşınmaz; request.security/lookahead yok.
+// =============================================================================
+
+// =============================================================================
+// STRATEGY — pozisyon yönetimi, çizim ve alert'ler (her onaylı barda).
+// Emirler yalnızca yukarıdaki confirmed-bar mantığından doğar; burada açık
+// pozisyon stop/target/timeout ile kapatılır. Lookahead yok: tüm kararlar
+// kapanmış (confirmed) bar verisiyle; dolum bir sonraki açılışta gerçekleşir.
+// =============================================================================
+if barstate.isconfirmed
+    // Açık long için stop/target (OCO) ve süre-durdurma (expiry ile aynı kural).
+    if strategy.position_size > 0
+        strategy.exit("X", from_entry = "L", stop = stActiveStop, limit = stActiveTarget, alert_message = "HPS exit (stop/target)")
+        if bar_index - strategy.opentrades.entry_bar_index(0) >= maxActiveBars
+            strategy.close("L", comment = "timeout", alert_message = "HPS timeout close")
+
+    // Dolum tespiti (poz 0 -> >0): gerçek giriş barı, C->giriş bar farkı, R:R çiz.
+    if strategy.position_size > 0 and strategy.position_size[1] == 0
+        int   fillBar   = strategy.opentrades.entry_bar_index(0)
+        float fillPrice = strategy.opentrades.entry_price(0)
+        int   barsCtoEntry = fillBar - stCbar
+        label.new(fillBar, fillPrice, "ENTRY " + str.tostring(fillPrice, format.mintick) + "\nC->entry " + str.tostring(barsCtoEntry) + " bar\nR:R " + str.tostring(stRRrec, "#.##"), xloc = xloc.bar_index, style = label.style_label_up, color = color.new(color.teal, 0), textcolor = color.white, size = size.small)
+        label.new(stCbar, stCprice, "C " + str.tostring(stCprice, format.mintick), xloc = xloc.bar_index, style = label.style_label_down, color = color.new(color.gray, 20), textcolor = color.white, size = size.tiny)
+        line.new(fillBar, stActiveStop,   fillBar + maxActiveBars, stActiveStop,   xloc = xloc.bar_index, color = color.red,   style = line.style_dashed, width = 1)
+        line.new(fillBar, stActiveTarget, fillBar + maxActiveBars, stActiveTarget, xloc = xloc.bar_index, color = color.green, style = line.style_dashed, width = 1)
+        label.new(fillBar, stActiveStop,   "STOP "   + str.tostring(stActiveStop, format.mintick),   xloc = xloc.bar_index, style = label.style_label_up,   color = color.new(color.red, 30),   textcolor = color.white, size = size.tiny)
+        label.new(fillBar, stActiveTarget, "TARGET " + str.tostring(stActiveTarget, format.mintick), xloc = xloc.bar_index, style = label.style_label_down, color = color.new(color.green, 30), textcolor = color.white, size = size.tiny)
+        alert("HPS BUY entry filled @ " + str.tostring(fillPrice, format.mintick) + " | C->entry " + str.tostring(barsCtoEntry) + " bars | R:R " + str.tostring(stRRrec, "#.##"), alert.freq_once_per_bar)
+
+    // Çıkış tespiti (poz >0 -> 0): sebebi çıkar ve alert üret.
+    if strategy.position_size == 0 and strategy.position_size[1] > 0
+        string why = low <= stActiveStop ? "STOP" : high >= stActiveTarget ? "TARGET" : "TIMEOUT"
+        alert("HPS exit (" + why + ") @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar)
