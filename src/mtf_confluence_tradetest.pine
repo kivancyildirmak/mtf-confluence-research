@@ -39,19 +39,22 @@
 strategy("Harmonic Prediction Strategy", overlay = true, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, pyramiding = 0, initial_capital = 10000, default_qty_type = strategy.fixed, default_qty_value = 1, calc_on_every_tick = false, process_orders_on_close = false, commission_type = strategy.commission.percent, commission_value = 0.04, slippage = 1)
 
 // --- Strategy katmanı input'ları ---
+// VARSAYILANLAR = ÖLÇÜM PRESET'İ: sinyalin HAM edge'ini görmek için filtreler
+// gevşek (All + Market + minRR 0 + minTargetDist 0). Yeterli işlem çıkınca
+// Input'tan sıkabilirsin (Pullback, minRR 2, minTargetDist 1 → yüksek R:R modu).
 grpStrat   = "Strategy"
-tradeMode  = input.string("QUALIFIED + WEAK", "Trade mode", options = ["All", "QUALIFIED only", "QUALIFIED + WEAK"], group = grpStrat, tooltip = "Hangi qStatus'lu sinyaller işleme girer. QUALIFIED=1, WEAK=2 (SHADOW etiketleri; qualification mantığı DEĞİŞMEZ).")
+tradeMode  = input.string("All", "Trade mode", options = ["All", "QUALIFIED only", "QUALIFIED + WEAK"], group = grpStrat, tooltip = "Hangi qStatus'lu sinyaller işleme girer. QUALIFIED=1, WEAK=2 (SHADOW etiketleri; qualification mantığı DEĞİŞMEZ).")
 riskPct    = input.float(1.0, "Risk % of equity per trade", minval = 0.01, maxval = 100.0, step = 0.1, group = grpStrat)
 // Giriş: pivot ~3*ATR yükselince onaylandığından, C-confirmation'da MARKET girmek
-// çok geç/pahalı. Varsayılan PULLBACK: C'ye doğru geri çekilmede limit ile daha
-// iyi fiyat → daha küçük stop → R:R yükselir. Dolmazsa iptal (işlem yok).
-entryMode  = input.string("Pullback", "Entry mode", options = ["Pullback", "Market"], group = grpStrat, tooltip = "Pullback: C'ye geri çekilmede limit emir. Market: sinyal barı kapanışında piyasa (agresif, daha çok dolum ama düşük R:R).")
+// geç/pahalı ama DOLUM garantili; PULLBACK daha iyi fiyat verir ama trendde
+// çoğu zaman dolmaz (işlem sayısı düşer). Ölçüm için varsayılan MARKET.
+entryMode  = input.string("Market", "Entry mode", options = ["Pullback", "Market"], group = grpStrat, tooltip = "Pullback: C'ye geri çekilmede limit emir (az dolum, yüksek R:R). Market: sinyal barı kapanışında piyasa (çok dolum, düşük R:R).")
 pullbackFrac   = input.float(0.5, "Pullback fraction (C->signal)", minval = 0.0, maxval = 0.95, step = 0.05, group = grpStrat, tooltip = "Limit = C + f*(sinyal kapanışı - C). 0=C'de, 0.5=ortada.")
 entryValidBars = input.int(8, "Entry limit valid (bars)", minval = 1, group = grpStrat, tooltip = "Limit bu kadar bar içinde dolmazsa iptal.")
 stopBufferATR  = input.float(0.25, "Stop buffer (× ATR below C)", minval = 0.0, step = 0.05, group = grpStrat, tooltip = "Yapısal stop = C - max(bufferATR*ATR, minStopTicks).")
 minStopTicks   = input.int(5, "Stop buffer min ticks", minval = 0, group = grpStrat)
-minRR      = input.float(2.0, "Minimum R:R", minval = 0.0, step = 0.1, group = grpStrat, tooltip = "entry->stop mesafesine göre hedefe uzaklık bu orandan küçükse işlem reddedilir.")
-minTargetDistATR = input.float(1.0, "Min target distance (× ATR)", minval = 0.0, step = 0.1, group = grpStrat, tooltip = "Giriş D hedefine bu ATR'den yakınsa işlem reddedilir (D'ye çok yakın).")
+minRR      = input.float(0.0, "Minimum R:R", minval = 0.0, step = 0.1, group = grpStrat, tooltip = "entry->stop mesafesine göre hedefe uzaklık bu orandan küçükse işlem reddedilir. Ölçüm için 0; yüksek R:R modu için 2.")
+minTargetDistATR = input.float(0.0, "Min target distance (× ATR)", minval = 0.0, step = 0.1, group = grpStrat, tooltip = "Giriş D hedefine bu ATR'den yakınsa işlem reddedilir. Ölçüm için 0; yüksek R:R modu için 1.")
 maxTradeBars = input.int(15, "Max trade duration (bars)", minval = 1, group = grpStrat, tooltip = "Doldurulan pozisyon bu kadar bar sonra piyasadan kapatılır (evaluation maxActiveBars'tan AYRI).")
 
 // =============================================================================

@@ -74,14 +74,15 @@ chk("structural stop below C with buffer (not fixed 0.5 ATR)",
     "C.price - math.max(stopBufferATR * cATR, minStopTicks * syminfo.mintick)" in strat_text)
 chk("pullback limit entry toward C", "C.price + pullbackFrac * (close - C.price)" in strat_text)
 chk("pullback places a limit order", 'strategy.entry("L", strategy.long, qty = qty, limit = stEntry' in strat_text)
-chk("optional market entry mode retained", 'entryMode  = input.string("Pullback", "Entry mode"' in strat_text)
+chk("entry-mode input offers Pullback + Market (default Market for measurement)",
+    'entryMode  = input.string("Market", "Entry mode"' in strat_text and '["Pullback", "Market"]' in strat_text)
 chk("target = pLo", re.search(r"stTarget\s*=\s*pLo", strat_text) is not None)
 chk("reject: target > entry required", "stTarget > stEntry" in strat_text)
 chk("reject: stop < entry required", "stStop < stEntry" in strat_text)
 chk("reject: R:R >= minRR", "stRR >= minRR" in strat_text)
 chk("reject: entry too close to D (min target distance)",
     "(stTarget - stEntry) >= minTargetDistATR * cATR" in strat_text)
-chk("Minimum R:R input default 2.0", 'input.float(2.0, "Minimum R:R"' in strat_text)
+chk("Minimum R:R input present (default 0.0 = measurement preset)", 'input.float(0.0, "Minimum R:R"' in strat_text)
 chk("risk % sizing from entry-to-stop distance",
     "riskCash / stRisk" in strat_text and "strategy.equity * (riskPct" in strat_text)
 # Pine requires const commission/slippage in the strategy() header (CE10123 if
