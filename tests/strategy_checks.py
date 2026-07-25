@@ -98,7 +98,10 @@ chk("trade timeout at maxTradeBars (separate from evaluation maxActiveBars)",
     "maxTradeBars" in strat_text and "strategy.close_all(" in strat_text and 'input.int(15, "Max trade duration' in strat_text)
 chk("unfilled pullback limit cancelled after entryValidBars",
     'strategy.cancel("L")' in strat_text and "entryValidBars" in strat_text)
-chk("stop/target OCO exit (long+short)", "strategy.exit(" in strat_text and "stop = stActiveStop" in strat_text and "limit = stActiveTarget" in strat_text)
+chk("dual-target scale-out exits (T1 partial + T2/stop, long+short)",
+    "strategy.exit(" in strat_text and "stop = stActiveStop" in strat_text
+    and "limit = stT1" in strat_text and "limit = stT2" in strat_text
+    and "qty_percent = przT1Qty" in strat_text)
 
 # (C2) FADE-at-D (PRZ reversal) method
 chk("method selector Chase-to-D (v1) vs Fade-at-D (PRZ)",
@@ -112,6 +115,23 @@ chk("fade places long/short reversal entries",
     'strategy.entry("L", strategy.long, qty = qty, alert_message = "HPS PRZ long")' in strat_text and
     'strategy.entry("S", strategy.short, qty = qty, alert_message = "HPS PRZ short")' in strat_text)
 chk("arm window disarms if D not reached (armBars)", "(bar_index - przArmBar) > armBars" in strat_text)
+
+# (C3) HARMONIC-PRO: dual fib targets + LONG/SHORT statistics
+chk("T1/T2 fib targets off the D->C leg",
+    "przT1Frac * (przCprice - entryPx)" in strat_text and "przT2Frac * (przCprice - entryPx)" in strat_text)
+chk("T1/T2 fraction + partial-% inputs",
+    'input.float(0.382, "Target1 fraction' in strat_text and 'input.float(0.618, "Target2 fraction' in strat_text
+    and 'input.int(50, "Target1 partial exit %"' in strat_text)
+chk("reached-target tracking for stats", "stReachedT1 :=" in strat_text and "stReachedT2 :=" in strat_text)
+chk("Found/Invalid counted per direction",
+    "array.set(stFound," in strat_text and "array.set(stInvalid," in strat_text)
+chk("T1/T2/Stop outcomes counted per direction",
+    "array.set(stT1cnt," in strat_text and "array.set(stT2cnt," in strat_text and "array.set(stStopCnt," in strat_text)
+chk("LONG/SHORT statistics panel (Found/Invalid/T1/T2/Stop)",
+    '"FADE-at-D STATS"' in strat_text and '"Found"' in strat_text and '"Invalid"' in strat_text
+    and "table.new(position.bottom_right" in strat_text)
+chk("stats helper f_hcell is global (not nested in an if)",
+    any(l.startswith("f_hcell(table t") for l in strat))
 
 # (D) ENTRY IS SIGNAL-DERIVED, NOT HISTORICAL C PRICE
 chk("entry never uses raw historical C price as fill (pullback is C + f*(close-C))",

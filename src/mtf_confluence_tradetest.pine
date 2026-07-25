@@ -66,8 +66,12 @@ grpFade    = "Strategy — Fade-at-D (PRZ)"
 fadeDir    = input.string("Both", "Fade direction", options = ["Both", "Long only", "Short only"], group = grpFade, tooltip = "D yukarıdaysa (bullish pattern) dönüş SHORT; D aşağıdaysa (bearish) dönüş LONG. Long only = yalnız aşağı-D setuplarında AL.")
 armBars    = input.int(40, "Arm window (bars) to reach D", minval = 1, group = grpFade, tooltip = "Projekte D bu kadar bar içinde fiyata değmezse setup iptal.")
 przStopATR = input.float(0.5, "PRZ stop buffer (× ATR beyond D)", minval = 0.0, step = 0.1, group = grpFade, tooltip = "Stop, D bölgesinin karşı kenarının bu kadar ATR ötesine konur (bölge kırılırsa pattern geçersiz).")
-przTargetMode = input.string("Fixed R", "PRZ target", options = ["Fixed R", "Retrace to C"], group = grpFade, tooltip = "Fixed R: risk*R kadar hedef. Retrace to C: hedef C pivot fiyatı.")
-przTargetR = input.float(1.5, "PRZ target R (Fixed R)", minval = 0.1, step = 0.1, group = grpFade)
+// Harmonic Patterns Pro tarzı ÇİFT HEDEF: D→C bacağının fib geri çekilmeleri.
+// T1 = D + f1*(C-D), T2 = D + f2*(C-D). Long'da C yukarıda → hedefler yukarı;
+// short'ta C aşağıda → hedefler aşağı (aynı formül iki yön için çalışır).
+przT1Frac = input.float(0.382, "Target1 fraction (D->C)", minval = 0.05, maxval = 3.0, step = 0.01, group = grpFade)
+przT2Frac = input.float(0.618, "Target2 fraction (D->C)", minval = 0.05, maxval = 3.0, step = 0.01, group = grpFade)
+przT1Qty  = input.int(50, "Target1 partial exit %", minval = 1, maxval = 99, group = grpFade, tooltip = "T1'de pozisyonun bu yüzdesi kapatılır; kalan T2/stop/timeout.")
 
 // =============================================================================
 // Girdiler
@@ -867,6 +871,16 @@ var bool  stPending      = false // bekleyen (henüz dolmamış) limit emir var 
 var int   stOrderBar     = na   // limit emrin verildiği bar (iptal penceresi için)
 var float stLimitPx      = na   // pullback limit fiyatı (giriş referansı)
 var bool  stIsLong       = true  // aktif pozisyon long mu (çıkış sebebi çıkarımı için)
+var float stT1           = na    // Target1 fiyatı (kısmi çıkış)
+var float stT2           = na    // Target2 fiyatı (kalan)
+var bool  stReachedT1    = false // aktif işlemde T1'e değildi mi
+var bool  stReachedT2    = false // aktif işlemde T2'ye değildi mi
+// --- LONG/SHORT istatistik sayaçları (index 0=LONG, 1=SHORT) — Harmonic Pro tablosu ---
+var array<int> stFound   = array.from(0, 0)  // armed setup sayısı
+var array<int> stInvalid = array.from(0, 0)  // armed ama dolmadan iptal (arm penceresi doldu)
+var array<int> stT1cnt   = array.from(0, 0)  // T1'e ulaşan işlem
+var array<int> stT2cnt   = array.from(0, 0)  // T2'ye ulaşan işlem
+var array<int> stStopCnt = array.from(0, 0)  // T1'e ulaşmadan kapanan (stop/timeout)
 // --- Fade-at-D (PRZ) tek-slot armed setup ---
 var bool  przArmed       = false // bekleyen (fiyatın D'ye ulaşmasını beklediğimiz) setup var mı
 var float przLo          = na    // D bölgesi alt kenarı
@@ -1810,6 +1824,10 @@ if barstate.isconfirmed
                             // pattern dir==1 → D yukarıda → dönüş SHORT ; dir==-1 → D aşağıda → dönüş LONG
                             bool dirAllowed = (dir == 1 and (fadeDir == "Both" or fadeDir == "Short only")) or (dir == -1 and (fadeDir == "Both" or fadeDir == "Long only"))
                             if dirAllowed
+                                // Eğer önceki armed setup dolmadan yenisi geliyorsa: eskisi geçersiz (Invalid).
+                                if przArmed
+                                    int prevIdx = przPatDir == -1 ? 0 : 1
+                                    array.set(stInvalid, prevIdx, array.get(stInvalid, prevIdx) + 1)
                                 przArmed  := true
                                 przLo     := pLo
                                 przHi     := pHi
@@ -1818,6 +1836,9 @@ if barstate.isconfirmed
                                 przCbar   := C.bidx
                                 przATR    := cATR
                                 przArmBar := bar_index
+                                // Found: reversal yönü (dir==-1 → LONG idx0 ; dir==1 → SHORT idx1)
+                                int foundIdx = dir == -1 ? 0 : 1
+                                array.set(stFound, foundIdx, array.get(stFound, foundIdx) + 1)
                         if stratMethod == "Chase-to-D (v1)" and dir == 1
                             // Giriş fiyatı: PULLBACK ise C'ye geri çekilmede limit; MARKET ise
                             // sinyal kapanışı. Her iki durumda da C tarihsel fiyatından GİRİLMEZ.
@@ -1844,6 +1865,10 @@ if barstate.isconfirmed
                                         strategy.entry("L", strategy.long, qty = qty, alert_message = "HPS BUY market")
                                     stActiveStop   := stStop
                                     stActiveTarget := stTarget
+                                    stT1           := stTarget   // v1: tek hedef → T1=T2=pLo
+                                    stT2           := stTarget
+                                    stReachedT1    := false
+                                    stReachedT2    := false
                                     stSignalBar    := bar_index
                                     stCbar         := C.bidx
                                     stCprice       := C.price
@@ -2523,6 +2548,9 @@ if barstate.isconfirmed
     //   pattern dir==-1 → D aşağıda → fiyat aşağı inip bölgeye girer (low<=przHi)  → LONG
     if stratMethod == "Fade-at-D (PRZ)" and przArmed and strategy.position_size == 0
         if not na(przArmBar) and (bar_index - przArmBar) > armBars
+            // Arm penceresi doldu, fiyat D'ye değmedi → setup geçersiz (Invalid).
+            int invIdx = przPatDir == -1 ? 0 : 1
+            array.set(stInvalid, invIdx, array.get(stInvalid, invIdx) + 1)
             przArmed := false
         else
             bool touchShort = przPatDir == 1 and high >= przLo
@@ -2532,9 +2560,11 @@ if barstate.isconfirmed
                 float entryPx = close
                 float stopPx  = goLong ? (przLo - przStopATR * przATR) : (przHi + przStopATR * przATR)
                 float riskD   = math.abs(entryPx - stopPx)
-                float tgtPx   = przTargetMode == "Retrace to C" ? przCprice : (goLong ? entryPx + przTargetR * riskD : entryPx - przTargetR * riskD)
-                bool  okLong  = goLong and tgtPx > entryPx and stopPx < entryPx
-                bool  okShort = (not goLong) and tgtPx < entryPx and stopPx > entryPx
+                // Çift hedef: D→C bacağının fib geri çekilmeleri (her iki yön için tek formül).
+                float t1Px    = entryPx + przT1Frac * (przCprice - entryPx)
+                float t2Px    = entryPx + przT2Frac * (przCprice - entryPx)
+                bool  okLong  = goLong and t1Px > entryPx and t2Px > entryPx and stopPx < entryPx
+                bool  okShort = (not goLong) and t1Px < entryPx and t2Px < entryPx and stopPx > entryPx
                 if riskD > 0 and (okLong or okShort)
                     float qty = (strategy.equity * (riskPct / 100.0)) / riskD
                     if qty > 0
@@ -2543,36 +2573,103 @@ if barstate.isconfirmed
                         else
                             strategy.entry("S", strategy.short, qty = qty, alert_message = "HPS PRZ short")
                         stActiveStop   := stopPx
-                        stActiveTarget := tgtPx
+                        stT1           := t1Px
+                        stT2           := t2Px
+                        stActiveTarget := t2Px           // final hedef = T2
+                        stReachedT1    := false
+                        stReachedT2    := false
                         stCbar         := przCbar
                         stCprice       := przCprice
                         stEntryRef     := entryPx
-                        stRRrec        := math.abs(tgtPx - entryPx) / riskD
+                        stRRrec        := math.abs(t2Px - entryPx) / riskD
                         stIsLong       := goLong
                         stPending      := false
                         przArmed       := false
 
-    // Açık pozisyon: stop/target (OCO; long ve short) ve süre-durdurma (maxTradeBars).
+    // Açık pozisyon: T1'de kısmi çıkış + T2/stop (OCO) + süre-durdurma (maxTradeBars).
     if strategy.position_size != 0
-        strategy.exit("XL", from_entry = "L", stop = stActiveStop, limit = stActiveTarget, alert_message = "HPS exit (stop/target)")
-        strategy.exit("XS", from_entry = "S", stop = stActiveStop, limit = stActiveTarget, alert_message = "HPS exit (stop/target)")
+        strategy.exit("T1L", from_entry = "L", qty_percent = przT1Qty, limit = stT1, stop = stActiveStop, alert_message = "HPS T1 (long)")
+        strategy.exit("T2L", from_entry = "L", limit = stT2, stop = stActiveStop, alert_message = "HPS T2/stop (long)")
+        strategy.exit("T1S", from_entry = "S", qty_percent = przT1Qty, limit = stT1, stop = stActiveStop, alert_message = "HPS T1 (short)")
+        strategy.exit("T2S", from_entry = "S", limit = stT2, stop = stActiveStop, alert_message = "HPS T2/stop (short)")
+        // Hedeflere ulaşım takibi (istatistik için).
+        if stIsLong
+            stReachedT1 := stReachedT1 or high >= stT1
+            stReachedT2 := stReachedT2 or high >= stT2
+        else
+            stReachedT1 := stReachedT1 or low <= stT1
+            stReachedT2 := stReachedT2 or low <= stT2
         if bar_index - strategy.opentrades.entry_bar_index(0) >= maxTradeBars
             strategy.close_all(comment = "timeout", alert_message = "HPS timeout close")
 
-    // Dolum tespiti (poz 0 -> !=0): giriş, C->giriş bar farkı, R:R, stop/target çiz.
+    // Dolum tespiti (poz 0 -> !=0): giriş, C->giriş bar farkı, R:R, Entry/T1/T2/Stop çiz.
     if strategy.position_size != 0 and strategy.position_size[1] == 0
         stPending := false
         int    fillBar   = strategy.opentrades.entry_bar_index(0)
         float  fillPrice = strategy.opentrades.entry_price(0)
         int    barsCtoEntry = fillBar - stCbar
         string dirTag = stIsLong ? "LONG" : "SHORT"
+        int    xr = fillBar + maxTradeBars
         label.new(fillBar, fillPrice, dirTag + " " + str.tostring(fillPrice, format.mintick) + "\nC->entry " + str.tostring(barsCtoEntry) + " bar\nR:R " + str.tostring(stRRrec, "#.##"), xloc = xloc.bar_index, style = stIsLong ? label.style_label_up : label.style_label_down, color = color.new(stIsLong ? color.teal : color.maroon, 0), textcolor = color.white, size = size.small)
         label.new(stCbar, stCprice, "C " + str.tostring(stCprice, format.mintick), xloc = xloc.bar_index, style = label.style_label_left, color = color.new(color.gray, 20), textcolor = color.white, size = size.tiny)
-        line.new(fillBar, stActiveStop,   fillBar + maxTradeBars, stActiveStop,   xloc = xloc.bar_index, color = color.red,   style = line.style_dashed, width = 1)
-        line.new(fillBar, stActiveTarget, fillBar + maxTradeBars, stActiveTarget, xloc = xloc.bar_index, color = color.green, style = line.style_dashed, width = 1)
-        alert("HPS " + dirTag + " filled @ " + str.tostring(fillPrice, format.mintick) + " | R:R " + str.tostring(stRRrec, "#.##"), alert.freq_once_per_bar)
+        line.new(fillBar, stActiveStop, xr, stActiveStop, xloc = xloc.bar_index, color = color.red,   style = line.style_dashed, width = 1)
+        line.new(fillBar, stT1,         xr, stT1,         xloc = xloc.bar_index, color = color.new(color.green, 40), style = line.style_dashed, width = 1)
+        line.new(fillBar, stT2,         xr, stT2,         xloc = xloc.bar_index, color = color.green, style = line.style_dashed, width = 1)
+        line.new(fillBar, fillPrice,    xr, fillPrice,    xloc = xloc.bar_index, color = color.new(color.gray, 40), style = line.style_dotted, width = 1)
+        label.new(xr, stActiveStop, "Stop " + str.tostring(stActiveStop, format.mintick), xloc = xloc.bar_index, style = label.style_none, textcolor = color.red, size = size.tiny)
+        label.new(xr, stT1, "T1 " + str.tostring(stT1, format.mintick), xloc = xloc.bar_index, style = label.style_none, textcolor = color.green, size = size.tiny)
+        label.new(xr, stT2, "T2 " + str.tostring(stT2, format.mintick), xloc = xloc.bar_index, style = label.style_none, textcolor = color.green, size = size.tiny)
+        alert("HPS " + dirTag + " filled @ " + str.tostring(fillPrice, format.mintick) + " | T1 " + str.tostring(stT1, format.mintick) + " T2 " + str.tostring(stT2, format.mintick) + " | R:R " + str.tostring(stRRrec, "#.##"), alert.freq_once_per_bar)
 
-    // Çıkış tespiti (poz !=0 -> 0): sebebi (long/short'a göre) çıkar ve alert üret.
+    // Çıkış tespiti (poz !=0 -> 0): istatistik say (T1/T2/Stop) ve alert.
     if strategy.position_size == 0 and strategy.position_size[1] != 0
-        string why = stIsLong ? (low <= stActiveStop ? "STOP" : high >= stActiveTarget ? "TARGET" : "TIMEOUT") : (high >= stActiveStop ? "STOP" : low <= stActiveTarget ? "TARGET" : "TIMEOUT")
+        int oi = stIsLong ? 0 : 1
+        if stReachedT1
+            array.set(stT1cnt, oi, array.get(stT1cnt, oi) + 1)
+        if stReachedT2
+            array.set(stT2cnt, oi, array.get(stT2cnt, oi) + 1)
+        if not stReachedT1
+            array.set(stStopCnt, oi, array.get(stStopCnt, oi) + 1)
+        string why = stReachedT2 ? "T2" : stReachedT1 ? "T1" : "STOP/TIMEOUT"
         alert("HPS exit (" + why + ") @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar)
+
+// =============================================================================
+// HARMONIC-PRO STATISTICS PANEL — Fade-at-D setup dağılımı (LONG/SHORT).
+// Found = armed setup, Invalid = D'ye değmeden iptal, T1/T2 = hedeflere ulaşan
+// işlem, Stop = T1'e ulaşmadan kapanan. Yalnız görüntü; trade'i ETKİLEMEZ.
+// =============================================================================
+f_hcell(table t, int c, int r, string s, color bg, color tc) =>
+    table.cell(t, c, r, s, text_color = tc, bgcolor = bg, text_size = size.small, text_halign = text.align_right)
+
+var table hpsTab = na
+if barstate.islast and stratMethod == "Fade-at-D (PRZ)"
+    if na(hpsTab)
+        hpsTab := table.new(position.bottom_right, 6, 4, border_width = 1, frame_width = 1, frame_color = color.rgb(70, 70, 70))
+    color hd = color.new(color.blue, 60)
+    f_hcell(hpsTab, 0, 0, "FADE-at-D STATS", hd, color.white)
+    f_hcell(hpsTab, 1, 0, "Found", hd, color.white)
+    f_hcell(hpsTab, 2, 0, "Invalid", hd, color.white)
+    f_hcell(hpsTab, 3, 0, "T1", hd, color.white)
+    f_hcell(hpsTab, 4, 0, "T2", hd, color.white)
+    f_hcell(hpsTab, 5, 0, "Stop", hd, color.white)
+    color lg = color.new(color.teal, 85)
+    f_hcell(hpsTab, 0, 1, "LONG", color.new(color.teal, 70), color.white)
+    f_hcell(hpsTab, 1, 1, str.tostring(array.get(stFound, 0)),   lg, color.white)
+    f_hcell(hpsTab, 2, 1, str.tostring(array.get(stInvalid, 0)), lg, color.white)
+    f_hcell(hpsTab, 3, 1, str.tostring(array.get(stT1cnt, 0)),   lg, color.white)
+    f_hcell(hpsTab, 4, 1, str.tostring(array.get(stT2cnt, 0)),   lg, color.white)
+    f_hcell(hpsTab, 5, 1, str.tostring(array.get(stStopCnt, 0)), lg, color.white)
+    color sh = color.new(color.maroon, 80)
+    f_hcell(hpsTab, 0, 2, "SHORT", color.new(color.maroon, 60), color.white)
+    f_hcell(hpsTab, 1, 2, str.tostring(array.get(stFound, 1)),   sh, color.white)
+    f_hcell(hpsTab, 2, 2, str.tostring(array.get(stInvalid, 1)), sh, color.white)
+    f_hcell(hpsTab, 3, 2, str.tostring(array.get(stT1cnt, 1)),   sh, color.white)
+    f_hcell(hpsTab, 4, 2, str.tostring(array.get(stT2cnt, 1)),   sh, color.white)
+    f_hcell(hpsTab, 5, 2, str.tostring(array.get(stStopCnt, 1)), sh, color.white)
+    color tb = color.new(color.gray, 50)
+    f_hcell(hpsTab, 0, 3, "TOTAL", tb, color.white)
+    f_hcell(hpsTab, 1, 3, str.tostring(array.get(stFound, 0) + array.get(stFound, 1)),     tb, color.white)
+    f_hcell(hpsTab, 2, 3, str.tostring(array.get(stInvalid, 0) + array.get(stInvalid, 1)), tb, color.white)
+    f_hcell(hpsTab, 3, 3, str.tostring(array.get(stT1cnt, 0) + array.get(stT1cnt, 1)),     tb, color.white)
+    f_hcell(hpsTab, 4, 3, str.tostring(array.get(stT2cnt, 0) + array.get(stT2cnt, 1)),     tb, color.white)
+    f_hcell(hpsTab, 5, 3, str.tostring(array.get(stStopCnt, 0) + array.get(stStopCnt, 1)), tb, color.white)
