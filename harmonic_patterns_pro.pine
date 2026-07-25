@@ -1,0 +1,376 @@
+//@version=6
+// =============================================================================
+//  Harmonic Patterns Pro (Open)
+//  Inspired by LonesomeTheBlue's "Harmonic Patterns" / "Harmonic Patterns Pro".
+//  Detects XABCD harmonic patterns from ZigZag pivots using Fibonacci ratios
+//  with a configurable error tolerance (validation zone).
+//
+//  Features:
+//   - ZigZag based X-A-B-C-D pivot detection
+//   - 9 patterns: Gartley, Butterfly, Bat, Alternate Bat, Crab, Deep Crab,
+//     Shark, Cypher, AB=CD  (each pattern has its own colour)
+//   - Entry / Target1 / Target2 / Stop-loss levels for the latest setup
+//   - Validation (PRZ) zone box for the latest setup
+//   - Long/Short statistics table (Found / Invalid / Target1 / Target2 / Stop)
+//     filled by tracking each detected setup to its outcome
+//   - ZigZag drawing + alerts
+// =============================================================================
+indicator("Harmonic Patterns Pro (Open)", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// ============================ Inputs =========================================
+grpZ = "ZigZag"
+prd         = input.int(6, "ZigZag Period", minval = 2, group = grpZ)
+err_allowed = input.float(8.0, "Error Rate %", minval = 0.0, maxval = 30.0, group = grpZ) / 100.0
+showZigzag  = input.bool(false, "Show ZigZag", group = grpZ)
+zzcol       = input.color(color.new(color.gray, 20), "ZigZag Colour", group = grpZ)
+
+grpP = "Patterns"
+useGartley  = input.bool(true, "Gartley",       group = grpP)
+useButter   = input.bool(true, "Butterfly",     group = grpP)
+useBat      = input.bool(true, "Bat",           group = grpP)
+useAltBat   = input.bool(true, "Alternate Bat", group = grpP)
+useCrab     = input.bool(true, "Crab",          group = grpP)
+useDeepCrab = input.bool(true, "Deep Crab",     group = grpP)
+useShark    = input.bool(true, "Shark",         group = grpP)
+useCypher   = input.bool(true, "Cypher",        group = grpP)
+useABCD     = input.bool(true, "AB=CD",         group = grpP)
+
+grpD = "Display"
+showLabels    = input.bool(true,  "Show Pattern Lines & XABCD",        group = grpD)
+showRatios    = input.bool(true,  "Show Fib Ratios",                   group = grpD)
+showHarmonic  = input.bool(true,  "Show Harmonic (XB/BD) Lines",       group = grpD)
+showLevels    = input.bool(true,  "Show Entry/Target/Stop Levels",     group = grpD)
+showZone      = input.bool(true,  "Show Validation Zone",              group = grpD)
+showStats     = input.bool(true,  "Show Statistics Table",             group = grpD)
+tablePos      = input.string("Top Right", "Table Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right"], group = grpD)
+rightBars     = input.int(30, "Level Line Length (bars)", minval = 5, group = grpD)
+
+grpL = "Levels (Fib of A-D leg)"
+t1f = input.float(0.382, "Target 1", step = 0.001, group = grpL)
+t2f = input.float(0.618, "Target 2", step = 0.001, group = grpL)
+slf = input.float(0.236, "Stop-loss", step = 0.001, group = grpL)
+
+grpC = "Pattern Colours"
+cGartley  = input.color(color.new(#26a69a, 0), "Gartley",       group = grpC)
+cButter   = input.color(color.new(#ef5350, 0), "Butterfly",     group = grpC)
+cBat      = input.color(color.new(#42a5f5, 0), "Bat",           group = grpC)
+cAltBat   = input.color(color.new(#7e57c2, 0), "Alternate Bat", group = grpC)
+cCrab     = input.color(color.new(#ffa726, 0), "Crab",          group = grpC)
+cDeepCrab = input.color(color.new(#ec407a, 0), "Deep Crab",     group = grpC)
+cShark    = input.color(color.new(#26c6da, 0), "Shark",         group = grpC)
+cCypher   = input.color(color.new(#9ccc65, 0), "Cypher",        group = grpC)
+cABCD     = input.color(color.new(#bdbdbd, 0), "AB=CD",         group = grpC)
+
+// ======================= Pattern meta (index 0..8) ===========================
+var array<string> pNames  = array.from("Gartley", "Butterfly", "Bat", "Alternate Bat", "Crab", "Deep Crab", "Shark", "Cypher", "AB=CD")
+var array<color>  pColors = array.from(cGartley, cButter, cBat, cAltBat, cCrab, cDeepCrab, cShark, cCypher, cABCD)
+var array<bool>   pUse    = array.from(useGartley, useButter, useBat, useAltBat, useCrab, useDeepCrab, useShark, useCypher, useABCD)
+
+// ============================ ZigZag =========================================
+// zp[0] / zb[0] = most recent pivot. Keeps up to 6 alternating pivots.
+var array<float> zp   = array.new<float>()
+var array<int>   zb   = array.new<int>()
+var int          zdir = 0
+
+// Adds/updates a pivot. Arrays are mutated in place; returns [newDir, isNewPivot]
+addPivot(array<float> pArr, array<int> bArr, int curdir, float val, int bidx, int pdir) =>
+    newdir = curdir
+    isNew  = false
+    if array.size(pArr) == 0
+        array.unshift(pArr, val)
+        array.unshift(bArr, bidx)
+        newdir := pdir
+    else
+        if curdir == pdir
+            prev = array.get(pArr, 0)
+            if (pdir == 1 and val > prev) or (pdir == -1 and val < prev)
+                array.set(pArr, 0, val)
+                array.set(bArr, 0, bidx)
+        else
+            array.unshift(pArr, val)
+            array.unshift(bArr, bidx)
+            newdir := pdir
+            isNew  := true
+            if array.size(pArr) > 6
+                array.pop(pArr)
+                array.pop(bArr)
+    [newdir, isNew]
+
+ph = ta.pivothigh(prd, prd)
+pl = ta.pivotlow(prd, prd)
+
+newPivot = false
+if not na(ph)
+    [nd, isn] = addPivot(zp, zb, zdir, ph, bar_index[prd], 1)
+    zdir     := nd
+    newPivot := newPivot or isn
+if not na(pl)
+    [nd2, isn2] = addPivot(zp, zb, zdir, pl, bar_index[prd], -1)
+    zdir     := nd2
+    newPivot := newPivot or isn2
+
+// draw zigzag leg when a new pivot is confirmed
+if showZigzag and newPivot and array.size(zp) >= 2
+    line.new(array.get(zb, 1), array.get(zp, 1), array.get(zb, 0), array.get(zp, 0), xloc = xloc.bar_index, color = zzcol, width = 1)
+
+// ============================ Statistics =====================================
+// columns: 0 Found | 1 Invalid | 2 Target1 | 3 Target2 | 4 Stop-loss
+var matrix<int> statL = matrix.new<int>(9, 5, 0)
+var matrix<int> statS = matrix.new<int>(9, 5, 0)
+
+incStat(int d, int pid, int col) =>
+    if d == 1
+        matrix.set(statL, pid, col, matrix.get(statL, pid, col) + 1)
+    else
+        matrix.set(statS, pid, col, matrix.get(statS, pid, col) + 1)
+
+// pending setups being tracked to their outcome
+var array<int>   pt_pid = array.new<int>()
+var array<int>   pt_dir = array.new<int>()
+var array<float> pt_t1  = array.new<float>()
+var array<float> pt_t2  = array.new<float>()
+var array<float> pt_sl  = array.new<float>()
+var array<bool>  pt_r1  = array.new<bool>()
+
+// ===================== Ratio / detection helpers =============================
+// widen [lo,hi] by the allowed error on both sides
+inr(float v, float lo, float hi) =>
+    not na(v) and v >= lo * (1 - err_allowed) and v <= hi * (1 + err_allowed)
+
+// ============================ Detection ======================================
+color firstColor = na
+string foundNames = ""
+bool   foundBull  = false
+bool   anyMatch   = false
+
+// transient drawings (latest setup only)
+var array<line>  lvlLines = array.new<line>()
+var array<label> lvlLabs  = array.new<label>()
+var array<box>   lvlBoxes = array.new<box>()
+
+if newPivot and array.size(zp) >= 5
+    d  = array.get(zp, 0)
+    c  = array.get(zp, 1)
+    b  = array.get(zp, 2)
+    a  = array.get(zp, 3)
+    x  = array.get(zp, 4)
+    db = array.get(zb, 0)
+    cb = array.get(zb, 1)
+    bb = array.get(zb, 2)
+    ab = array.get(zb, 3)
+    xb = array.get(zb, 4)
+    isBull = zdir == -1  // most recent pivot D is a low -> bullish reversal expected
+
+    denXA = math.abs(x - a)
+    denAB = math.abs(a - b)
+    denBC = math.abs(b - c)
+
+    if denXA > 0 and denAB > 0 and denBC > 0
+        xab = math.abs(b - a) / denXA
+        xad = math.abs(a - d) / denXA
+        abc = math.abs(b - c) / denAB
+        bcd = math.abs(c - d) / denBC
+
+        isGartley  = inr(xab, 0.500, 0.618) and inr(abc, 0.382, 0.886) and inr(bcd, 1.130, 2.618) and inr(xad, 0.750, 0.875)
+        isButter   = inr(xab, 0.700, 0.860) and inr(abc, 0.382, 0.886) and inr(bcd, 1.618, 2.618) and inr(xad, 1.270, 1.618)
+        isBat      = inr(xab, 0.382, 0.500) and inr(abc, 0.382, 0.886) and inr(bcd, 1.618, 2.618) and inr(xad, 0.000, 0.886)
+        isAltBat   = inr(xab, 0.382, 0.500) and inr(abc, 0.382, 0.886) and inr(bcd, 2.000, 3.618) and inr(xad, 0.000, 1.130)
+        isCrab     = inr(xab, 0.382, 0.618) and inr(abc, 0.382, 0.886) and inr(bcd, 2.240, 3.618) and inr(xad, 1.618, 1.618)
+        isDeepCrab = inr(xab, 0.886, 0.886) and inr(abc, 0.382, 0.886) and inr(bcd, 2.000, 3.618) and inr(xad, 1.618, 1.618)
+        isShark    = inr(xab, 0.500, 0.886) and inr(abc, 1.130, 1.618) and inr(bcd, 1.270, 2.240) and inr(xad, 0.886, 1.130)
+        isCypher   = inr(xab, 0.382, 0.618) and inr(abc, 1.130, 1.414) and inr(bcd, 1.272, 2.000) and inr(xad, 0.786, 0.786)
+        isABCD     = inr(abc, 0.618, 0.786) and inr(bcd, 1.272, 1.618)
+
+        matched = array.from(isGartley, isButter, isBat, isAltBat, isCrab, isDeepCrab, isShark, isCypher, isABCD)
+
+        // levels shared by all patterns found at this D (A-D leg projection)
+        rng   = math.abs(a - d)
+        entry = d
+        t1 = isBull ? d + rng * t1f : d - rng * t1f
+        t2 = isBull ? d + rng * t2f : d - rng * t2f
+        sl = isBull ? d - rng * slf : d + rng * slf
+        dirv = isBull ? 1 : -1
+
+        for i = 0 to 8
+            if array.get(matched, i) and array.get(pUse, i)
+                anyMatch := true
+                foundBull := isBull
+                if na(firstColor)
+                    firstColor := array.get(pColors, i)
+                foundNames := foundNames + (foundNames == "" ? "" : "\n") + array.get(pNames, i)
+                // register outcome tracking + Found counter
+                incStat(dirv, i, 0)
+                array.push(pt_pid, i)
+                array.push(pt_dir, dirv)
+                array.push(pt_t1, t1)
+                array.push(pt_t2, t2)
+                array.push(pt_sl, sl)
+                array.push(pt_r1, false)
+
+        if anyMatch
+            // ---- persistent pattern geometry ----
+            if showLabels
+                line.new(xb, x, ab, a, xloc = xloc.bar_index, color = firstColor, width = 2)
+                line.new(ab, a, bb, b, xloc = xloc.bar_index, color = firstColor, width = 2)
+                line.new(bb, b, cb, c, xloc = xloc.bar_index, color = firstColor, width = 2)
+                line.new(cb, c, db, d, xloc = xloc.bar_index, color = firstColor, width = 2)
+                if showHarmonic
+                    line.new(xb, x, bb, b, xloc = xloc.bar_index, color = color.new(firstColor, 45), width = 1, style = line.style_dotted)
+                    line.new(bb, b, db, d, xloc = xloc.bar_index, color = color.new(firstColor, 45), width = 1, style = line.style_dotted)
+                    line.new(ab, a, cb, c, xloc = xloc.bar_index, color = color.new(firstColor, 45), width = 1, style = line.style_dotted)
+                // XABCD letters
+                label.new(xb, x, "X", xloc = xloc.bar_index, style = label.style_none, textcolor = firstColor, size = size.small)
+                label.new(ab, a, "A", xloc = xloc.bar_index, style = label.style_none, textcolor = firstColor, size = size.small)
+                label.new(bb, b, "B", xloc = xloc.bar_index, style = label.style_none, textcolor = firstColor, size = size.small)
+                label.new(cb, c, "C", xloc = xloc.bar_index, style = label.style_none, textcolor = firstColor, size = size.small)
+                // pattern name(s) at D
+                label.new(db, d, foundNames, xloc = xloc.bar_index, style = isBull ? label.style_label_up : label.style_label_down, color = color.new(firstColor, 15), textcolor = color.white, size = size.small)
+                if showRatios
+                    label.new(int((ab + bb) / 2), (a + b) / 2, str.tostring(xab, "#.###"), xloc = xloc.bar_index, style = label.style_none, textcolor = firstColor, size = size.tiny)
+                    label.new(int((bb + cb) / 2), (b + c) / 2, str.tostring(abc, "#.###"), xloc = xloc.bar_index, style = label.style_none, textcolor = firstColor, size = size.tiny)
+                    label.new(int((cb + db) / 2), (c + d) / 2, str.tostring(bcd, "#.###"), xloc = xloc.bar_index, style = label.style_none, textcolor = firstColor, size = size.tiny)
+                    label.new(int((xb + db) / 2), (x + d) / 2, str.tostring(xad, "#.###"), xloc = xloc.bar_index, style = label.style_none, textcolor = color.new(firstColor, 30), size = size.tiny)
+
+            // ---- transient levels + validation zone (latest setup only) ----
+            if showLevels
+                if array.size(lvlLines) > 0
+                    for i = 0 to array.size(lvlLines) - 1
+                        line.delete(array.get(lvlLines, i))
+                if array.size(lvlLabs) > 0
+                    for i = 0 to array.size(lvlLabs) - 1
+                        label.delete(array.get(lvlLabs, i))
+                if array.size(lvlBoxes) > 0
+                    for i = 0 to array.size(lvlBoxes) - 1
+                        box.delete(array.get(lvlBoxes, i))
+                array.clear(lvlLines)
+                array.clear(lvlLabs)
+                array.clear(lvlBoxes)
+
+                x2 = db + rightBars
+                colEntry = color.new(firstColor, 0)
+                colT     = color.new(color.teal, 0)
+                colSL    = color.new(color.red, 0)
+
+                array.push(lvlLines, line.new(db, entry, x2, entry, xloc = xloc.bar_index, color = colEntry, width = 1, style = line.style_dashed))
+                array.push(lvlLabs,  label.new(x2, entry, "Entry: "    + str.tostring(entry, format.mintick), xloc = xloc.bar_index, style = label.style_none, textcolor = colEntry, size = size.small))
+                array.push(lvlLines, line.new(db, t1, x2, t1, xloc = xloc.bar_index, color = colT, width = 1, style = line.style_dashed))
+                array.push(lvlLabs,  label.new(x2, t1, "Target1: "     + str.tostring(t1, format.mintick), xloc = xloc.bar_index, style = label.style_none, textcolor = colT, size = size.small))
+                array.push(lvlLines, line.new(db, t2, x2, t2, xloc = xloc.bar_index, color = colT, width = 1, style = line.style_dashed))
+                array.push(lvlLabs,  label.new(x2, t2, "Target2: "     + str.tostring(t2, format.mintick), xloc = xloc.bar_index, style = label.style_none, textcolor = colT, size = size.small))
+                array.push(lvlLines, line.new(db, sl, x2, sl, xloc = xloc.bar_index, color = colSL, width = 1, style = line.style_dashed))
+                array.push(lvlLabs,  label.new(x2, sl, "Stop-loss: "   + str.tostring(sl, format.mintick), xloc = xloc.bar_index, style = label.style_none, textcolor = colSL, size = size.small))
+
+            if showZone
+                zoneHalf = d * err_allowed * 0.5
+                array.push(lvlBoxes, box.new(cb, d + zoneHalf, db + int(rightBars * 0.2), d - zoneHalf, xloc = xloc.bar_index, border_color = color.new(firstColor, 30), bgcolor = color.new(firstColor, 85)))
+
+// ============================ Outcome tracking ===============================
+if array.size(pt_pid) > 0
+    i = array.size(pt_pid) - 1
+    while i >= 0
+        pdir = array.get(pt_dir, i)
+        pt1  = array.get(pt_t1, i)
+        pt2  = array.get(pt_t2, i)
+        psl  = array.get(pt_sl, i)
+        ppid = array.get(pt_pid, i)
+        pr1  = array.get(pt_r1, i)
+        resolved = false
+        if pdir == 1
+            if low <= psl
+                incStat(pdir, ppid, 4)
+                if not pr1
+                    incStat(pdir, ppid, 1)
+                resolved := true
+            else
+                if not pr1 and high >= pt1
+                    incStat(pdir, ppid, 2)
+                    array.set(pt_r1, i, true)
+                    pr1 := true
+                if pr1 and high >= pt2
+                    incStat(pdir, ppid, 3)
+                    resolved := true
+        else
+            if high >= psl
+                incStat(pdir, ppid, 4)
+                if not pr1
+                    incStat(pdir, ppid, 1)
+                resolved := true
+            else
+                if not pr1 and low <= pt1
+                    incStat(pdir, ppid, 2)
+                    array.set(pt_r1, i, true)
+                    pr1 := true
+                if pr1 and low <= pt2
+                    incStat(pdir, ppid, 3)
+                    resolved := true
+        if resolved
+            array.remove(pt_pid, i)
+            array.remove(pt_dir, i)
+            array.remove(pt_t1, i)
+            array.remove(pt_t2, i)
+            array.remove(pt_sl, i)
+            array.remove(pt_r1, i)
+        i -= 1
+
+// ============================ Statistics table ===============================
+tPos(string p) =>
+    switch p
+        "Top Right"     => position.top_right
+        "Top Left"      => position.top_left
+        "Bottom Right"  => position.bottom_right
+        "Bottom Left"   => position.bottom_left
+        "Middle Right"  => position.middle_right
+        => position.top_right
+
+var table stat = table.new(tPos(tablePos), 12, 12, border_width = 1)
+
+if showStats and barstate.islast
+    cHdr = color.new(color.gray, 0)
+    cLng = color.new(color.green, 65)
+    cSht = color.new(color.red, 65)
+    txt  = color.white
+
+    table.clear(stat, 0, 0, 11, 11)
+    // group header row (create cells first, then merge)
+    table.cell(stat, 0, 0, "STATISTICS", bgcolor = color.new(color.black, 0), text_color = txt, text_size = size.tiny)
+    for j = 1 to 10
+        table.cell(stat, j, 0, "", bgcolor = j < 6 ? cLng : cSht, text_size = size.tiny)
+    table.cell(stat, 1, 0, "LONG",  bgcolor = cLng, text_color = txt, text_size = size.tiny)
+    table.cell(stat, 6, 0, "SHORT", bgcolor = cSht, text_color = txt, text_size = size.tiny)
+    table.merge_cells(stat, 1, 0, 5, 0)
+    table.merge_cells(stat, 6, 0, 10, 0)
+
+    heads = array.from("Pattern", "Found", "Inv", "T1", "T2", "SL", "Found", "Inv", "T1", "T2", "SL")
+    for j = 0 to 10
+        table.cell(stat, j, 1, array.get(heads, j), bgcolor = cHdr, text_color = txt, text_size = size.tiny)
+
+    var array<int> totals = array.new<int>(10, 0)
+    for k = 0 to 9
+        array.set(totals, k, 0)
+
+    for p = 0 to 8
+        r = p + 2
+        table.cell(stat, 0, r, array.get(pNames, p), bgcolor = color.new(color.gray, 40), text_color = array.get(pColors, p), text_size = size.tiny)
+        for col = 0 to 4
+            vL = matrix.get(statL, p, col)
+            table.cell(stat, 1 + col, r, str.tostring(vL), bgcolor = cLng, text_color = txt, text_size = size.tiny)
+            array.set(totals, col, array.get(totals, col) + vL)
+        for col = 0 to 4
+            vS = matrix.get(statS, p, col)
+            table.cell(stat, 6 + col, r, str.tostring(vS), bgcolor = cSht, text_color = txt, text_size = size.tiny)
+            array.set(totals, 5 + col, array.get(totals, 5 + col) + vS)
+
+    // total row
+    rT = 11
+    table.cell(stat, 0, rT, "Total", bgcolor = color.new(color.maroon, 0), text_color = txt, text_size = size.tiny)
+    for col = 0 to 9
+        bg = col < 5 ? cLng : cSht
+        table.cell(stat, 1 + col, rT, str.tostring(array.get(totals, col)), bgcolor = bg, text_color = txt, text_size = size.tiny)
+
+// ============================ Alerts =========================================
+alertcondition(anyMatch and foundBull,       title = "Bullish Harmonic Pattern", message = "Bullish harmonic pattern detected on {{ticker}} {{interval}}")
+alertcondition(anyMatch and not foundBull,    title = "Bearish Harmonic Pattern", message = "Bearish harmonic pattern detected on {{ticker}} {{interval}}")
+alertcondition(anyMatch,                      title = "Any Harmonic Pattern",     message = "Harmonic pattern detected on {{ticker}} {{interval}}")
+
+if anyMatch and barstate.isconfirmed
+    alert((foundBull ? "Bullish" : "Bearish") + " harmonic pattern: " + str.replace_all(foundNames, "\n", ", "), alert.freq_once_per_bar)
