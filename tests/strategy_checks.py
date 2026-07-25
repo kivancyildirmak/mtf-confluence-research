@@ -59,11 +59,12 @@ chk("no request.security() call introduced", "request.security(" not in "\n".joi
 # strategy.entry must be indented (nested inside the barstate.isconfirmed detection
 # block), never at column 0 (global/every-bar).
 entry_lines = [l for l in strat if "strategy.entry(" in l]
-chk("two entry variants only (pullback-limit + market)", len(entry_lines) == 2)
+# 4 entry variants: v1 pullback-L, v1 market-L, fade PRZ long-L, fade PRZ short-S.
+chk("four entry variants (v1 pullback/market + fade long/short)", len(entry_lines) == 4)
 chk("all strategy.entry calls nested (indented), never global",
     bool(entry_lines) and all(l.startswith(" ") for l in entry_lines))
-chk("all entries use the single id 'L' (pyramiding-safe)",
-    all('"L"' in l for l in entry_lines))
+chk("entries use ids 'L' (long) or 'S' (short) only",
+    all(('"L"' in l or '"S"' in l) for l in entry_lines))
 chk("detection guarded by barstate.isconfirmed", "if barstate.isconfirmed" in strat_text)
 # position-management block also gated by confirmed bars
 chk("position management under barstate.isconfirmed",
@@ -94,10 +95,23 @@ chk("no input.* inside strategy() header (would fail CE10123)",
 chk("trade modes All / QUALIFIED only / QUALIFIED + WEAK",
     '"All", "QUALIFIED only", "QUALIFIED + WEAK"' in strat_text)
 chk("trade timeout at maxTradeBars (separate from evaluation maxActiveBars)",
-    "maxTradeBars" in strat_text and 'strategy.close("L"' in strat_text and 'input.int(15, "Max trade duration' in strat_text)
+    "maxTradeBars" in strat_text and "strategy.close_all(" in strat_text and 'input.int(15, "Max trade duration' in strat_text)
 chk("unfilled pullback limit cancelled after entryValidBars",
     'strategy.cancel("L")' in strat_text and "entryValidBars" in strat_text)
-chk("stop/target OCO exit", "strategy.exit(" in strat_text and "stop = stActiveStop" in strat_text and "limit = stActiveTarget" in strat_text)
+chk("stop/target OCO exit (long+short)", "strategy.exit(" in strat_text and "stop = stActiveStop" in strat_text and "limit = stActiveTarget" in strat_text)
+
+# (C2) FADE-at-D (PRZ reversal) method
+chk("method selector Chase-to-D (v1) vs Fade-at-D (PRZ)",
+    '"Chase-to-D (v1)", "Fade-at-D (PRZ)"' in strat_text)
+chk("fade arms the D zone (waits for price to reach D)", "przArmed  := true" in strat_text)
+chk("fade reversal: SHORT when price reaches D-above, LONG when D-below",
+    "przPatDir == 1 and high >= przLo" in strat_text and "przPatDir == -1 and low <= przHi" in strat_text)
+chk("PRZ stop beyond the D zone (structural)",
+    "przHi + przStopATR * przATR" in strat_text and "przLo - przStopATR * przATR" in strat_text)
+chk("fade places long/short reversal entries",
+    'strategy.entry("L", strategy.long, qty = qty, alert_message = "HPS PRZ long")' in strat_text and
+    'strategy.entry("S", strategy.short, qty = qty, alert_message = "HPS PRZ short")' in strat_text)
+chk("arm window disarms if D not reached (armBars)", "(bar_index - przArmBar) > armBars" in strat_text)
 
 # (D) ENTRY IS SIGNAL-DERIVED, NOT HISTORICAL C PRICE
 chk("entry never uses raw historical C price as fill (pullback is C + f*(close-C))",
@@ -107,9 +121,9 @@ chk("pullback limit must sit below current close (real pullback, not instant fil
 chk("labels show C->entry bar gap", "C->entry" in strat_text)
 chk("labels show calculated R:R", "R:R " in strat_text)
 chk("alerts for entry/exit/timeout present",
-    'alert("HPS BUY entry filled' in strat_text and "HPS exit (" in strat_text and "HPS timeout close" in strat_text)
-chk("long-only (strategy.long, no strategy.short)",
-    "strategy.long" in strat_text and "strategy.short" not in strat_text)
+    ' filled @ ' in strat_text and "HPS exit (" in strat_text and "HPS timeout close" in strat_text)
+chk("supports long and short (fade can reverse either way)",
+    "strategy.long" in strat_text and "strategy.short" in strat_text)
 chk("header documents: entry on C-confirmation bar, NOT historical C price",
     "C'nin ONAYLANDIĞI" in strat_text and "tarihsel fiyattan DE" in strat_text)
 

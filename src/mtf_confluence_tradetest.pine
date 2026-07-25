@@ -43,6 +43,11 @@ strategy("Harmonic Prediction Strategy", overlay = true, max_labels_count = 500,
 // gevşek (All + Market + minRR 0 + minTargetDist 0). Yeterli işlem çıkınca
 // Input'tan sıkabilirsin (Pullback, minRR 2, minTargetDist 1 → yüksek R:R modu).
 grpStrat   = "Strategy"
+// METHOD SEÇİMİ:
+//  - "Chase-to-D (v1)": C-confirmation'da D yönünde gir (eski; veri KAYBETTİRDİĞİNİ gösterdi).
+//  - "Fade-at-D (PRZ)": D KOŞMA; fiyat D bölgesine ULAŞINCA TERS yönde gir (harmonik PRZ dönüş
+//    ticareti). Long %30 kazandığından (rastgeleden kötü) hipotez: setup dönüş işareti.
+stratMethod = input.string("Fade-at-D (PRZ)", "Strategy method", options = ["Chase-to-D (v1)", "Fade-at-D (PRZ)"], group = grpStrat, tooltip = "Fade-at-D: D bölgesine dokununca ters yönde işlem. Chase-to-D: eski v1 (D yönünde).")
 tradeMode  = input.string("All", "Trade mode", options = ["All", "QUALIFIED only", "QUALIFIED + WEAK"], group = grpStrat, tooltip = "Hangi qStatus'lu sinyaller işleme girer. QUALIFIED=1, WEAK=2 (SHADOW etiketleri; qualification mantığı DEĞİŞMEZ).")
 riskPct    = input.float(1.0, "Risk % of equity per trade", minval = 0.01, maxval = 100.0, step = 0.1, group = grpStrat)
 // Giriş: pivot ~3*ATR yükselince onaylandığından, C-confirmation'da MARKET girmek
@@ -56,6 +61,13 @@ minStopTicks   = input.int(5, "Stop buffer min ticks", minval = 0, group = grpSt
 minRR      = input.float(0.0, "Minimum R:R", minval = 0.0, step = 0.1, group = grpStrat, tooltip = "entry->stop mesafesine göre hedefe uzaklık bu orandan küçükse işlem reddedilir. Ölçüm için 0; yüksek R:R modu için 2.")
 minTargetDistATR = input.float(0.0, "Min target distance (× ATR)", minval = 0.0, step = 0.1, group = grpStrat, tooltip = "Giriş D hedefine bu ATR'den yakınsa işlem reddedilir. Ölçüm için 0; yüksek R:R modu için 1.")
 maxTradeBars = input.int(15, "Max trade duration (bars)", minval = 1, group = grpStrat, tooltip = "Doldurulan pozisyon bu kadar bar sonra piyasadan kapatılır (evaluation maxActiveBars'tan AYRI).")
+// --- Fade-at-D (PRZ) yöntemine özel input'lar ---
+grpFade    = "Strategy — Fade-at-D (PRZ)"
+fadeDir    = input.string("Both", "Fade direction", options = ["Both", "Long only", "Short only"], group = grpFade, tooltip = "D yukarıdaysa (bullish pattern) dönüş SHORT; D aşağıdaysa (bearish) dönüş LONG. Long only = yalnız aşağı-D setuplarında AL.")
+armBars    = input.int(40, "Arm window (bars) to reach D", minval = 1, group = grpFade, tooltip = "Projekte D bu kadar bar içinde fiyata değmezse setup iptal.")
+przStopATR = input.float(0.5, "PRZ stop buffer (× ATR beyond D)", minval = 0.0, step = 0.1, group = grpFade, tooltip = "Stop, D bölgesinin karşı kenarının bu kadar ATR ötesine konur (bölge kırılırsa pattern geçersiz).")
+przTargetMode = input.string("Fixed R", "PRZ target", options = ["Fixed R", "Retrace to C"], group = grpFade, tooltip = "Fixed R: risk*R kadar hedef. Retrace to C: hedef C pivot fiyatı.")
+przTargetR = input.float(1.5, "PRZ target R (Fixed R)", minval = 0.1, step = 0.1, group = grpFade)
 
 // =============================================================================
 // Girdiler
@@ -854,6 +866,16 @@ var bool  stDrew         = false // bu pozisyon için etiket/çizgi çizildi mi
 var bool  stPending      = false // bekleyen (henüz dolmamış) limit emir var mı
 var int   stOrderBar     = na   // limit emrin verildiği bar (iptal penceresi için)
 var float stLimitPx      = na   // pullback limit fiyatı (giriş referansı)
+var bool  stIsLong       = true  // aktif pozisyon long mu (çıkış sebebi çıkarımı için)
+// --- Fade-at-D (PRZ) tek-slot armed setup ---
+var bool  przArmed       = false // bekleyen (fiyatın D'ye ulaşmasını beklediğimiz) setup var mı
+var float przLo          = na    // D bölgesi alt kenarı
+var float przHi          = na    // D bölgesi üst kenarı
+var int   przPatDir      = 0     // pattern yönü: 1=D yukarıda (dönüş SHORT), -1=D aşağıda (dönüş LONG)
+var float przCprice      = na    // C pivot fiyatı (Retrace-to-C hedefi + etiket)
+var int   przCbar        = na    // C pivotunun barı (etiket)
+var float przATR         = na    // oluşum ATR'si (stop tamponu)
+var int   przArmBar      = na    // setup'ın kurulduğu bar (arm penceresi)
 
 // -----------------------------------------------------------------------------
 // FEATURE ENGINEERING analytics sayaçları (partition bucket; çözümde O(1) bump).
@@ -1779,10 +1801,24 @@ if barstate.isconfirmed
                         // Tanısal: joint kombosu adaya uydu ama seçilemedi (partisyon dışı).
                         qJointLow += qJLow
 
-                        // 1g2) STRATEGY — onaylı BUY sinyali (C-confirmation) barında long emir.
-                        //      Giriş = sinyal barı kapanışı referansı; gerçek dolum SONRAKİ barın
-                        //      açılışı (Strategy Tester varsayılanı). C tarihsel fiyatından GİRİLMEZ.
-                        if dir == 1
+                        // 1g2) STRATEGY — trade katmanı. İki yöntem:
+                        //   Chase-to-D (v1): C-confirmation'da D yönünde gir (aşağıdaki blok).
+                        //   Fade-at-D (PRZ): burada YALNIZ setup'ı ARM et; giriş, fiyat D'ye ULAŞINCA
+                        //                    (aşağıdaki yönetim bloğunda) TERS yönde yapılır.
+                        bool modeOkArm = tradeMode == "All" or (tradeMode == "QUALIFIED only" and qSt == 1) or (tradeMode == "QUALIFIED + WEAK" and (qSt == 1 or qSt == 2))
+                        if stratMethod == "Fade-at-D (PRZ)" and modeOkArm
+                            // pattern dir==1 → D yukarıda → dönüş SHORT ; dir==-1 → D aşağıda → dönüş LONG
+                            bool dirAllowed = (dir == 1 and (fadeDir == "Both" or fadeDir == "Short only")) or (dir == -1 and (fadeDir == "Both" or fadeDir == "Long only"))
+                            if dirAllowed
+                                przArmed  := true
+                                przLo     := pLo
+                                przHi     := pHi
+                                przPatDir := dir
+                                przCprice := C.price
+                                przCbar   := C.bidx
+                                przATR    := cATR
+                                przArmBar := bar_index
+                        if stratMethod == "Chase-to-D (v1)" and dir == 1
                             // Giriş fiyatı: PULLBACK ise C'ye geri çekilmede limit; MARKET ise
                             // sinyal kapanışı. Her iki durumda da C tarihsel fiyatından GİRİLMEZ.
                             float stEntry  = entryMode == "Pullback" ? C.price + pullbackFrac * (close - C.price) : close
@@ -1817,6 +1853,7 @@ if barstate.isconfirmed
                                     stDrew         := false
                                     stPending      := entryMode == "Pullback"
                                     stOrderBar     := bar_index
+                                    stIsLong       := true
 
                         // 1h) Evaluation kaydı: ACTIVE olarak izlemeye al + oluşum sayaçları.
                         array.push(activeList, rec)
@@ -2476,32 +2513,66 @@ else
 // kapanmış (confirmed) bar verisiyle; dolum bir sonraki açılışta gerçekleşir.
 // =============================================================================
 if barstate.isconfirmed
-    // Bekleyen pullback limitini süre dolunca iptal et (dolmadıysa işlem yok).
+    // Bekleyen pullback limitini (v1) süre dolunca iptal et.
     if stPending and strategy.position_size == 0 and not na(stOrderBar) and (bar_index - stOrderBar) >= entryValidBars
         strategy.cancel("L")
         stPending := false
 
-    // Açık long için stop/target (OCO) ve süre-durdurma (trade'e özel maxTradeBars).
-    if strategy.position_size > 0
-        strategy.exit("X", from_entry = "L", stop = stActiveStop, limit = stActiveTarget, alert_message = "HPS exit (stop/target)")
-        if bar_index - strategy.opentrades.entry_bar_index(0) >= maxTradeBars
-            strategy.close("L", comment = "timeout", alert_message = "HPS timeout close")
+    // FADE-at-D: armed setup'ta fiyat D bölgesine ULAŞINCA ters yönde gir.
+    //   pattern dir==1 → D yukarıda → fiyat yukarı çıkıp bölgeye girer (high>=przLo) → SHORT
+    //   pattern dir==-1 → D aşağıda → fiyat aşağı inip bölgeye girer (low<=przHi)  → LONG
+    if stratMethod == "Fade-at-D (PRZ)" and przArmed and strategy.position_size == 0
+        if not na(przArmBar) and (bar_index - przArmBar) > armBars
+            przArmed := false
+        else
+            bool touchShort = przPatDir == 1 and high >= przLo
+            bool touchLong  = przPatDir == -1 and low <= przHi
+            if touchShort or touchLong
+                bool  goLong  = touchLong
+                float entryPx = close
+                float stopPx  = goLong ? (przLo - przStopATR * przATR) : (przHi + przStopATR * przATR)
+                float riskD   = math.abs(entryPx - stopPx)
+                float tgtPx   = przTargetMode == "Retrace to C" ? przCprice : (goLong ? entryPx + przTargetR * riskD : entryPx - przTargetR * riskD)
+                bool  okLong  = goLong and tgtPx > entryPx and stopPx < entryPx
+                bool  okShort = (not goLong) and tgtPx < entryPx and stopPx > entryPx
+                if riskD > 0 and (okLong or okShort)
+                    float qty = (strategy.equity * (riskPct / 100.0)) / riskD
+                    if qty > 0
+                        if goLong
+                            strategy.entry("L", strategy.long, qty = qty, alert_message = "HPS PRZ long")
+                        else
+                            strategy.entry("S", strategy.short, qty = qty, alert_message = "HPS PRZ short")
+                        stActiveStop   := stopPx
+                        stActiveTarget := tgtPx
+                        stCbar         := przCbar
+                        stCprice       := przCprice
+                        stEntryRef     := entryPx
+                        stRRrec        := math.abs(tgtPx - entryPx) / riskD
+                        stIsLong       := goLong
+                        stPending      := false
+                        przArmed       := false
 
-    // Dolum tespiti (poz 0 -> >0): gerçek giriş barı, C->giriş bar farkı, R:R çiz.
-    if strategy.position_size > 0 and strategy.position_size[1] == 0
+    // Açık pozisyon: stop/target (OCO; long ve short) ve süre-durdurma (maxTradeBars).
+    if strategy.position_size != 0
+        strategy.exit("XL", from_entry = "L", stop = stActiveStop, limit = stActiveTarget, alert_message = "HPS exit (stop/target)")
+        strategy.exit("XS", from_entry = "S", stop = stActiveStop, limit = stActiveTarget, alert_message = "HPS exit (stop/target)")
+        if bar_index - strategy.opentrades.entry_bar_index(0) >= maxTradeBars
+            strategy.close_all(comment = "timeout", alert_message = "HPS timeout close")
+
+    // Dolum tespiti (poz 0 -> !=0): giriş, C->giriş bar farkı, R:R, stop/target çiz.
+    if strategy.position_size != 0 and strategy.position_size[1] == 0
         stPending := false
-        int   fillBar   = strategy.opentrades.entry_bar_index(0)
-        float fillPrice = strategy.opentrades.entry_price(0)
-        int   barsCtoEntry = fillBar - stCbar
-        label.new(fillBar, fillPrice, "ENTRY " + str.tostring(fillPrice, format.mintick) + "\nC->entry " + str.tostring(barsCtoEntry) + " bar\nR:R " + str.tostring(stRRrec, "#.##"), xloc = xloc.bar_index, style = label.style_label_up, color = color.new(color.teal, 0), textcolor = color.white, size = size.small)
-        label.new(stCbar, stCprice, "C " + str.tostring(stCprice, format.mintick), xloc = xloc.bar_index, style = label.style_label_down, color = color.new(color.gray, 20), textcolor = color.white, size = size.tiny)
+        int    fillBar   = strategy.opentrades.entry_bar_index(0)
+        float  fillPrice = strategy.opentrades.entry_price(0)
+        int    barsCtoEntry = fillBar - stCbar
+        string dirTag = stIsLong ? "LONG" : "SHORT"
+        label.new(fillBar, fillPrice, dirTag + " " + str.tostring(fillPrice, format.mintick) + "\nC->entry " + str.tostring(barsCtoEntry) + " bar\nR:R " + str.tostring(stRRrec, "#.##"), xloc = xloc.bar_index, style = stIsLong ? label.style_label_up : label.style_label_down, color = color.new(stIsLong ? color.teal : color.maroon, 0), textcolor = color.white, size = size.small)
+        label.new(stCbar, stCprice, "C " + str.tostring(stCprice, format.mintick), xloc = xloc.bar_index, style = label.style_label_left, color = color.new(color.gray, 20), textcolor = color.white, size = size.tiny)
         line.new(fillBar, stActiveStop,   fillBar + maxTradeBars, stActiveStop,   xloc = xloc.bar_index, color = color.red,   style = line.style_dashed, width = 1)
         line.new(fillBar, stActiveTarget, fillBar + maxTradeBars, stActiveTarget, xloc = xloc.bar_index, color = color.green, style = line.style_dashed, width = 1)
-        label.new(fillBar, stActiveStop,   "STOP "   + str.tostring(stActiveStop, format.mintick),   xloc = xloc.bar_index, style = label.style_label_up,   color = color.new(color.red, 30),   textcolor = color.white, size = size.tiny)
-        label.new(fillBar, stActiveTarget, "TARGET " + str.tostring(stActiveTarget, format.mintick), xloc = xloc.bar_index, style = label.style_label_down, color = color.new(color.green, 30), textcolor = color.white, size = size.tiny)
-        alert("HPS BUY entry filled @ " + str.tostring(fillPrice, format.mintick) + " | C->entry " + str.tostring(barsCtoEntry) + " bars | R:R " + str.tostring(stRRrec, "#.##"), alert.freq_once_per_bar)
+        alert("HPS " + dirTag + " filled @ " + str.tostring(fillPrice, format.mintick) + " | R:R " + str.tostring(stRRrec, "#.##"), alert.freq_once_per_bar)
 
-    // Çıkış tespiti (poz >0 -> 0): sebebi çıkar ve alert üret.
-    if strategy.position_size == 0 and strategy.position_size[1] > 0
-        string why = low <= stActiveStop ? "STOP" : high >= stActiveTarget ? "TARGET" : "TIMEOUT"
+    // Çıkış tespiti (poz !=0 -> 0): sebebi (long/short'a göre) çıkar ve alert üret.
+    if strategy.position_size == 0 and strategy.position_size[1] != 0
+        string why = stIsLong ? (low <= stActiveStop ? "STOP" : high >= stActiveTarget ? "TARGET" : "TIMEOUT") : (high >= stActiveStop ? "STOP" : low <= stActiveTarget ? "TARGET" : "TIMEOUT")
         alert("HPS exit (" + why + ") @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar)
