@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# Test / cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Uygulama yerel verisi (kullanıcı makinesinde ~/.football_predictor)
+*.sqlite
+cache.sqlite
+settings.json
+
+# OS
+.DS_Store
+Thumbs.db
