@@ -307,27 +307,107 @@ def test_update_from_api_without_league_id_raises(monkeypatch, tmp_path):
     assert "lig id" in str(exc.value).lower()
 
 
+def _seasons_response(years):
+    """/leagues yanıtı: planın eriştiği sezonlar."""
+    return FakeResponse({"response": [
+        {"league": {"id": 103, "name": "Eliteserien"},
+         "seasons": [{"year": y} for y in years]},
+    ]})
+
+
+def patch_router(monkeypatch, handler):
+    """requests.get'i URL'e göre yanıt veren bir yönlendiriciyle değiştirir."""
+    import requests
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        result = handler(url, params)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(requests, "get", fake_get)
+
+
 def test_update_from_api_survives_partial_failure(monkeypatch, tmp_path):
     """Bir sezon patlarsa diğerleri yine de kaydedilmeli."""
     from fpredict import data_fetch, squad_adjust
     import requests
 
     monkeypatch.setattr(squad_adjust, "load_league_id", lambda k: 103)
-    calls = {"n": 0}
+    calls = {"fixtures": 0}
 
-    def flaky(url, params=None, headers=None, timeout=None):
-        calls["n"] += 1
-        if calls["n"] == 1:
+    def handler(url, params):
+        if "/leagues" in url:
+            return _seasons_response([2026, 2025])
+        calls["fixtures"] += 1
+        if calls["fixtures"] == 1:
             return FakeResponse({"response": [
                 _fixture("Molde", "Brann", 2, 0, iso="2026-05-01T00:00:00+00:00")]})
-        raise requests.exceptions.ConnectTimeout("timed out")
+        return requests.exceptions.ConnectTimeout("timed out")
 
-    monkeypatch.setattr(requests, "get", flaky)
+    patch_router(monkeypatch, handler)
     res = data_fetch.update_from_api("NOR", "key", seasons_back=2,
                                      db_path=tmp_path / "t.sqlite")
     assert res["inserted"] == 1
     assert len(res["seasons_ok"]) == 1
     assert len(res["seasons_failed"]) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Plan sezon kısıtı (ücretsiz plan güncel sezonu kapsamayabilir)
+# --------------------------------------------------------------------------- #
+def test_league_seasons_parses_years(monkeypatch):
+    patch_get(monkeypatch, _seasons_response([2021, 2023, 2022]))
+    years = af.APIFootballClient("k").league_seasons(103)
+    assert years == [2023, 2022, 2021]        # yeniden eskiye
+
+
+def test_league_seasons_empty_response(monkeypatch):
+    patch_get(monkeypatch, FakeResponse({"response": []}))
+    assert af.APIFootballClient("k").league_seasons(103) == []
+
+
+def test_update_falls_back_to_newest_available_season(monkeypatch, tmp_path):
+    """Plan güncel sezonu kapsamıyorsa eriştiği en yeni sezon indirilmeli."""
+    from fpredict import data_fetch, squad_adjust
+
+    monkeypatch.setattr(squad_adjust, "load_league_id", lambda k: 103)
+
+    def handler(url, params):
+        if "/leagues" in url:
+            return _seasons_response([2023, 2024])       # 2026/2025 YOK
+        assert params["season"] in (2024, 2023)          # boşa istek yok
+        return FakeResponse({"response": [
+            _fixture("Molde", "Brann", 2, 0,
+                     iso=f"{params['season']}-05-01T00:00:00+00:00")]})
+
+    patch_router(monkeypatch, handler)
+    res = data_fetch.update_from_api("NOR", "key", seasons_back=2,
+                                     db_path=tmp_path / "t.sqlite")
+    assert res["inserted"] == 2
+    assert set(res["seasons_ok"]) == {"2024", "2023"}
+    assert res["plan_note"] and "erişemiyor" in res["plan_note"]
+    assert res["available_seasons"] == [2024, 2023]
+
+
+def test_update_notes_when_current_season_missing(monkeypatch, tmp_path):
+    """İstenen yıllardan bazıları planda varsa da eksik olan bildirilmeli."""
+    from fpredict import data_fetch, squad_adjust
+
+    monkeypatch.setattr(squad_adjust, "load_league_id", lambda k: 103)
+
+    def handler(url, params):
+        if "/leagues" in url:
+            return _seasons_response([2025, 2024])       # 2026 (güncel) yok
+        return FakeResponse({"response": [
+            _fixture("Molde", "Brann", 1, 0,
+                     iso=f"{params['season']}-05-01T00:00:00+00:00")]})
+
+    patch_router(monkeypatch, handler)
+    res = data_fetch.update_from_api("NOR", "key", seasons_back=2,
+                                     db_path=tmp_path / "t.sqlite")
+    assert res["plan_note"] and "2026" in res["plan_note"]
+    assert res["seasons_ok"] == ["2025"]                 # 2026 istenmedi bile
 
 
 # --------------------------------------------------------------------------- #

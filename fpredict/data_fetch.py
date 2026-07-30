@@ -563,7 +563,36 @@ def update_from_api(
         known = []
 
     client = APIFootballClient(api_key, provider=load_api_provider())
-    years = api_seasons(league_key, seasons_back)
+
+    # Önce planın hangi sezonlara eriştiğini sor (1 istek). Ücretsiz planlar
+    # güncel sezonu içermeyebilir; körlemesine yıl denemek hem boşa istek
+    # harcar hem de kullanıcıya "veri yok" gibi yanıltıcı bir sonuç gösterir.
+    available_years: list[int] = []
+    plan_note = None
+    if progress:
+        progress("Erişilebilir sezonlar sorgulanıyor…", 0.05)
+    try:
+        available_years = client.league_seasons(league_id)
+    except APIFootballError as exc:
+        plan_note = f"Sezon listesi alınamadı ({exc}); varsayılan yıllar denenecek."
+
+    wanted = api_seasons(league_key, seasons_back)
+    if available_years:
+        years = [y for y in wanted if y in available_years]
+        if not years:
+            # İstenen yılların hiçbiri planda yok -> en yeni erişilebilir olanlar
+            years = available_years[:seasons_back]
+            plan_note = (
+                f"Planınız {wanted[0]} sezonuna erişemiyor. En yeni erişilebilir "
+                f"sezon: {available_years[0]}. Bu sezon(lar) indirildi."
+            )
+        elif wanted[0] not in available_years:
+            plan_note = (
+                f"Planınız {wanted[0]} (güncel) sezonuna erişemiyor; "
+                f"en yeni erişilebilir sezon {available_years[0]}."
+            )
+    else:
+        years = wanted
 
     total, ok, failed, errors = 0, [], [], []
     for i, year in enumerate(years):
@@ -574,8 +603,9 @@ def update_from_api(
             if not rows:
                 failed.append(str(year))
                 errors.append(
-                    f"{year}: API 0 tamamlanmış maç döndürdü "
-                    f"(lig id {league_id} yanlış olabilir veya sezon henüz başlamamış)."
+                    f"{year}: API 0 tamamlanmış maç döndürdü — sezon henüz "
+                    f"başlamamış, planınız bu sezonu kapsamıyor veya lig id "
+                    f"({league_id}) yanlış olabilir."
                 )
                 continue
             total += db.upsert_matches(rows, db_path=db_path)
@@ -612,6 +642,8 @@ def update_from_api(
         "last_match_date": last_date,
         "stale_days": stale_days,
         "quota": client.last_quota.describe() if client.last_quota else None,
+        "plan_note": plan_note,
+        "available_seasons": available_years[:8],
     }
 
 

@@ -96,6 +96,13 @@ def render():
                 )
                 if result.get("quota"):
                     st.caption(f"API kotası: {result['quota']}")
+                if result.get("plan_note"):
+                    st.warning(f"ℹ️ **Plan kısıtı:** {result['plan_note']}")
+                if result.get("available_seasons"):
+                    st.caption(
+                        "Planınızın bu ligde eriştiği sezonlar: "
+                        + ", ".join(str(y) for y in result["available_seasons"])
+                    )
             else:
                 result = data_fetch.update_league(
                     league_key, seasons_back=int(seasons_back), progress=_cb
@@ -125,12 +132,15 @@ def render():
                     st.warning(
                         "Bazı sezonlar indirilemedi: "
                         f"{', '.join(result['seasons_failed'])}. "
-                        "(En yeni sezon henüz yayınlanmamış olabilir — bu normaldir.)"
+                        + ("(Planınız bu sezonları kapsamıyor olabilir.)"
+                           if use_api else
+                           "(En yeni sezon henüz yayınlanmamış olabilir — bu normaldir.)")
                     )
                     with st.expander("Ayrıntılı hata"):
                         for e in result["errors"]:
                             st.caption(f"• {e}")
-                _manual_upload_fallback(league_key)
+                if not use_api:
+                    _manual_upload_fallback(league_key)
         except data_fetch.DataFetchError as exc:
             prog.empty()
             st.error(f"İndirme hatası: {exc}")
@@ -273,7 +283,8 @@ def _staleness_warning(result: dict):
         "form değişimlerini **görmez**. Yeni sezon maçlarında tahminlerin "
         "güvenilirliği belirgin biçimde düşer.\n\n"
         "Güncel veri için: football-data.co.uk erişimini açın (DNS/VPN) veya "
-        "*Kadro/Sakatlık* ekranından API-Football anahtarı girin."
+        "API-Football'da güncel sezonu kapsayan bir plan kullanın "
+        "(ücretsiz plan güncel sezonu kapsamayabilir)."
     )
 
 

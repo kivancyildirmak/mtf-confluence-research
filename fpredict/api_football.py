@@ -235,6 +235,22 @@ class APIFootballClient:
             })
         return out
 
+    def league_seasons(self, league_id: int) -> list[int]:
+        """Bu lig için planınızın eriştiği sezon yıllarını döndürür (yeniden eskiye).
+
+        Ücretsiz planlar genellikle YALNIZCA belirli sezonlara erişir; güncel
+        sezon dahil olmayabilir. Bu yüzden körlemesine yıl denemek yerine
+        API'ye hangi sezonların açık olduğu sorulur — hem doğru veri gelir hem
+        de boşa istek harcanmaz.
+        """
+        data = self._get("leagues", {"id": league_id})
+        resp = data.get("response") or []
+        if not resp:
+            return []
+        seasons = (resp[0] or {}).get("seasons") or []
+        years = [_int(s.get("year")) for s in seasons]
+        return sorted([y for y in years if y is not None], reverse=True)
+
     def list_teams(self, league_id: int, season: int) -> list[dict]:
         """Ligdeki takımlar (id + ad) — sakatlık sorgusu için gerekir."""
         data = self._get("teams", {"league": league_id, "season": season})
