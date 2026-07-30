@@ -96,6 +96,11 @@ def load_matches(league: str | None = None, db_path: Path | None = None) -> pd.D
     if not df.empty:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df = df.dropna(subset=["date"])
+        # Takım adı varyantlarını birleştir ('Ajax ' / 'Ajax', 'Ham-Kam' / 'HamKam').
+        # Tek noktada yapılır ki model, backtest, değer ekranı ve arayüzdeki
+        # takım listesi aynı kanonik adları görsün.
+        from .name_matching import unify_team_names
+        df = unify_team_names(df)
     return df
 
 

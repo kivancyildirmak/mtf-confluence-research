@@ -153,6 +153,18 @@ her lig için doğru olanı otomatik seçer:
 tüm sezonlar tek dosyadadır (tam geçmiş indirilir, sezon seçimi devre dışıdır).
 Elle CSV yüklerken biçim **otomatik algılanır**.
 
+#### Erişim engellenirse — arşiv kaynağı (tüm ligler)
+
+football-data.co.uk bazı ülkelerde ağ seviyesinde engellidir. **Veri** ekranındaki
+*"Yalnızca arşiv (GitHub)"* seçeneği bu durumda **38 ligin tamamını** GitHub
+üzerinden indirir (2000-2025, ~230.000 maç, oran sütunları dahil).
+
+> ⚠️ **Arşiv canlı değildir.** Son maç tarihi ligden lige değişir: büyük Avrupa
+> ligleri ~Mayıs 2025, İskandinav/Polonya ligleri ~Aralık 2024. Uygulama bunu
+> güncelleme sonrası açıkça uyarı olarak gösterir. Yeni sezon maçlarında
+> tahminlerin güvenilirliği düşer; güncel veri için asıl kaynağa erişim veya
+> API-Football anahtarı gerekir.
+
 #### Erişim engellenirse — yedek ayna
 
 Bazı ağlarda (İSS/DNS engeli, kurumsal filtre, antivirüsün HTTPS taraması)

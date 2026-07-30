@@ -16,7 +16,9 @@ Tasarım ilkeleri
 from __future__ import annotations
 
 import io
+import time
 from datetime import date
+from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
@@ -395,6 +397,130 @@ def update_league(
         "seasons_failed": seasons_failed,
         "errors": errors,
         "sources_used": sorted(sources_used),
+    }
+
+
+def ensure_archive(progress=None, force: bool = False) -> Path:
+    """Birleşik arşiv CSV'sini indirir ve yerelde saklar (~43 MB, tek sefer).
+
+    Yerel kopya `ARCHIVE_MAX_AGE_DAYS` günden yeniyse yeniden indirilmez.
+
+    Returns:
+        Yerel arşiv dosyasının yolu.
+
+    Raises:
+        DataFetchError: indirilemezse ve yerel kopya da yoksa.
+    """
+    config.ensure_app_dir()
+    path = config.ARCHIVE_CACHE
+
+    if path.exists() and not force:
+        age_days = (time.time() - path.stat().st_mtime) / 86400
+        if age_days < config.ARCHIVE_MAX_AGE_DAYS:
+            return path
+
+    if progress:
+        progress("Arşiv indiriliyor (~43 MB, yalnızca ilk seferde)…", 0.1)
+    try:
+        content = download_csv(config.ARCHIVE_URL, timeout=180)
+    except DataFetchError:
+        if path.exists():
+            return path  # eski kopya yenisinden iyidir
+        raise
+    path.write_bytes(content)
+    return path
+
+
+def parse_archive_for_league(archive_path: Path, league_key: str) -> list[dict]:
+    """Arşivden tek bir ligin maçlarını normalize kayıtlara çevirir.
+
+    Arşiv sütunları football-data.co.uk'tan farklı adlandırılmıştır:
+        MatchDate, HomeTeam, AwayTeam, FTHome, FTAway, FTResult,
+        OddHome/OddDraw/OddAway, Over25/Under25
+    """
+    division = config.archive_division(league_key)
+    if not division:
+        raise DataFetchError(f"{league_key} arşivde bulunmuyor.")
+
+    cols = [
+        "Division", "MatchDate", "HomeTeam", "AwayTeam",
+        "FTHome", "FTAway", "FTResult",
+        "OddHome", "OddDraw", "OddAway", "Over25", "Under25",
+    ]
+    try:
+        df = pd.read_csv(archive_path, usecols=cols, low_memory=False)
+    except Exception as exc:
+        raise DataFetchError(f"Arşiv okunamadı: {exc}") from exc
+
+    df = df[df["Division"] == division]
+    if df.empty:
+        raise DataFetchError(f"Arşivde '{division}' için maç bulunamadı.")
+
+    code = config.LEAGUES[league_key].code
+    rows: list[dict] = []
+    for _, r in df.iterrows():
+        iso = _parse_date(r.get("MatchDate"))
+        home, away = r.get("HomeTeam"), r.get("AwayTeam")
+        hg, ag = r.get("FTHome"), r.get("FTAway")
+        if not iso or pd.isna(home) or pd.isna(away) or pd.isna(hg) or pd.isna(ag):
+            continue
+        try:
+            hg, ag = int(hg), int(ag)
+        except (ValueError, TypeError):
+            continue
+        home, away = str(home).strip(), str(away).strip()
+        rows.append({
+            "match_uid": db.make_uid(code, iso, home, away),
+            "league": code,
+            "season": iso[:4],
+            "date": iso,
+            "home_team": home,
+            "away_team": away,
+            "home_goals": hg,
+            "away_goals": ag,
+            "result": r.get("FTResult") if pd.notna(r.get("FTResult")) else (
+                "H" if hg > ag else "A" if ag > hg else "D"
+            ),
+            "odds_h": _num(r.get("OddHome")),
+            "odds_d": _num(r.get("OddDraw")),
+            "odds_a": _num(r.get("OddAway")),
+            "odds_over25": _num(r.get("Over25")),
+            "odds_under25": _num(r.get("Under25")),
+        })
+    return rows
+
+
+def update_from_archive(league_key: str, db_path=None, progress=None) -> dict:
+    """Bir ligi arşiv kaynağından günceller (football-data.co.uk erişilemezken).
+
+    Returns:
+        update_league ile aynı biçimde sonuç sözlüğü; ayrıca 'last_match_date'
+        ve 'stale_days' alanlarıyla verinin ne kadar eski olduğunu bildirir.
+    """
+    code = config.LEAGUES[league_key].code
+    path = ensure_archive(progress=progress)
+    if progress:
+        progress("Arşiv ayrıştırılıyor…", 0.6)
+    rows = parse_archive_for_league(path, league_key)
+    inserted = db.upsert_matches(rows, db_path=db_path)
+    db.touch_updated(code, db_path=db_path)
+    if progress:
+        progress("Tamamlandı.", 1.0)
+
+    last_date = max((r["date"] for r in rows), default=None)
+    stale_days = None
+    if last_date:
+        stale_days = (date.today() - date.fromisoformat(last_date)).days
+
+    return {
+        "league": league_key,
+        "inserted": inserted,
+        "seasons_ok": sorted({r["season"] for r in rows})[-5:],
+        "seasons_failed": [],
+        "errors": [],
+        "sources_used": ["Arşiv (GitHub)"],
+        "last_match_date": last_date,
+        "stale_days": stale_days,
     }
 
 

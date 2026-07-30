@@ -54,6 +54,21 @@ def render():
             "daha fazla ağırlık verir)."
         )
 
+    # --- Kaynak seçimi ------------------------------------------------------ #
+    in_archive = config.archive_division(league_key) is not None
+    source_mode = st.radio(
+        "Veri kaynağı",
+        ["Otomatik (önerilen)", "Yalnızca arşiv (GitHub)"],
+        horizontal=True,
+        help=(
+            "Otomatik: önce football-data.co.uk, olmazsa yedek ayna denenir.\n"
+            "Arşiv: football-data.co.uk engelliyse tüm ligler için çalışır, "
+            "ancak veri güncel değildir."
+        ),
+        disabled=not in_archive,
+    )
+    use_archive = in_archive and source_mode == "Yalnızca arşiv (GitHub)"
+
     if st.button("🔄 Verileri Güncelle", type="primary"):
         prog = st.progress(0.0, text="Başlatılıyor…")
 
@@ -61,9 +76,12 @@ def render():
             prog.progress(min(frac, 1.0), text=msg)
 
         try:
-            result = data_fetch.update_league(
-                league_key, seasons_back=int(seasons_back), progress=_cb
-            )
+            if use_archive:
+                result = data_fetch.update_from_archive(league_key, progress=_cb)
+            else:
+                result = data_fetch.update_league(
+                    league_key, seasons_back=int(seasons_back), progress=_cb
+                )
             common.bump_data_version()
             prog.empty()
             if result["seasons_ok"]:
@@ -80,6 +98,7 @@ def render():
                         "**bahis oranı sütunları yoktur** — bu yüzden *Değer* ekranı "
                         "bu lig için çalışmaz. Tahmin ve Backtest normal çalışır."
                     )
+                _staleness_warning(result)
             if result["seasons_failed"]:
                 # Hiçbir sezon inmediyse bu bir ağ sorunudur: teşhis göster
                 if not result["seasons_ok"]:
@@ -105,6 +124,32 @@ def render():
     st.divider()
     with st.expander("📄 Elle CSV Yükle (yedek yöntem)"):
         _manual_upload_fallback(league_key, standalone=True)
+
+
+def _staleness_warning(result: dict):
+    """Veri güncel değilse kullanıcıyı açıkça uyarır.
+
+    Arşiv kaynağı canlı değildir; kaç ay geride olduğunu ve bunun tahmine
+    etkisini saklamadan söylemek gerekir.
+    """
+    stale = result.get("stale_days")
+    last = result.get("last_match_date")
+    if stale is None or last is None:
+        return
+    months = stale / 30.4
+    if months < 3:
+        st.caption(f"Son maç: {last} (veri güncel).")
+        return
+
+    st.warning(
+        f"⚠️ **Veri güncel değil.** Cache'teki son maç: **{last}** "
+        f"(yaklaşık **{months:.0f} ay** önce).\n\n"
+        "Model bu tarihten sonraki transferleri, yükselen/düşen takımları ve "
+        "form değişimlerini **görmez**. Yeni sezon maçlarında tahminlerin "
+        "güvenilirliği belirgin biçimde düşer.\n\n"
+        "Güncel veri için: football-data.co.uk erişimini açın (DNS/VPN) veya "
+        "*Kadro/Sakatlık* ekranından API-Football anahtarı girin."
+    )
 
 
 def _network_diagnosis(errors: list[str], league_key: str):

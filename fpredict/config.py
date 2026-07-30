@@ -138,6 +138,43 @@ def mirror_url(league_code: str, season: str) -> str | None:
     d = MIRROR_DIRS.get(league_code)
     return MIRROR_URL.format(dir=d, season=season) if d else None
 
+
+# --------------------------------------------------------------------------- #
+# Arşiv kaynağı (tüm ligler, tek dosya — ama güncel değil)
+# --------------------------------------------------------------------------- #
+# football-data.co.uk'tan türetilmiş, 2000-2025 arasını kapsayan birleşik veri
+# seti. GitHub üzerinde barındığı için football-data.co.uk engelliyken de
+# erişilebilir. 38 lig içerir (İskandinavya, Polonya, Belçika dahil).
+#
+# ÖNEMLİ: Bu bir ARŞİVDİR, canlı kaynak değildir. Son maç tarihleri ligden lige
+# değişir (büyük Avrupa ligleri ~2025 Mayıs, İskandinav ligleri ~2024 Aralık).
+# Güncel sezon verisi için asıl kaynağa veya API-Football'a ihtiyaç vardır.
+ARCHIVE_URL = (
+    "https://raw.githubusercontent.com/xgabora/Club-Football-Match-Data-2000-2025"
+    "/main/data/Matches.csv"
+)
+ARCHIVE_CACHE = APP_DIR / "archive_matches.csv"
+ARCHIVE_MAX_AGE_DAYS = 14   # yerel arşiv kopyası bu kadar gün sonra yenilenir
+
+# Bizim lig kodumuz -> arşivdeki 'Division' kodu (bazıları farklı yazılır)
+ARCHIVE_DIVISIONS: dict[str, str] = {
+    "E0": "E0", "E1": "E1", "SC0": "SC0",
+    "SP1": "SP1", "SP2": "SP2",
+    "D1": "D1", "D2": "D2",
+    "I1": "I1", "I2": "I2",
+    "F1": "F1", "F2": "F2",
+    "N1": "N1", "B1": "B1", "P1": "P1", "G1": "G1", "T1": "T1",
+    "SWE": "SWE", "NOR": "NOR", "DNK": "DEN", "FIN": "FIN",
+    "POL": "POL", "AUT": "AUT", "SWZ": "SUI", "IRL": "IRL",
+    "ROU": "ROM", "RUS": "RUS", "USA": "USA", "MEX": "MEX",
+    "BRA": "BRA", "ARG": "ARG", "JPN": "JAP", "CHN": "CHN",
+}
+
+
+def archive_division(league_key: str) -> str | None:
+    """Lig anahtarının arşivdeki karşılığı (yoksa None)."""
+    return ARCHIVE_DIVISIONS.get(league_key)
+
 # football-data.org lig id eşlemesi (sakatlık/kadro API'si opsiyonel kullanım)
 # API-Football (api-sports.io) league id'leri
 APIFOOTBALL_LEAGUE_IDS: dict[str, int] = {

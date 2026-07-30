@@ -82,6 +82,28 @@ class DixonColesModel:
     log_likelihood: float = field(default=float("nan"))
     n_matches: int = 0
 
+    # ----- isim çözümleme -------------------------------------------------- #
+    def resolve_team(self, name: str) -> str:
+        """Serbest yazılmış bir takım adını modeldeki adla eşleştirir.
+
+        Kaynaklar arası yazım farkları için ('Hamkam' -> 'Ham-Kam',
+        'Fenerbahçe' -> 'Fenerbahce') isim eşleştirme katmanını kullanır.
+
+        Raises:
+            KeyError: makul bir eşleşme bulunamazsa (mevcut adlardan örnekle).
+        """
+        if name in self.attack:
+            return name
+        from .name_matching import best_match
+
+        match, score = best_match(name, self.teams, threshold=0.75)
+        if match:
+            return match
+        raise KeyError(
+            f"Takım modelde bulunamadı: {name!r} (en yakın skor {score:.2f}). "
+            f"Mevcut takımlardan bazıları: {', '.join(self.teams[:5])}…"
+        )
+
     # ----- gol beklentileri ------------------------------------------------ #
     def expected_goals(self, home: str, away: str, home_boost: float = 1.0,
                        away_boost: float = 1.0) -> tuple[float, float]:
@@ -90,8 +112,8 @@ class DixonColesModel:
         `home_boost`/`away_boost` kadro/sakatlık güç çarpanlarıdır (1.0 = etkisiz).
         Çarpan doğrudan beklenen gol üzerine uygulanır (kaba yaklaşım).
         """
-        if home not in self.attack or away not in self.attack:
-            raise KeyError(f"Takım modelde yok: {home!r} veya {away!r}")
+        home = self.resolve_team(home)
+        away = self.resolve_team(away)
         lam = math.exp(self.attack[home] - self.defense[away] + self.home_adv)
         mu = math.exp(self.attack[away] - self.defense[home])
         return lam * home_boost, mu * away_boost
@@ -117,6 +139,8 @@ class DixonColesModel:
     # ----- tahmin ---------------------------------------------------------- #
     def predict(self, home: str, away: str, **boosts) -> dict:
         """Bir maç için tüm çıktı olasılıklarını üretir."""
+        home = self.resolve_team(home)
+        away = self.resolve_team(away)
         mat = self.score_matrix(home, away, **boosts)
         n = mat.shape[0]
         idx = np.arange(n)

@@ -135,3 +135,23 @@ def test_predict_unknown_team_raises():
     m = model.fit(df, half_life=0, min_matches=30)
     with pytest.raises(KeyError):
         m.predict("A", "Nonexistent")
+
+
+def test_resolve_team_handles_spelling_variants():
+    """Kaynaklar arası yazım farkları tahmini engellememeli."""
+    df, *_ = _synthetic_league()
+    df = df.replace({"A": "Ham-Kam", "B": "Fenerbahce"})
+    m = model.fit(df, half_life=0, min_matches=30)
+    assert m.resolve_team("HamKam") == "Ham-Kam"
+    assert m.resolve_team("Hamkam") == "Ham-Kam"
+    assert m.resolve_team("Fenerbahçe") == "Fenerbahce"
+    # tahmin de bu adlarla çalışmalı
+    pred = m.predict("HamKam", "Fenerbahçe")
+    assert 0.0 < pred["prob_home"] < 1.0
+
+
+def test_resolve_team_rejects_unrelated_name():
+    df, *_ = _synthetic_league()
+    m = model.fit(df, half_life=0, min_matches=30)
+    with pytest.raises(KeyError):
+        m.resolve_team("Real Madrid")
