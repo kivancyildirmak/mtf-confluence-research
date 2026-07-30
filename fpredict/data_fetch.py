@@ -541,7 +541,7 @@ def update_from_api(
         update_league ile aynı biçimde sonuç sözlüğü ('quota' alanı eklidir).
     """
     from .api_football import APIFootballClient, APIFootballError, api_seasons
-    from .squad_adjust import load_league_id
+    from .squad_adjust import load_api_provider, load_league_id
 
     info = config.LEAGUES.get(league_key)
     if info is None:
@@ -562,7 +562,7 @@ def update_from_api(
     except Exception:
         known = []
 
-    client = APIFootballClient(api_key)
+    client = APIFootballClient(api_key, provider=load_api_provider())
     years = api_seasons(league_key, seasons_back)
 
     total, ok, failed, errors = 0, [], [], []

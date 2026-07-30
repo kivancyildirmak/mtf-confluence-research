@@ -370,3 +370,65 @@ def test_all_leagues_have_api_id():
     from fpredict import config
     missing = [k for k in config.LEAGUES if k not in config.APIFOOTBALL_LEAGUE_IDS]
     assert not missing, f"API id tanımsız ligler: {missing}"
+
+
+# --------------------------------------------------------------------------- #
+# İki kanal (api-sports.io doğrudan / RapidAPI)
+# --------------------------------------------------------------------------- #
+def test_direct_provider_headers_and_url(monkeypatch):
+    cap = []
+    patch_get(monkeypatch, FakeResponse({"response": []}), cap)
+    af.APIFootballClient("K", provider="direct").fetch_fixtures(1, 2026, "X")
+    assert cap[0]["url"].startswith("https://v3.football.api-sports.io/")
+    assert cap[0]["headers"] == {"x-apisports-key": "K"}
+
+
+def test_rapidapi_provider_headers_and_url(monkeypatch):
+    cap = []
+    patch_get(monkeypatch, FakeResponse({"response": []}), cap)
+    af.APIFootballClient("K", provider="rapidapi").fetch_fixtures(1, 2026, "X")
+    assert cap[0]["url"].startswith("https://api-football-v1.p.rapidapi.com/v3/")
+    assert cap[0]["headers"]["x-rapidapi-key"] == "K"
+    assert cap[0]["headers"]["x-rapidapi-host"] == "api-football-v1.p.rapidapi.com"
+
+
+def test_unknown_provider_rejected():
+    with pytest.raises(af.APIFootballError) as exc:
+        af.APIFootballClient("K", provider="nope")
+    assert "sağlayıcı" in str(exc.value).lower()
+
+
+def test_rapidapi_quota_from_remaining_header(monkeypatch):
+    """RapidAPI 'kalan' bildirir, api-sports 'kullanılan' — ikisi de okunmalı."""
+    patch_get(monkeypatch, FakeResponse(
+        {"response": []},
+        headers={"x-ratelimit-requests-limit": "100",
+                 "x-ratelimit-requests-remaining": "88"},
+    ))
+    c = af.APIFootballClient("K", provider="rapidapi")
+    c.fetch_fixtures(1, 2026, "X")
+    assert c.last_quota.limit == 100
+    assert c.last_quota.used == 12
+    assert c.last_quota.remaining == 88
+
+
+def test_provider_error_message_names_channel(monkeypatch):
+    import requests
+    patch_get(monkeypatch, requests.exceptions.ConnectTimeout("timed out"))
+    with pytest.raises(af.APIFootballError) as exc:
+        af.APIFootballClient("K", provider="rapidapi").status()
+    assert "RapidAPI" in str(exc.value)
+
+
+def test_provider_setting_roundtrip(tmp_path, monkeypatch):
+    from fpredict import config, squad_adjust
+
+    monkeypatch.setattr(config, "APP_DIR", tmp_path)
+    monkeypatch.setattr(config, "SETTINGS_PATH", tmp_path / "settings.json")
+
+    assert squad_adjust.load_api_provider() == "direct"   # varsayılan
+    squad_adjust.save_api_provider("rapidapi")
+    assert squad_adjust.load_api_provider() == "rapidapi"
+    # anahtar kaydı kanalı silmemeli
+    squad_adjust.save_api_key("K")
+    assert squad_adjust.load_api_provider() == "rapidapi"

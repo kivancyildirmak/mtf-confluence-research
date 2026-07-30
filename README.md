@@ -208,11 +208,22 @@ football-data.co.uk erişilemiyorsa ve **güncel** veri gerekiyorsa
 Ücretsiz plan **günde 100 istek** verir; bir ligin bir sezonu **tek istek**
 harcadığından bu fazlasıyla yeterlidir.
 
+**İki kanal desteklenir** — aynı API, farklı alan adları. Biri ağınızda
+engelliyse diğerini seçebilirsiniz (veri ve kullanım birebir aynıdır):
+
+| Kanal | Ana makine | Kayıt |
+|---|---|---|
+| Doğrudan | `v3.football.api-sports.io` | dashboard.api-football.com/register |
+| RapidAPI | `api-football-v1.p.rapidapi.com` | rapidapi.com/api-sports/api/api-football |
+
+> Anahtarlar kanala özeldir: RapidAPI anahtarı doğrudan kanalda çalışmaz.
+
 **Kurulum:**
-1. api-sports.io üzerinden ücretsiz kaydolun, anahtarınızı kopyalayın.
-2. **Veri** ekranı → *Veri kaynağı: API-Football* → anahtarı yapıştırıp kaydedin.
-3. **🔌 Bağlantıyı Test Et** ile anahtarı ve kalan kotayı doğrulayın.
-4. Ligi seçip **Verileri Güncelle**'ye basın.
+1. **Veri** ekranı → *Veri kaynağı: API-Football* → **API kanalı**'nı seçin.
+2. Seçtiğiniz kanaldan ücretsiz kaydolup anahtarınızı kopyalayın.
+3. Anahtarı yapıştırıp kaydedin.
+4. **🔌 Bağlantıyı Test Et** ile anahtarı ve kalan kotayı doğrulayın.
+5. Ligi seçip **Verileri Güncelle**'ye basın.
 
 **Lig ID doğrulama:** Uygulamada 32 lig için yerleşik API lig ID'si vardır.
 Bir ID yanlış/eskimişse API 0 maç döndürür; bu durumda **🔎 Lig ID ara / düzelt**

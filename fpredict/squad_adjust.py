@@ -106,7 +106,7 @@ def fetch_injuries_for_team(
             "Veri ekranındaki 'Lig ID ara' aracıyla belirleyebilirsiniz."
         )
     try:
-        client = APIFootballClient(api_key)
+        client = APIFootballClient(api_key, provider=load_api_provider())
         team_id = client.find_team_id(league_id, season, team_name)
         if not team_id:
             raise SquadAPIError(
@@ -130,6 +130,19 @@ def save_api_key(key: str) -> None:
 
 def load_api_key() -> Optional[str]:
     return _load_settings().get("apifootball_key")
+
+
+def save_api_provider(provider: str) -> None:
+    """Kullanılacak API kanalını kaydeder ('direct' veya 'rapidapi')."""
+    config.ensure_app_dir()
+    settings = _load_settings()
+    settings["apifootball_provider"] = provider
+    config.SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
+
+
+def load_api_provider() -> str:
+    """Kayıtlı API kanalı (varsayılan: doğrudan api-sports.io)."""
+    return _load_settings().get("apifootball_provider") or "direct"
 
 
 def save_league_id(league_key: str, league_id: int) -> None:

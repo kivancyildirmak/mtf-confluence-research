@@ -145,14 +145,38 @@ def render():
 
 
 def _api_panel(league_key: str, api_key: str | None):
-    """API-Football anahtarı, bağlantı testi ve lig ID doğrulama aracı."""
+    """API-Football kanalı, anahtarı, bağlantı testi ve lig ID doğrulama aracı."""
+    from fpredict.api_football import PROVIDERS
+
+    # --- Kanal seçimi ------------------------------------------------------- #
+    keys = list(PROVIDERS.keys())
+    current = squad_adjust.load_api_provider()
+    provider = st.radio(
+        "API kanalı",
+        keys,
+        index=keys.index(current) if current in keys else 0,
+        format_func=lambda k: PROVIDERS[k]["label"],
+        horizontal=True,
+        help=(
+            "Aynı API iki farklı alan adından sunulur. Biri ağınızda "
+            "engelliyse diğerini deneyin — veri ve kullanım aynıdır."
+        ),
+    )
+    if provider != current:
+        squad_adjust.save_api_provider(provider)
+        st.caption(f"Kanal '{PROVIDERS[provider]['label']}' olarak kaydedildi.")
+
     if not api_key:
         st.warning(
-            "Bu kaynak için ücretsiz bir **API-Football anahtarı** gerekir.\n\n"
-            "1. [api-sports.io](https://www.api-sports.io/) üzerinden ücretsiz "
-            "kaydolun (günde 100 istek).\n"
+            f"Bu kaynak için ücretsiz bir **API anahtarı** gerekir "
+            f"(günde 100 istek).\n\n"
+            f"1. Kayıt olun: {PROVIDERS[provider]['signup']}\n"
             "2. Panelden anahtarınızı kopyalayın.\n"
             "3. Aşağıya yapıştırıp kaydedin."
+        )
+        st.caption(
+            "Not: RapidAPI anahtarı ile doğrudan api-sports.io anahtarı "
+            "**farklıdır**; seçtiğiniz kanalın anahtarını girin."
         )
         new_key = st.text_input("API anahtarı", type="password", key="api_key_data")
         if st.button("💾 Anahtarı Kaydet"):
@@ -164,11 +188,18 @@ def _api_panel(league_key: str, api_key: str | None):
                 st.error("Anahtar boş olamaz.")
         return
 
+    with st.expander("🔑 Anahtarı değiştir"):
+        new_key = st.text_input("Yeni API anahtarı", type="password", key="api_key_edit")
+        if st.button("Kaydet", key="save_key_edit") and new_key.strip():
+            squad_adjust.save_api_key(new_key.strip())
+            st.success("Anahtar güncellendi.")
+            st.rerun()
+
     league_id = squad_adjust.load_league_id(league_key)
     c1, c2 = st.columns([1, 2])
     with c1:
         if st.button("🔌 Bağlantıyı Test Et"):
-            _test_api_connection(api_key)
+            _test_api_connection(api_key, provider)
     with c2:
         st.caption(
             f"Kullanılacak lig ID: **{league_id}** — "
@@ -184,7 +215,9 @@ def _api_panel(league_key: str, api_key: str | None):
         if st.button("Ara") and query.strip():
             try:
                 from fpredict.api_football import APIFootballClient
-                results = APIFootballClient(api_key).search_leagues(query.strip())
+                results = APIFootballClient(
+                    api_key, provider=squad_adjust.load_api_provider()
+                ).search_leagues(query.strip())
                 if not results:
                     st.info("Sonuç bulunamadı.")
                 else:
@@ -203,11 +236,11 @@ def _api_panel(league_key: str, api_key: str | None):
                 st.rerun()
 
 
-def _test_api_connection(api_key: str):
+def _test_api_connection(api_key: str, provider: str = "direct"):
     """Anahtarı /status ile doğrular ve kotayı gösterir."""
     try:
         from fpredict.api_football import APIFootballClient
-        info = APIFootballClient(api_key).status()
+        info = APIFootballClient(api_key, provider=provider).status()
     except Exception as exc:
         st.error(f"Bağlantı başarısız: {exc}")
         return

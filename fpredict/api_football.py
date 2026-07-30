@@ -32,7 +32,25 @@ from datetime import date
 from . import config, db
 from .name_matching import best_match
 
-BASE_URL = "https://v3.football.api-sports.io"
+# API-Football iki kanaldan sunulur. Gövde/yanıt biçimi AYNIdır; yalnızca ana
+# makine adı ve kimlik başlıkları değişir. Bir alan adı ağ seviyesinde
+# engelliyken diğeri çalışabildiği için ikisi de desteklenir.
+PROVIDERS = {
+    "direct": {
+        "label": "api-sports.io (doğrudan)",
+        "base_url": "https://v3.football.api-sports.io",
+        "signup": "https://dashboard.api-football.com/register",
+    },
+    "rapidapi": {
+        "label": "RapidAPI",
+        "base_url": "https://api-football-v1.p.rapidapi.com/v3",
+        "signup": "https://rapidapi.com/api-sports/api/api-football",
+    },
+}
+DEFAULT_PROVIDER = "direct"
+
+# Geriye dönük uyumluluk (eski kod/testler bu sabiti kullanıyordu)
+BASE_URL = PROVIDERS["direct"]["base_url"]
 
 # Yalnızca tamamlanmış maçlar modele girer (NS = başlamadı, PST = ertelendi …)
 FINISHED_STATUSES = {"FT", "AET", "PEN"}
@@ -85,38 +103,65 @@ def _canonical_name(name: str, known_teams=None) -> str:
 class APIFootballClient:
     """API-Football v3 için ince istemci."""
 
-    def __init__(self, api_key: str, timeout: int = config.HTTP_TIMEOUT):
+    def __init__(self, api_key: str, provider: str = DEFAULT_PROVIDER,
+                 timeout: int = config.HTTP_TIMEOUT):
         if not api_key or not str(api_key).strip():
             raise APIFootballError("API anahtarı girilmemiş.")
+        if provider not in PROVIDERS:
+            raise APIFootballError(
+                f"Bilinmeyen sağlayıcı: {provider!r}. "
+                f"Seçenekler: {', '.join(PROVIDERS)}"
+            )
         self.api_key = str(api_key).strip()
+        self.provider = provider
+        self.base_url = PROVIDERS[provider]["base_url"]
         self.timeout = timeout
         self.last_quota: APIQuota | None = None
 
     # ------------------------------------------------------------------ #
+    def _headers(self) -> dict:
+        """Sağlayıcıya göre kimlik başlıkları."""
+        if self.provider == "rapidapi":
+            host = self.base_url.split("//", 1)[1].split("/", 1)[0]
+            return {"x-rapidapi-key": self.api_key, "x-rapidapi-host": host}
+        return {"x-apisports-key": self.api_key}
+
+    def _read_quota(self, headers) -> APIQuota:
+        """Kota başlıklarını okur (iki sağlayıcı farklı başlık kullanır).
+
+        api-sports.io  : x-ratelimit-requests-current (kullanılan)
+        RapidAPI       : x-ratelimit-requests-remaining (kalan)
+        """
+        limit = _int(headers.get("x-ratelimit-requests-limit"))
+        used = _int(headers.get("x-ratelimit-requests-current"))
+        if used is None:
+            remaining = _int(headers.get("x-ratelimit-requests-remaining"))
+            if remaining is not None and limit is not None:
+                used = max(0, limit - remaining)
+        return APIQuota(used=used, limit=limit)
+
     def _get(self, path: str, params: dict | None = None) -> dict:
         """Tek bir GET isteği; HTTP ve API-içi hataları anlamlı mesaja çevirir."""
         import requests
 
         from .data_fetch import classify_network_error
 
-        url = f"{BASE_URL}/{path.lstrip('/')}"
+        url = f"{self.base_url}/{path.lstrip('/')}"
         try:
             resp = requests.get(
                 url,
                 params=params or {},
-                headers={"x-apisports-key": self.api_key},
+                headers=self._headers(),
                 timeout=self.timeout,
             )
         except requests.exceptions.RequestException as exc:
             raise APIFootballError(
-                f"API'ye erişilemedi: {classify_network_error(exc)}"
+                f"API'ye erişilemedi ({PROVIDERS[self.provider]['label']}): "
+                f"{classify_network_error(exc)}"
             ) from exc
 
         # Kota başlıkları (varsa) her yanıtta güncellenir
-        self.last_quota = APIQuota(
-            used=_int(resp.headers.get("x-ratelimit-requests-current")),
-            limit=_int(resp.headers.get("x-ratelimit-requests-limit")),
-        )
+        self.last_quota = self._read_quota(resp.headers)
 
         if resp.status_code in (401, 403):
             raise APIFootballError(
