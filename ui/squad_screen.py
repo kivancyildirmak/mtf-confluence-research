@@ -53,13 +53,43 @@ def render():
 
     # --- API'den sakatlık çek ---------------------------------------------- #
     api_key = squad_adjust.load_api_key()
-    if api_key and league_key in config.APIFOOTBALL_LEAGUE_IDS:
-        if st.button("📡 API'den sakatlıkları çek"):
-            st.info(
-                "Not: API takım id eşlemesi gerektirir. Bu sürümde otomatik id "
-                "çözümlemesi yapılmadığından, çekilen liste yalnızca bilgilendirme "
-                "amaçlıdır; çarpanı aşağıdan elle ayarlayın."
-            )
+    if api_key:
+        from fpredict.api_football import api_seasons
+
+        season = api_seasons(config.key_for_code(league_key), 1)[0]
+        if st.button(f"📡 '{team}' için sakatlıkları çek ({season} sezonu)"):
+            with st.spinner("API sorgulanıyor…"):
+                try:
+                    injuries = squad_adjust.fetch_injuries_for_team(
+                        api_key, config.key_for_code(league_key), team, season
+                    )
+                except squad_adjust.SquadAPIError as exc:
+                    st.error(f"Sakatlık verisi alınamadı: {exc}")
+                    injuries = None
+
+            if injuries is not None:
+                if not injuries:
+                    st.info(
+                        f"API, '{team}' için bu sezon kayıtlı sakat/cezalı oyuncu "
+                        "döndürmedi. (Kayıt olmaması sakat oyuncu yok demek "
+                        "olmayabilir.)"
+                    )
+                else:
+                    st.success(f"{len(injuries)} kayıt bulundu:")
+                    import pandas as pd
+                    st.dataframe(pd.DataFrame(injuries), use_container_width=True,
+                                 hide_index=True)
+                    st.caption(
+                        "Bu liste bilgilendirme amaçlıdır. Etkiyi modele yansıtmak "
+                        "için aşağıdan güç çarpanını ayarlayın — hangi oyuncunun ne "
+                        "kadar kritik olduğunu uygulama bilemez."
+                    )
+                    st.session_state[f"inj_count_{team}"] = len(injuries)
+    else:
+        st.caption(
+            "ℹ️ Otomatik sakatlık çekimi için **Veri** ekranından API-Football "
+            "anahtarı girin. Anahtarsız da aşağıdan elle çarpan girebilirsiniz."
+        )
 
     # --- Elle giriş --------------------------------------------------------- #
     st.subheader(f"'{team}' için güç çarpanı")

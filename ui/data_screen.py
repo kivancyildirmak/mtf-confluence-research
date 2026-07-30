@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from fpredict import config, data_fetch, db
+from fpredict import config, data_fetch, db, squad_adjust
 from . import common
 
 
@@ -56,18 +56,30 @@ def render():
 
     # --- Kaynak seçimi ------------------------------------------------------ #
     in_archive = config.archive_division(league_key) is not None
+    api_key = squad_adjust.load_api_key()
+
+    options = ["Otomatik (önerilen)"]
+    if in_archive:
+        options.append("Arşiv (GitHub) — güncel değil")
+    options.append("API-Football — güncel")
+
     source_mode = st.radio(
         "Veri kaynağı",
-        ["Otomatik (önerilen)", "Yalnızca arşiv (GitHub)"],
+        options,
         horizontal=True,
         help=(
-            "Otomatik: önce football-data.co.uk, olmazsa yedek ayna denenir.\n"
-            "Arşiv: football-data.co.uk engelliyse tüm ligler için çalışır, "
-            "ancak veri güncel değildir."
+            "Otomatik: önce football-data.co.uk, olmazsa GitHub aynası.\n"
+            "Arşiv: engel varken tüm ligler için çalışır ama veri eskidir.\n"
+            "API-Football: güncel sezon dahil; ücretsiz anahtar gerekir."
         ),
-        disabled=not in_archive,
     )
-    use_archive = in_archive and source_mode == "Yalnızca arşiv (GitHub)"
+    use_archive = source_mode.startswith("Arşiv")
+    use_api = source_mode.startswith("API-Football")
+
+    if use_api:
+        _api_panel(league_key, api_key)
+        if not api_key:
+            st.stop()
 
     if st.button("🔄 Verileri Güncelle", type="primary"):
         prog = st.progress(0.0, text="Başlatılıyor…")
@@ -78,6 +90,12 @@ def render():
         try:
             if use_archive:
                 result = data_fetch.update_from_archive(league_key, progress=_cb)
+            elif use_api:
+                result = data_fetch.update_from_api(
+                    league_key, api_key, seasons_back=int(seasons_back), progress=_cb
+                )
+                if result.get("quota"):
+                    st.caption(f"API kotası: {result['quota']}")
             else:
                 result = data_fetch.update_league(
                     league_key, seasons_back=int(seasons_back), progress=_cb
@@ -124,6 +142,80 @@ def render():
     st.divider()
     with st.expander("📄 Elle CSV Yükle (yedek yöntem)"):
         _manual_upload_fallback(league_key, standalone=True)
+
+
+def _api_panel(league_key: str, api_key: str | None):
+    """API-Football anahtarı, bağlantı testi ve lig ID doğrulama aracı."""
+    if not api_key:
+        st.warning(
+            "Bu kaynak için ücretsiz bir **API-Football anahtarı** gerekir.\n\n"
+            "1. [api-sports.io](https://www.api-sports.io/) üzerinden ücretsiz "
+            "kaydolun (günde 100 istek).\n"
+            "2. Panelden anahtarınızı kopyalayın.\n"
+            "3. Aşağıya yapıştırıp kaydedin."
+        )
+        new_key = st.text_input("API anahtarı", type="password", key="api_key_data")
+        if st.button("💾 Anahtarı Kaydet"):
+            if new_key.strip():
+                squad_adjust.save_api_key(new_key.strip())
+                st.success("Anahtar kaydedildi. Sayfayı yenileyin.")
+                st.rerun()
+            else:
+                st.error("Anahtar boş olamaz.")
+        return
+
+    league_id = squad_adjust.load_league_id(league_key)
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        if st.button("🔌 Bağlantıyı Test Et"):
+            _test_api_connection(api_key)
+    with c2:
+        st.caption(
+            f"Kullanılacak lig ID: **{league_id}** — "
+            "sonuç boş gelirse aşağıdaki araçla doğrulayın."
+        )
+
+    with st.expander("🔎 Lig ID ara / düzelt"):
+        st.caption(
+            "Yerleşik ID yanlışsa (API 0 maç döndürüyorsa) ligi adıyla arayıp "
+            "doğru ID'yi seçebilirsiniz. Seçiminiz kalıcı kaydedilir."
+        )
+        query = st.text_input("Lig adı (en az 3 harf)", value="", key="lg_search")
+        if st.button("Ara") and query.strip():
+            try:
+                from fpredict.api_football import APIFootballClient
+                results = APIFootballClient(api_key).search_leagues(query.strip())
+                if not results:
+                    st.info("Sonuç bulunamadı.")
+                else:
+                    st.session_state["league_search_results"] = results
+            except Exception as exc:
+                st.error(f"Arama başarısız: {exc}")
+
+        for r in st.session_state.get("league_search_results", [])[:12]:
+            cols = st.columns([4, 2, 2, 2])
+            cols[0].write(f"**{r['name']}** ({r['country']})")
+            cols[1].write(f"tip: {r.get('type', '-')}")
+            cols[2].write(f"ID: `{r['id']}`")
+            if cols[3].button("Bunu kullan", key=f"pick_{r['id']}"):
+                squad_adjust.save_league_id(league_key, r["id"])
+                st.success(f"{league_key} için lig ID {r['id']} kaydedildi.")
+                st.rerun()
+
+
+def _test_api_connection(api_key: str):
+    """Anahtarı /status ile doğrular ve kotayı gösterir."""
+    try:
+        from fpredict.api_football import APIFootballClient
+        info = APIFootballClient(api_key).status()
+    except Exception as exc:
+        st.error(f"Bağlantı başarısız: {exc}")
+        return
+    quota = info.get("quota")
+    st.success(
+        f"✅ Bağlantı çalışıyor. Plan: **{info.get('plan') or '-'}**"
+        + (f" — {quota.describe()}" if quota else "")
+    )
 
 
 def _staleness_warning(result: dict):

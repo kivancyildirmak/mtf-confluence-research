@@ -201,11 +201,39 @@ ABD MLS (USA), Meksika (MEX), Brezilya (BRA), Arjantin (ARG), Japonya (JPN),
 > alabilir; football-data.co.uk yalnızca lig maçlarını yayınladığı için bu tür
 > eşleşmeler modelde bulunmaz.
 
-### 2) Sakatlık / kadro — resmi API (opsiyonel)
-[API-Football (api-sports.io)](https://www.api-sports.io/) gibi ücretsiz kotalı
-bir API'nin `injuries` endpoint'i desteklenir. Anahtar **Kadro/Sakatlık**
-ekranından girilir ve yalnızca yerelde (`~/.football_predictor/settings.json`)
-saklanır. Anahtar yoksa elle güç çarpanı girebilirsiniz.
+### 2) API-Football — güncel sezon verisi (önerilen yedek)
+
+football-data.co.uk erişilemiyorsa ve **güncel** veri gerekiyorsa
+[API-Football (api-sports.io)](https://www.api-sports.io/) kullanılabilir.
+Ücretsiz plan **günde 100 istek** verir; bir ligin bir sezonu **tek istek**
+harcadığından bu fazlasıyla yeterlidir.
+
+**Kurulum:**
+1. api-sports.io üzerinden ücretsiz kaydolun, anahtarınızı kopyalayın.
+2. **Veri** ekranı → *Veri kaynağı: API-Football* → anahtarı yapıştırıp kaydedin.
+3. **🔌 Bağlantıyı Test Et** ile anahtarı ve kalan kotayı doğrulayın.
+4. Ligi seçip **Verileri Güncelle**'ye basın.
+
+**Lig ID doğrulama:** Uygulamada 32 lig için yerleşik API lig ID'si vardır.
+Bir ID yanlış/eskimişse API 0 maç döndürür; bu durumda **🔎 Lig ID ara / düzelt**
+aracıyla ligi adıyla arayıp doğru ID'yi seçebilirsiniz. Seçim
+`settings.json` içine kalıcı yazılır ve yerleşik değeri geçersiz kılar.
+
+**Sınırlar:**
+- Ücretsiz planda **bahis oranı yoktur** → *Değer* ekranı API verisiyle çalışmaz
+  (Tahmin ve Backtest normal çalışır).
+- API'den gelen takım adları, cache'te zaten bulunan adlara otomatik çapalanır
+  (aynı takımın iki yazımla bölünmesini önlemek için).
+
+### 3) Sakatlık / kadro — resmi API (opsiyonel)
+Aynı API anahtarıyla **Kadro/Sakatlık** ekranından bir takımın sakat/cezalı
+oyuncuları çekilebilir. Takım ID'si lig kadrosundan otomatik çözülür (isim
+eşleştirmesiyle); elle ID girmeniz gerekmez. Anahtar yalnızca yerelde
+(`~/.football_predictor/settings.json`) saklanır, hiçbir yere gönderilmez.
+
+Çekilen liste **bilgilendirme amaçlıdır**: hangi oyuncunun ne kadar kritik
+olduğunu uygulama bilemez, bu yüzden modele etkiyi siz güç çarpanıyla
+verirsiniz. Anahtar yoksa çarpanı doğrudan elle girebilirsiniz.
 
 > Rastgele sitelerden ham scraping **yapılmaz** — yalnızca resmi/izinli API'ler
 > ve açık veri kullanılır. Yalnızca kullanım şartlarına uygun kaynakları kullanın.

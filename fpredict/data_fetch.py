@@ -524,6 +524,97 @@ def update_from_archive(league_key: str, db_path=None, progress=None) -> dict:
     }
 
 
+def update_from_api(
+    league_key: str,
+    api_key: str,
+    seasons_back: int = 2,
+    db_path=None,
+    progress=None,
+) -> dict:
+    """Bir ligi API-Football'dan günceller (güncel sezon dahil).
+
+    Her sezon TEK istek harcar; ücretsiz kota (100/gün) için uygundur.
+    API'den gelen takım adları, cache'te zaten bulunan adlara çapalanır ki
+    aynı takım iki farklı yazımla bölünmesin.
+
+    Returns:
+        update_league ile aynı biçimde sonuç sözlüğü ('quota' alanı eklidir).
+    """
+    from .api_football import APIFootballClient, APIFootballError, api_seasons
+    from .squad_adjust import load_league_id
+
+    info = config.LEAGUES.get(league_key)
+    if info is None:
+        raise DataFetchError(f"Bilinmeyen lig: {league_key}")
+    league_id = load_league_id(league_key)
+    if not league_id:
+        raise DataFetchError(
+            f"{info.name} için API-Football lig id'si tanımlı değil. "
+            "Veri ekranındaki 'Lig ID ara' aracını kullanın."
+        )
+
+    code = info.code
+    # Cache'te zaten olan takım adları (çapa olarak kullanılır)
+    try:
+        existing = db.load_matches(code, db_path=db_path)
+        known = sorted(set(existing["home_team"]) | set(existing["away_team"])) \
+            if not existing.empty else []
+    except Exception:
+        known = []
+
+    client = APIFootballClient(api_key)
+    years = api_seasons(league_key, seasons_back)
+
+    total, ok, failed, errors = 0, [], [], []
+    for i, year in enumerate(years):
+        if progress:
+            progress(f"API-Football: {info.name} {year} sezonu…", i / max(1, len(years)))
+        try:
+            rows = client.fetch_fixtures(league_id, year, code, known_teams=known)
+            if not rows:
+                failed.append(str(year))
+                errors.append(
+                    f"{year}: API 0 tamamlanmış maç döndürdü "
+                    f"(lig id {league_id} yanlış olabilir veya sezon henüz başlamamış)."
+                )
+                continue
+            total += db.upsert_matches(rows, db_path=db_path)
+            ok.append(str(year))
+            # Yeni takımlar sonraki sezonlara da çapa olsun
+            known = sorted(set(known) | {r["home_team"] for r in rows}
+                           | {r["away_team"] for r in rows})
+        except APIFootballError as exc:
+            failed.append(str(year))
+            errors.append(f"{year}: {exc}")
+
+    if ok:
+        db.touch_updated(code, db_path=db_path)
+    if progress:
+        progress("Tamamlandı.", 1.0)
+
+    # Güncellik bilgisi
+    last_date, stale_days = None, None
+    try:
+        df = db.load_matches(code, db_path=db_path)
+        if not df.empty:
+            last_date = df["date"].max().date().isoformat()
+            stale_days = (date.today() - df["date"].max().date()).days
+    except Exception:
+        pass
+
+    return {
+        "league": league_key,
+        "inserted": total,
+        "seasons_ok": ok,
+        "seasons_failed": failed,
+        "errors": errors,
+        "sources_used": ["API-Football"] if ok else [],
+        "last_match_date": last_date,
+        "stale_days": stale_days,
+        "quota": client.last_quota.describe() if client.last_quota else None,
+    }
+
+
 def _update_extra_league(league_key: str, code: str, db_path=None, progress=None) -> dict:
     """'extra' biçimli ligi (tek dosya, tüm sezonlar) indirip cache'e yazar."""
     url = extra_csv_url(code)

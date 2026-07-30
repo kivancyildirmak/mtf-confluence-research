@@ -47,6 +47,9 @@ class LeagueInfo:
     code: str          # football-data.co.uk dosya kodu
     source: str        # "main" (sezon başına dosya) veya "extra" (tek dosya)
     country: str = ""  # gruplama için
+    # Takvim yılı ligi mi? (İskandinavya, MLS, Brezilya: Mart-Kasım tek yıl)
+    # False ise sonbahar-ilkbahar ligi (2025-26 gibi) demektir.
+    calendar_year: bool = False
 
 
 LEAGUES: dict[str, LeagueInfo] = {
@@ -70,22 +73,22 @@ LEAGUES: dict[str, LeagueInfo] = {
 
     # ---- "extra" biçim: new/{kod}.csv ------------------------------------- #
     # Not: İskandinav ligleri ilkbahar-sonbahar takvimiyle oynanır.
-    "SWE": LeagueInfo("İsveç Allsvenskan", "SWE", "extra", "İsveç"),
-    "NOR": LeagueInfo("Norveç Eliteserien", "NOR", "extra", "Norveç"),
+    "SWE": LeagueInfo("İsveç Allsvenskan", "SWE", "extra", "İsveç", calendar_year=True),
+    "NOR": LeagueInfo("Norveç Eliteserien", "NOR", "extra", "Norveç", calendar_year=True),
     "DNK": LeagueInfo("Danimarka Superliga", "DNK", "extra", "Danimarka"),
-    "FIN": LeagueInfo("Finlandiya Veikkausliiga", "FIN", "extra", "Finlandiya"),
+    "FIN": LeagueInfo("Finlandiya Veikkausliiga", "FIN", "extra", "Finlandiya", calendar_year=True),
     "POL": LeagueInfo("Polonya Ekstraklasa", "POL", "extra", "Polonya"),
     "AUT": LeagueInfo("Avusturya Bundesliga", "AUT", "extra", "Avusturya"),
     "SWZ": LeagueInfo("İsviçre Super Lig", "SWZ", "extra", "İsviçre"),
-    "IRL": LeagueInfo("İrlanda Premier Division", "IRL", "extra", "İrlanda"),
+    "IRL": LeagueInfo("İrlanda Premier Division", "IRL", "extra", "İrlanda", calendar_year=True),
     "ROU": LeagueInfo("Romanya Liga 1", "ROU", "extra", "Romanya"),
     "RUS": LeagueInfo("Rusya Premier Lig", "RUS", "extra", "Rusya"),
-    "USA": LeagueInfo("ABD MLS", "USA", "extra", "ABD"),
+    "USA": LeagueInfo("ABD MLS", "USA", "extra", "ABD", calendar_year=True),
     "MEX": LeagueInfo("Meksika Liga MX", "MEX", "extra", "Meksika"),
-    "BRA": LeagueInfo("Brezilya Serie A", "BRA", "extra", "Brezilya"),
+    "BRA": LeagueInfo("Brezilya Serie A", "BRA", "extra", "Brezilya", calendar_year=True),
     "ARG": LeagueInfo("Arjantin Primera Division", "ARG", "extra", "Arjantin"),
-    "JPN": LeagueInfo("Japonya J1 Lig", "JPN", "extra", "Japonya"),
-    "CHN": LeagueInfo("Çin Super Lig", "CHN", "extra", "Çin"),
+    "JPN": LeagueInfo("Japonya J1 Lig", "JPN", "extra", "Japonya", calendar_year=True),
+    "CHN": LeagueInfo("Çin Super Lig", "CHN", "extra", "Çin", calendar_year=True),
 }
 
 # kod -> görünen ad (arayüzde cache tablosunu okunur hale getirmek için)
@@ -101,6 +104,21 @@ def league_label(key: str) -> str:
 def league_name_for_code(code: str) -> str:
     """football-data kodundan görünen adı döndürür (bilinmiyorsa kodun kendisi)."""
     return LEAGUE_NAMES.get(code, code)
+
+
+def key_for_code(code: str) -> str:
+    """Cache'te saklanan lig kodundan LEAGUES anahtarını bulur.
+
+    Şu an tüm ligler için anahtar == kod, ancak arayüz cache'ten kodu okuyup
+    LEAGUES'e anahtarla eriştiği için bu dönüşümü varsayım yerine açık bir
+    fonksiyona bağlıyoruz.
+    """
+    if code in LEAGUES:
+        return code
+    for key, info in LEAGUES.items():
+        if info.code == code:
+            return key
+    return code
 
 
 BASE_URL = "https://www.football-data.co.uk/mmz4281"
@@ -177,22 +195,42 @@ def archive_division(league_key: str) -> str | None:
 
 # football-data.org lig id eşlemesi (sakatlık/kadro API'si opsiyonel kullanım)
 # API-Football (api-sports.io) league id'leri
+# NOT: Bu id'ler API-Football'un yayımladığı lig kimlikleridir. Yanlış/eskimiş
+# olma ihtimaline karşı arayüzde "Lig ID ara/doğrula" aracı vardır; kullanıcının
+# bulduğu id settings.json içine yazılır ve buradaki varsayılanı geçersiz kılar.
 APIFOOTBALL_LEAGUE_IDS: dict[str, int] = {
     "T1": 203,   # Süper Lig
     "E0": 39,    # Premier League
+    "E1": 40,    # Championship
+    "SC0": 179,  # Scottish Premiership
     "SP1": 140,  # La Liga
+    "SP2": 141,  # La Liga 2
     "D1": 78,    # Bundesliga
+    "D2": 79,    # 2. Bundesliga
     "I1": 135,   # Serie A
+    "I2": 136,   # Serie B
     "F1": 61,    # Ligue 1
+    "F2": 62,    # Ligue 2
     "N1": 88,    # Eredivisie
     "P1": 94,    # Primeira Liga
+    "G1": 197,   # Super League Greece
     "B1": 144,   # Jupiler Pro League
     "SWE": 113,  # Allsvenskan
     "NOR": 103,  # Eliteserien
     "DNK": 119,  # Superliga
+    "FIN": 244,  # Veikkausliiga
     "POL": 106,  # Ekstraklasa
     "AUT": 218,  # Österreichische Bundesliga
     "SWZ": 207,  # Swiss Super League
+    "IRL": 357,  # Premier Division
+    "ROU": 283,  # Liga I
+    "RUS": 235,  # Premier League
+    "USA": 253,  # MLS
+    "MEX": 262,  # Liga MX
+    "BRA": 71,   # Serie A
+    "ARG": 128,  # Liga Profesional
+    "JPN": 98,   # J1 League
+    "CHN": 169,  # Super League
 }
 
 # --------------------------------------------------------------------------- #

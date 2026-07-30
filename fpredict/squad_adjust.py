@@ -79,51 +79,43 @@ class SquadAPIError(RuntimeError):
     """API çağrısı başarısız olduğunda kullanıcıya gösterilebilir hata."""
 
 
-def fetch_injuries_api_football(
+def fetch_injuries_for_team(
     api_key: str,
-    team_id: int,
+    league_key: str,
+    team_name: str,
     season: int,
-    timeout: int = config.HTTP_TIMEOUT,
 ) -> list[dict]:
-    """API-Football injuries endpoint'inden takımın sakat oyuncularını çeker.
+    """Takım ADINDAN yola çıkarak sakat/cezalı oyuncuları çeker.
+
+    Önceki sürümde kullanıcıdan sayısal takım id'si bekleniyordu ve bu yüzden
+    özellik arayüzde kullanılamıyordu. Artık takım id'si lig kadrosundan
+    otomatik çözülür (isim eşleştirmesiyle).
 
     Returns:
         [{"player": str, "type": str, "reason": str}, ...]
 
     Raises:
-        SquadAPIError: anahtar yoksa veya ağ/HTTP hatası olursa.
+        SquadAPIError: anahtar/lig id yoksa, takım bulunamazsa veya API hata verirse.
     """
-    if not api_key:
-        raise SquadAPIError("API anahtarı girilmemiş.")
-    import requests
+    from .api_football import APIFootballClient, APIFootballError
 
-    url = "https://v3.football.api-sports.io/injuries"
-    try:
-        resp = requests.get(
-            url,
-            params={"team": team_id, "season": season},
-            headers={"x-apisports-key": api_key},
-            timeout=timeout,
+    league_id = load_league_id(league_key)
+    if not league_id:
+        raise SquadAPIError(
+            f"{league_key} için API-Football lig id'si tanımlı değil. "
+            "Veri ekranındaki 'Lig ID ara' aracıyla belirleyebilirsiniz."
         )
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.exceptions.RequestException as exc:
-        raise SquadAPIError(f"Sakatlık API'sine erişilemedi: {exc}") from exc
-    except ValueError as exc:
-        raise SquadAPIError(f"API yanıtı çözümlenemedi: {exc}") from exc
-
-    if data.get("errors"):
-        raise SquadAPIError(f"API hatası: {data['errors']}")
-
-    out = []
-    for item in data.get("response", []):
-        player = item.get("player", {}) or {}
-        out.append({
-            "player": player.get("name", "?"),
-            "type": player.get("type", ""),
-            "reason": player.get("reason", ""),
-        })
-    return out
+    try:
+        client = APIFootballClient(api_key)
+        team_id = client.find_team_id(league_id, season, team_name)
+        if not team_id:
+            raise SquadAPIError(
+                f"'{team_name}' API kadro listesinde bulunamadı "
+                f"(lig id {league_id}, sezon {season})."
+            )
+        return client.fetch_injuries(team_id, season)
+    except APIFootballError as exc:
+        raise SquadAPIError(str(exc)) from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -138,6 +130,27 @@ def save_api_key(key: str) -> None:
 
 def load_api_key() -> Optional[str]:
     return _load_settings().get("apifootball_key")
+
+
+def save_league_id(league_key: str, league_id: int) -> None:
+    """Kullanıcının doğruladığı API-Football lig id'sini kalıcı kaydeder."""
+    config.ensure_app_dir()
+    settings = _load_settings()
+    ids = settings.setdefault("apifootball_league_ids", {})
+    ids[league_key] = int(league_id)
+    config.SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
+
+
+def load_league_id(league_key: str) -> Optional[int]:
+    """Bu lig için kullanılacak API id'si.
+
+    Öncelik kullanıcının kaydettiği değerdedir; yoksa yerleşik varsayılan
+    kullanılır. Böylece yerleşik id yanlış çıkarsa kullanıcı düzeltebilir.
+    """
+    override = _load_settings().get("apifootball_league_ids", {}).get(league_key)
+    if override:
+        return int(override)
+    return config.APIFOOTBALL_LEAGUE_IDS.get(league_key)
 
 
 def _load_settings() -> dict:
