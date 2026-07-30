@@ -50,6 +50,33 @@ def test_parse_date_formats():
     assert dfetch._parse_date("garbage") is None
 
 
+def test_parse_date_iso_not_day_month_swapped():
+    """Regresyon: ISO tarihlerde gün/ay takası olmamalı.
+
+    Esnek ayrıştırıcı dayfirst=True ile '2023-09-01' değerini 9 Ocak olarak
+    okuyordu (YYYY-DD-MM). Hem gün hem ay <= 12 olduğunda hata sessizdi ve
+    zaman ağırlığını/backtest sıralamasını bozuyordu.
+    """
+    assert dfetch._parse_date("2023-09-01") == "2023-09-01"   # 1 Eylül
+    assert dfetch._parse_date("2026-04-12") == "2026-04-12"   # 12 Nisan
+    assert dfetch._parse_date("2025-12-04") == "2025-12-04"   # 4 Aralık
+    assert dfetch._parse_date("2025-08-15") == "2025-08-15"   # tek anlamlı
+
+
+def test_parse_iso_dated_csv_keeps_chronology():
+    """Ayna kaynağı ISO tarih kullanır; sezon aralığı bozulmamalı."""
+    csv = (
+        "Date,HomeTeam,AwayTeam,FTHG,FTAG,FTR\n"
+        "2025-08-15,Liverpool,Bournemouth,4,2,H\n"
+        "2025-09-01,Arsenal,Chelsea,1,0,H\n"
+        "2026-04-12,Man City,Everton,2,2,D\n"
+    )
+    rows = dfetch.parse_csv_bytes(csv, "E0")
+    dates = [r["date"] for r in rows]
+    assert dates == ["2025-08-15", "2025-09-01", "2026-04-12"]
+    assert dates == sorted(dates)  # kronoloji korunmalı
+
+
 def test_parse_missing_columns_raises():
     bad = "Foo,Bar\n1,2\n"
     with pytest.raises(dfetch.DataFetchError):
@@ -136,3 +163,63 @@ def test_league_labels_unique():
     from fpredict import config
     labels = [config.league_label(k) for k in config.LEAGUES]
     assert len(labels) == len(set(labels))
+
+
+# --------------------------------------------------------------------------- #
+# Yedek ayna kaynağı ve ağ hatası teşhisi
+# --------------------------------------------------------------------------- #
+def test_mirror_url_for_covered_leagues():
+    from fpredict import config
+    assert config.has_mirror("E0")
+    url = config.mirror_url("E0", "2324")
+    assert url is not None and url.endswith("premier-league/season-2324.csv")
+    # ayna yalnızca 5 büyük ligi kapsar
+    assert not config.has_mirror("NOR")
+    assert config.mirror_url("NOR", "2324") is None
+
+
+def test_classify_network_error_messages():
+    import requests
+
+    ssl_exc = requests.exceptions.SSLError(
+        "certificate verify failed: self-signed certificate"
+    )
+    assert "TLS" in dfetch.classify_network_error(ssl_exc)
+
+    to_exc = requests.exceptions.ConnectTimeout("Connection timed out")
+    assert "zaman aşımı" in dfetch.classify_network_error(to_exc)
+
+    rst_exc = requests.exceptions.ConnectionError(
+        "Connection aborted, ConnectionResetError(10054, ...)"
+    )
+    msg = dfetch.classify_network_error(rst_exc)
+    assert "reset" in msg or "kapatıldı" in msg
+
+
+def test_download_with_fallback_uses_second_source(monkeypatch):
+    """Birinci kaynak başarısızsa ikinciye (aynaya) düşmeli."""
+    calls = []
+
+    def fake_download(url, *a, **kw):
+        calls.append(url)
+        if "football-data.co.uk" in url:
+            raise dfetch.DataFetchError("engellendi")
+        return b"x" * 100
+
+    monkeypatch.setattr(dfetch, "download_csv", fake_download)
+    content, label = dfetch.download_with_fallback([
+        ("football-data.co.uk", "https://www.football-data.co.uk/x.csv"),
+        ("GitHub aynası", "https://raw.githubusercontent.com/y.csv"),
+    ])
+    assert label == "GitHub aynası"
+    assert len(calls) == 2
+
+
+def test_download_with_fallback_all_fail_reports_each(monkeypatch):
+    def fake_download(url, *a, **kw):
+        raise dfetch.DataFetchError(f"hata: {url}")
+
+    monkeypatch.setattr(dfetch, "download_csv", fake_download)
+    with pytest.raises(dfetch.DataFetchError) as exc:
+        dfetch.download_with_fallback([("A", "u1"), ("B", "u2")])
+    assert "A:" in str(exc.value) and "B:" in str(exc.value)

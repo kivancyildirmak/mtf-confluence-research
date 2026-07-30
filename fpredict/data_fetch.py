@@ -70,17 +70,25 @@ def _first_present(row: pd.Series, columns: Iterable[str]):
 
 
 def _parse_date(raw) -> str | None:
-    """football-data tarihini ISO 'YYYY-MM-DD' string'ine çevirir."""
+    """football-data tarihini ISO 'YYYY-MM-DD' string'ine çevirir.
+
+    Biçimler açık açık denenir, çünkü esnek ayrıştırıcı `dayfirst=True` ile
+    ISO tarihleri YYYY-DD-MM gibi okuyup gün/ayı SESSİZCE takas eder
+    (ör. '2023-09-01' -> 1 Eylül yerine 9 Ocak). Bu, zaman ağırlığını ve
+    backtest sıralamasını bozar; bu yüzden ISO biçimi listede önce gelir.
+    """
     if pd.isna(raw):
         return None
-    for fmt in ("%d/%m/%Y", "%d/%m/%y"):
+    text = str(raw).strip()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y", "%Y/%m/%d"):
         try:
-            return pd.to_datetime(str(raw).strip(), format=fmt).strftime("%Y-%m-%d")
+            return pd.to_datetime(text, format=fmt).strftime("%Y-%m-%d")
         except (ValueError, TypeError):
             continue
-    # Son çare: pandas'ın esnek ayrıştırıcısı (gün-önce varsayımıyla)
+    # Son çare: yalnızca gün/ay takası riski olmayan durumlar için esnek ayrıştırma.
+    # (ISO biçim yukarıda yakalandığı için burada gün-önce varsayımı güvenlidir.)
     try:
-        return pd.to_datetime(str(raw).strip(), dayfirst=True).strftime("%Y-%m-%d")
+        return pd.to_datetime(text, dayfirst=True).strftime("%Y-%m-%d")
     except (ValueError, TypeError):
         return None
 
@@ -237,23 +245,92 @@ def parse_any_csv_bytes(raw: bytes | str, league_code: str, season: str | None =
 # --------------------------------------------------------------------------- #
 # İndirme
 # --------------------------------------------------------------------------- #
-def download_csv(url: str, timeout: int = config.HTTP_TIMEOUT) -> bytes:
-    """Tek bir CSV'yi indirir. Ağ hatalarını DataFetchError'a çevirir."""
+def classify_network_error(exc) -> str:
+    """Ağ hatasını kullanıcıya anlamlı gelecek kısa bir teşhise çevirir.
+
+    Amaç: "Max retries exceeded" gibi ham yığın izleri yerine, kullanıcının
+    ne yapması gerektiğini anlatan bir sebep göstermek.
+    """
+    text = f"{type(exc).__name__}: {exc}"
+    low = text.lower()
+    if "certificate" in low or "sslerror" in low or "ssl:" in low:
+        return (
+            "TLS sertifika doğrulaması başarısız (self-signed certificate). "
+            "Bağlantı araya girilerek yönlendiriliyor olabilir — genellikle "
+            "İSS/DNS engeli veya antivirüsün HTTPS taraması buna yol açar."
+        )
+    if "timed out" in low or "timeout" in low:
+        return (
+            "Bağlantı zaman aşımına uğradı — sunucuya paket gidiyor ama yanıt "
+            "dönmüyor. Genellikle ağ seviyesinde engelleme belirtisidir."
+        )
+    if "reset" in low or "10054" in low or "aborted" in low:
+        return (
+            "Bağlantı karşı taraftan zorla kapatıldı (reset). Genellikle ağ "
+            "seviyesinde engelleme belirtisidir."
+        )
+    if "name or service not known" in low or "getaddrinfo" in low or "nodename" in low:
+        return "Alan adı çözümlenemedi (DNS hatası)."
+    return text
+
+
+def download_csv(
+    url: str,
+    timeout: int = config.HTTP_TIMEOUT,
+    retries: int = config.HTTP_RETRIES,
+) -> bytes:
+    """Tek bir CSV'yi indirir; geçici hatalarda yeniden dener.
+
+    Ağ hatalarını, sebebini açıklayan bir DataFetchError'a çevirir.
+    """
+    import time
+
     import requests  # yerel import: test ederken ağ bağımlılığını izole eder
 
-    try:
-        resp = requests.get(
-            url, timeout=timeout, headers={"User-Agent": config.USER_AGENT}
-        )
-        resp.raise_for_status()
-    except requests.exceptions.RequestException as exc:
-        raise DataFetchError(
-            f"İndirme başarısız ({url}): {exc}. "
-            "İnternet bağlantınızı kontrol edin veya CSV'yi elle yükleyin."
-        ) from exc
-    if not resp.content or len(resp.content) < 50:
-        raise DataFetchError(f"İndirilen dosya boş görünüyor: {url}")
-    return resp.content
+    last_exc = None
+    for attempt in range(max(1, retries)):
+        try:
+            resp = requests.get(
+                url, timeout=timeout, headers={"User-Agent": config.USER_AGENT}
+            )
+            resp.raise_for_status()
+            if not resp.content or len(resp.content) < 50:
+                raise DataFetchError(f"İndirilen dosya boş görünüyor: {url}")
+            return resp.content
+        except requests.exceptions.HTTPError as exc:
+            # 404 vb. yeniden denemeye değmez (ör. sezon henüz yayınlanmamış)
+            status = exc.response.status_code if exc.response is not None else "?"
+            raise DataFetchError(f"Sunucu {status} döndü: {url}") from exc
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)  # 1s, 2s, 4s …
+
+    raise DataFetchError(
+        f"İndirme başarısız ({url}) — {retries} deneme sonunda. "
+        f"Sebep: {classify_network_error(last_exc)}"
+    )
+
+
+def download_with_fallback(urls: list[tuple[str, str]]) -> tuple[bytes, str]:
+    """Sırayla birden çok kaynağı dener; ilk başarılı olanı döndürür.
+
+    Args:
+        urls: [(etiket, url), ...] — örn. [("football-data.co.uk", ...), ("ayna", ...)]
+
+    Returns:
+        (içerik, kullanılan_etiket)
+
+    Raises:
+        DataFetchError: hepsi başarısızsa, her kaynağın sebebiyle birlikte.
+    """
+    problems = []
+    for label, url in urls:
+        try:
+            return download_csv(url), label
+        except DataFetchError as exc:
+            problems.append(f"{label}: {exc}")
+    raise DataFetchError(" | ".join(problems))
 
 
 def update_league(
@@ -284,15 +361,24 @@ def update_league(
 
     total_inserted = 0
     seasons_ok, seasons_failed, errors = [], [], []
+    sources_used = set()
     for i, year in enumerate(years):
         sc = season_code(year)
         if progress:
             progress(f"{code} {sc} indiriliyor…", i / len(years))
+
+        # Önce asıl kaynak, olmazsa (varsa) ayna
+        candidates = [("football-data.co.uk", csv_url(code, year))]
+        mirror = config.mirror_url(code, sc)
+        if mirror:
+            candidates.append(("GitHub aynası", mirror))
+
         try:
-            content = download_csv(csv_url(code, year))
+            content, used = download_with_fallback(candidates)
             rows = parse_csv_bytes(content, code, season=sc)
             total_inserted += db.upsert_matches(rows, db_path=db_path)
             seasons_ok.append(sc)
+            sources_used.add(used)
         except DataFetchError as exc:
             seasons_failed.append(sc)
             errors.append(str(exc))
@@ -308,6 +394,7 @@ def update_league(
         "seasons_ok": seasons_ok,
         "seasons_failed": seasons_failed,
         "errors": errors,
+        "sources_used": sorted(sources_used),
     }
 
 
@@ -329,6 +416,7 @@ def _update_extra_league(league_key: str, code: str, db_path=None, progress=None
             "seasons_ok": [],
             "seasons_failed": ["tümü"],
             "errors": [str(exc)],
+            "sources_used": [],
         }
 
     db.touch_updated(code, db_path=db_path)
@@ -342,4 +430,5 @@ def _update_extra_league(league_key: str, code: str, db_path=None, progress=None
         "seasons_ok": seasons or ["tümü"],
         "seasons_failed": [],
         "errors": [],
+        "sources_used": ["football-data.co.uk"],
     }

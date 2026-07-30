@@ -67,16 +67,32 @@ def render():
             common.bump_data_version()
             prog.empty()
             if result["seasons_ok"]:
+                srcs = result.get("sources_used") or []
                 st.success(
                     f"Güncellendi: {result['inserted']} maç işlendi. "
                     f"Başarılı sezonlar: {', '.join(result['seasons_ok'])}."
+                    + (f" (Kaynak: {', '.join(srcs)})" if srcs else "")
                 )
+                if "GitHub aynası" in srcs:
+                    st.info(
+                        "ℹ️ football-data.co.uk'a erişilemediği için **yedek ayna** "
+                        "kullanıldı. Sonuç/skor verisi eksiksizdir, ancak aynada "
+                        "**bahis oranı sütunları yoktur** — bu yüzden *Değer* ekranı "
+                        "bu lig için çalışmaz. Tahmin ve Backtest normal çalışır."
+                    )
             if result["seasons_failed"]:
-                st.warning(
-                    "Bazı sezonlar indirilemedi: "
-                    f"{', '.join(result['seasons_failed'])}.\n\n"
-                    + "\n".join(f"• {e}" for e in result["errors"])
-                )
+                # Hiçbir sezon inmediyse bu bir ağ sorunudur: teşhis göster
+                if not result["seasons_ok"]:
+                    _network_diagnosis(result["errors"], league_key)
+                else:
+                    st.warning(
+                        "Bazı sezonlar indirilemedi: "
+                        f"{', '.join(result['seasons_failed'])}. "
+                        "(En yeni sezon henüz yayınlanmamış olabilir — bu normaldir.)"
+                    )
+                    with st.expander("Ayrıntılı hata"):
+                        for e in result["errors"]:
+                            st.caption(f"• {e}")
                 _manual_upload_fallback(league_key)
         except data_fetch.DataFetchError as exc:
             prog.empty()
@@ -89,6 +105,58 @@ def render():
     st.divider()
     with st.expander("📄 Elle CSV Yükle (yedek yöntem)"):
         _manual_upload_fallback(league_key, standalone=True)
+
+
+def _network_diagnosis(errors: list[str], league_key: str):
+    """Tüm indirmeler başarısızsa: olası sebep + somut çözüm adımları."""
+    blob = " ".join(errors).lower()
+    st.error("Hiçbir sezon indirilemedi — veri kaynağına ulaşılamıyor.")
+
+    if "tls" in blob or "sertifika" in blob or "certificate" in blob:
+        likely = (
+            "**TLS araya girme tespit edildi.** Bağlantı, sunucunun kendi "
+            "sertifikası yerine başka bir sertifikayla karşılanıyor. Bu tipik "
+            "olarak İSS/DNS seviyesinde engelleme veya antivirüsün HTTPS "
+            "taraması anlamına gelir."
+        )
+    elif "zaman aşımı" in blob or "reset" in blob or "kapatıldı" in blob:
+        likely = (
+            "**Bağlantı engelleniyor.** Paketler sunucuya gidiyor ancak yanıt "
+            "dönmüyor veya bağlantı zorla kapatılıyor — ağ seviyesinde "
+            "filtreleme belirtisi."
+        )
+    else:
+        likely = "**Ağ hatası.** İnternet bağlantınızda bir sorun olabilir."
+
+    st.markdown(f"### Olası sebep\n{likely}")
+    st.markdown(
+        """
+### Deneyebilecekleriniz
+
+1. **Tarayıcıda test edin:** `https://www.football-data.co.uk/englandm.php`
+   adresini açın. Açılmıyorsa sorun uygulamada değil, ağ erişimindedir.
+2. **DNS değiştirin** (engellerin çoğu DNS seviyesindedir):
+   Ayarlar → Ağ → Bağdaştırıcı → IPv4 → DNS: `1.1.1.1` ve `8.8.8.8`.
+   Sonra komut satırında `ipconfig /flushdns` çalıştırıp tekrar deneyin.
+3. **Antivirüsün HTTPS/SSL taramasını** geçici kapatın (Kaspersky, ESET,
+   Avast vb. bu hatayı üretebilir).
+4. **VPN** kullanın.
+5. **Elle CSV yükleyin:** Dosyayı başka bir cihazdan/ağdan indirip aşağıdan
+   yükleyebilirsiniz.
+        """
+    )
+    if config.has_mirror(config.LEAGUES[league_key].code):
+        st.info("Bu lig için yedek ayna da denendi ve o da başarısız oldu.")
+    else:
+        st.info(
+            f"**Not:** {config.LEAGUES[league_key].name} için yedek ayna yok. "
+            "Ayna yalnızca Premier Lig, La Liga, Serie A, Bundesliga ve Ligue 1'i "
+            "kapsar — bu ligleri engelden bağımsız indirebilirsiniz."
+        )
+
+    with st.expander("Teknik hata ayrıntısı"):
+        for e in errors:
+            st.caption(f"• {e}")
 
 
 def _manual_upload_fallback(league_key: str, standalone: bool = False):

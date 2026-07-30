@@ -106,6 +106,38 @@ def league_name_for_code(code: str) -> str:
 BASE_URL = "https://www.football-data.co.uk/mmz4281"
 EXTRA_BASE_URL = "https://www.football-data.co.uk/new"
 
+# --------------------------------------------------------------------------- #
+# Yedek (ayna) kaynak
+# --------------------------------------------------------------------------- #
+# Bazı ağlarda (ISS engeli, kurumsal filtre, antivirüs HTTPS taraması)
+# football-data.co.uk'a erişilemez. Bu durumda aşağıdaki GitHub aynası denenir.
+# Ayna, football-data.co.uk ile AYNI sütun düzenini kullanır (HomeTeam/FTHG/...),
+# ancak yalnızca 5 büyük ligi kapsar ve BAHİS ORANI SÜTUNLARI YOKTUR.
+MIRROR_URL = (
+    "https://raw.githubusercontent.com/datasets/football-datasets/main"
+    "/datasets/{dir}/season-{season}.csv"
+)
+
+# lig kodu -> aynadaki klasör adı (yalnızca aynanın kapsadığı ligler)
+MIRROR_DIRS: dict[str, str] = {
+    "E0": "premier-league",
+    "SP1": "la-liga",
+    "I1": "serie-a",
+    "D1": "bundesliga",
+    "F1": "ligue-1",
+}
+
+
+def has_mirror(league_code: str) -> bool:
+    """Bu lig için yedek ayna kaynağı var mı?"""
+    return league_code in MIRROR_DIRS
+
+
+def mirror_url(league_code: str, season: str) -> str | None:
+    """Ayna URL'i (ör. 'E0', '2324') — ayna kapsamıyorsa None."""
+    d = MIRROR_DIRS.get(league_code)
+    return MIRROR_URL.format(dir=d, season=season) if d else None
+
 # football-data.org lig id eşlemesi (sakatlık/kadro API'si opsiyonel kullanım)
 # API-Football (api-sports.io) league id'leri
 APIFOOTBALL_LEAGUE_IDS: dict[str, int] = {
@@ -135,4 +167,5 @@ DEFAULT_SEASONS_BACK = 4         # kaç sezon otomatik indirilsin
 
 # HTTP
 HTTP_TIMEOUT = 30
+HTTP_RETRIES = 3   # geçici ağ hatalarında yeniden deneme sayısı (1s/2s/4s bekleyerek)
 USER_AGENT = "FootballPredictor/0.1 (+educational, statistical modelling)"

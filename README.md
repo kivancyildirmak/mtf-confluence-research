@@ -153,6 +153,22 @@ her lig için doğru olanı otomatik seçer:
 tüm sezonlar tek dosyadadır (tam geçmiş indirilir, sezon seçimi devre dışıdır).
 Elle CSV yüklerken biçim **otomatik algılanır**.
 
+#### Erişim engellenirse — yedek ayna
+
+Bazı ağlarda (İSS/DNS engeli, kurumsal filtre, antivirüsün HTTPS taraması)
+football-data.co.uk'a erişilemez. Belirtiler: `CERTIFICATE_VERIFY_FAILED`,
+bağlantı zaman aşımı veya `ConnectionResetError 10054`.
+
+Uygulama bu durumda:
+1. her indirmeyi **3 kez** artan beklemeyle tekrar dener,
+2. **GitHub aynasına** düşer (aynı sütun düzeni, oran sütunları yok),
+3. başarısız olursa **teşhis + çözüm adımları** gösterir (DNS değiştirme,
+   antivirüs HTTPS taraması, VPN, elle CSV yükleme).
+
+> Ayna yalnızca **Premier Lig, La Liga, Serie A, Bundesliga, Ligue 1**'i kapsar;
+> bu ligler engelden bağımsız çalışır. Diğer ligler için asıl kaynağa erişim
+> gerekir. Aynada oran sütunu olmadığından *Değer* ekranı ayna verisiyle çalışmaz.
+
 #### Desteklenen ligler
 
 **`main` biçim:** Türkiye Süper Lig (T1), İngiltere Premier Lig / Championship
