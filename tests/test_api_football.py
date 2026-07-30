@@ -432,3 +432,16 @@ def test_provider_setting_roundtrip(tmp_path, monkeypatch):
     # anahtar kaydı kanalı silmemeli
     squad_adjust.save_api_key("K")
     assert squad_adjust.load_api_provider() == "rapidapi"
+
+
+def test_403_message_suggests_channel_mismatch(monkeypatch):
+    """403'ün en sık sebebi kanal/anahtar uyuşmazlığı — mesaj bunu söylemeli."""
+    patch_get(monkeypatch, FakeResponse({}, status=403))
+    with pytest.raises(af.APIFootballError) as exc:
+        af.APIFootballClient("k", provider="rapidapi").status()
+    msg = str(exc.value)
+    assert "uyuşmazlığ" in msg.lower()
+    assert "RapidAPI" in msg                       # seçili kanal
+    assert PROVIDERS_DIRECT_SIGNUP in msg          # önerilen diğer kanal
+
+PROVIDERS_DIRECT_SIGNUP = af.PROVIDERS["direct"]["signup"]

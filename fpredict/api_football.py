@@ -164,9 +164,16 @@ class APIFootballClient:
         self.last_quota = self._read_quota(resp.headers)
 
         if resp.status_code in (401, 403):
+            other = "rapidapi" if self.provider == "direct" else "direct"
             raise APIFootballError(
-                f"API anahtarı geçersiz veya yetkisiz (HTTP {resp.status_code}). "
-                "Anahtarı Kadro/Sakatlık ekranından kontrol edin."
+                f"API anahtarı geçersiz veya yetkisiz (HTTP {resp.status_code}).\n\n"
+                f"Şu an seçili kanal: **{PROVIDERS[self.provider]['label']}**.\n"
+                "En sık sebep **kanal/anahtar uyuşmazlığıdır**: anahtarlar kanala "
+                "özeldir ve diğerinde çalışmaz.\n"
+                f"• Anahtarı {PROVIDERS[other]['signup']} adresinden aldıysanız "
+                f"kanalı **{PROVIDERS[other]['label']}** yapın.\n"
+                "• Kanal doğruysa anahtarı yeniden kopyalayın ve hesabınızın "
+                "e-posta ile aktive edildiğinden emin olun."
             )
         if resp.status_code == 429:
             raise APIFootballError(
