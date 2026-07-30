@@ -25,7 +25,7 @@ def render():
         st.info("Önce **Veri** sekmesinden en az bir lig indirin.")
         return
 
-    name_map = {code: name for _, (name, code) in config.LEAGUES.items()}
+    name_map = config.LEAGUE_NAMES
     league_key = st.selectbox(
         "Lig", options=available,
         format_func=lambda c: f"{name_map.get(c, c)} ({c})",

@@ -49,7 +49,13 @@ def recent_seasons(n: int, today: date | None = None) -> list[int]:
 
 
 def csv_url(league_code: str, start_year: int) -> str:
+    """'main' biçim: sezon başına bir dosya."""
     return f"{config.BASE_URL}/{season_code(start_year)}/{league_code}.csv"
+
+
+def extra_csv_url(league_code: str) -> str:
+    """'extra' biçim: tüm sezonlar tek dosyada."""
+    return f"{config.EXTRA_BASE_URL}/{league_code}.csv"
 
 
 # --------------------------------------------------------------------------- #
@@ -146,6 +152,88 @@ def _num(val):
         return None
 
 
+def parse_extra_csv_bytes(raw: bytes | str, league_code: str) -> list[dict]:
+    """football-data.co.uk '/new/{KOD}.csv' (extra) biçimini ayrıştırır.
+
+    Bu biçim İskandinav ligleri, Polonya, Avusturya, İsviçre vb. için kullanılır
+    ve 'main' biçimden farklıdır:
+
+        main :  Date, HomeTeam, AwayTeam, FTHG, FTAG, FTR, B365H ...
+        extra:  Date, Home,     Away,     HG,   AG,   Res, PH/AvgH ...
+
+    Ayrıca tek dosyada tüm sezonlar bulunur ve bir 'Season' sütunu vardır
+    (İskandinav ligleri takvim yılı olduğu için "2025" gibi tek yıl olabilir).
+    """
+    if isinstance(raw, bytes):
+        buf = io.BytesIO(raw)
+    else:
+        buf = io.StringIO(raw)
+    try:
+        df = pd.read_csv(buf, encoding="latin-1", on_bad_lines="skip")
+    except Exception as exc:  # pragma: no cover - bozuk dosya
+        raise DataFetchError(f"CSV ayrıştırılamadı: {exc}") from exc
+
+    if "Home" not in df.columns or "HG" not in df.columns:
+        raise DataFetchError(
+            "Beklenen sütunlar bulunamadı (Home/HG). "
+            "Bu dosya football-data.co.uk 'extra' lig CSV'si olmayabilir."
+        )
+
+    rows: list[dict] = []
+    for _, r in df.iterrows():
+        iso = _parse_date(_first_present(r, ["Date"]))
+        home = r.get("Home")
+        away = r.get("Away")
+        if not iso or pd.isna(home) or pd.isna(away):
+            continue
+        hg, ag = r.get("HG"), r.get("AG")
+        if pd.isna(hg) or pd.isna(ag):
+            continue  # oynanmamış maç
+        try:
+            hg, ag = int(hg), int(ag)
+        except (ValueError, TypeError):
+            continue
+
+        home, away = str(home).strip(), str(away).strip()
+        season = r.get("Season")
+        season = str(season).strip() if pd.notna(season) else None
+
+        rows.append({
+            "match_uid": db.make_uid(league_code, iso, home, away),
+            "league": league_code,
+            "season": season,
+            "date": iso,
+            "home_team": home,
+            "away_team": away,
+            "home_goals": hg,
+            "away_goals": ag,
+            "result": r.get("Res") if pd.notna(r.get("Res")) else (
+                "H" if hg > ag else "A" if ag > hg else "D"
+            ),
+            # extra biçimde Bet365 sütunu yok: Pinnacle (P*) / ortalama (Avg*) kullan
+            "odds_h": _num(_first_present(r, ["AvgH", "PH", "MaxH", "B365H"])),
+            "odds_d": _num(_first_present(r, ["AvgD", "PD", "MaxD", "B365D"])),
+            "odds_a": _num(_first_present(r, ["AvgA", "PA", "MaxA", "B365A"])),
+            "odds_over25": _num(_first_present(r, ["Avg>2.5", "P>2.5", "Max>2.5"])),
+            "odds_under25": _num(_first_present(r, ["Avg<2.5", "P<2.5", "Max<2.5"])),
+        })
+    return rows
+
+
+def parse_any_csv_bytes(raw: bytes | str, league_code: str, season: str | None = None) -> list[dict]:
+    """Biçimi otomatik algılayarak ayrıştırır (elle CSV yüklemede kullanışlı)."""
+    head = raw[:2000].decode("latin-1", "ignore") if isinstance(raw, bytes) else raw[:2000]
+    first_line = head.splitlines()[0] if head.splitlines() else ""
+    if "HomeTeam" in first_line:
+        return parse_csv_bytes(raw, league_code, season=season)
+    if "Home" in first_line:
+        return parse_extra_csv_bytes(raw, league_code)
+    raise DataFetchError(
+        "CSV biçimi tanınamadı. football-data.co.uk maç CSV'si bekleniyor "
+        "(HomeTeam/FTHG veya Home/HG sütunları)."
+    )
+
+
 # --------------------------------------------------------------------------- #
 # İndirme
 # --------------------------------------------------------------------------- #
@@ -185,7 +273,13 @@ def update_league(
     """
     if league_key not in config.LEAGUES:
         raise DataFetchError(f"Bilinmeyen lig: {league_key}")
-    _, code = config.LEAGUES[league_key]
+    info = config.LEAGUES[league_key]
+    code = info.code
+
+    # 'extra' ligler tek dosyada gelir; sezon döngüsü yok
+    if info.source == "extra":
+        return _update_extra_league(league_key, code, db_path=db_path, progress=progress)
+
     years = recent_seasons(seasons_back)
 
     total_inserted = 0
@@ -214,4 +308,38 @@ def update_league(
         "seasons_ok": seasons_ok,
         "seasons_failed": seasons_failed,
         "errors": errors,
+    }
+
+
+def _update_extra_league(league_key: str, code: str, db_path=None, progress=None) -> dict:
+    """'extra' biçimli ligi (tek dosya, tüm sezonlar) indirip cache'e yazar."""
+    url = extra_csv_url(code)
+    if progress:
+        progress(f"{code} indiriliyor (tüm sezonlar tek dosyada)…", 0.2)
+    try:
+        content = download_csv(url)
+        rows = parse_extra_csv_bytes(content, code)
+        inserted = db.upsert_matches(rows, db_path=db_path)
+    except DataFetchError as exc:
+        if progress:
+            progress("Başarısız.", 1.0)
+        return {
+            "league": league_key,
+            "inserted": 0,
+            "seasons_ok": [],
+            "seasons_failed": ["tümü"],
+            "errors": [str(exc)],
+        }
+
+    db.touch_updated(code, db_path=db_path)
+    if progress:
+        progress("Tamamlandı.", 1.0)
+
+    seasons = sorted({r["season"] for r in rows if r.get("season")})
+    return {
+        "league": league_key,
+        "inserted": inserted,
+        "seasons_ok": seasons or ["tümü"],
+        "seasons_failed": [],
+        "errors": [],
     }

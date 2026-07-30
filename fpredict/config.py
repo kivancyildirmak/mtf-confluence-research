@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 # --------------------------------------------------------------------------- #
@@ -23,20 +24,87 @@ def ensure_app_dir() -> Path:
 # --------------------------------------------------------------------------- #
 # football-data.co.uk lig kodları
 # --------------------------------------------------------------------------- #
-# key -> (görünen ad, football-data.co.uk kodu)
-LEAGUES: dict[str, tuple[str, str]] = {
-    "T1": ("Türkiye Süper Lig", "T1"),
-    "E0": ("İngiltere Premier Lig", "E0"),
-    "E1": ("İngiltere Championship", "E1"),
-    "SP1": ("İspanya La Liga", "SP1"),
-    "D1": ("Almanya Bundesliga", "D1"),
-    "I1": ("İtalya Serie A", "I1"),
-    "F1": ("Fransa Ligue 1", "F1"),
-    "N1": ("Hollanda Eredivisie", "N1"),
-    "P1": ("Portekiz Primeira Liga", "P1"),
+# football-data.co.uk verileri İKİ farklı biçimde yayınlar:
+#
+#   "main"  -> https://www.football-data.co.uk/mmz4281/{SEZON}/{KOD}.csv
+#              Her sezon ayrı dosya. Sütunlar: Date, HomeTeam, AwayTeam,
+#              FTHG, FTAG, FTR, B365H/D/A ...
+#              (Büyük Avrupa ligleri: İngiltere, Almanya, İspanya, İtalya,
+#               Fransa, Hollanda, Belçika, Portekiz, Türkiye, Yunanistan, İskoçya)
+#
+#   "extra" -> https://www.football-data.co.uk/new/{KOD}.csv
+#              TÜM sezonlar tek dosyada. Sütunlar farklı: Date, Home, Away,
+#              HG, AG, Res, PH/PD/PA, AvgH/AvgD/AvgA ...
+#              (İskandinavya, Polonya, Avusturya, İrlanda, ABD, Brezilya vb.)
+#
+# Bu yüzden her lig için hangi kaynağın kullanılacağını `source` alanı belirler.
+
+
+@dataclass(frozen=True)
+class LeagueInfo:
+    """Bir ligin görünen adı, football-data kodu ve veri kaynağı biçimi."""
+    name: str          # arayüzde görünen ad
+    code: str          # football-data.co.uk dosya kodu
+    source: str        # "main" (sezon başına dosya) veya "extra" (tek dosya)
+    country: str = ""  # gruplama için
+
+
+LEAGUES: dict[str, LeagueInfo] = {
+    # ---- "main" biçim: mmz4281/{sezon}/{kod}.csv -------------------------- #
+    "T1":  LeagueInfo("Türkiye Süper Lig", "T1", "main", "Türkiye"),
+    "E0":  LeagueInfo("İngiltere Premier Lig", "E0", "main", "İngiltere"),
+    "E1":  LeagueInfo("İngiltere Championship", "E1", "main", "İngiltere"),
+    "SC0": LeagueInfo("İskoçya Premiership", "SC0", "main", "İskoçya"),
+    "SP1": LeagueInfo("İspanya La Liga", "SP1", "main", "İspanya"),
+    "SP2": LeagueInfo("İspanya La Liga 2", "SP2", "main", "İspanya"),
+    "D1":  LeagueInfo("Almanya Bundesliga", "D1", "main", "Almanya"),
+    "D2":  LeagueInfo("Almanya 2. Bundesliga", "D2", "main", "Almanya"),
+    "I1":  LeagueInfo("İtalya Serie A", "I1", "main", "İtalya"),
+    "I2":  LeagueInfo("İtalya Serie B", "I2", "main", "İtalya"),
+    "F1":  LeagueInfo("Fransa Ligue 1", "F1", "main", "Fransa"),
+    "F2":  LeagueInfo("Fransa Ligue 2", "F2", "main", "Fransa"),
+    "N1":  LeagueInfo("Hollanda Eredivisie", "N1", "main", "Hollanda"),
+    "B1":  LeagueInfo("Belçika Jupiler Pro Lig", "B1", "main", "Belçika"),
+    "P1":  LeagueInfo("Portekiz Primeira Liga", "P1", "main", "Portekiz"),
+    "G1":  LeagueInfo("Yunanistan Super Lig", "G1", "main", "Yunanistan"),
+
+    # ---- "extra" biçim: new/{kod}.csv ------------------------------------- #
+    # Not: İskandinav ligleri ilkbahar-sonbahar takvimiyle oynanır.
+    "SWE": LeagueInfo("İsveç Allsvenskan", "SWE", "extra", "İsveç"),
+    "NOR": LeagueInfo("Norveç Eliteserien", "NOR", "extra", "Norveç"),
+    "DNK": LeagueInfo("Danimarka Superliga", "DNK", "extra", "Danimarka"),
+    "FIN": LeagueInfo("Finlandiya Veikkausliiga", "FIN", "extra", "Finlandiya"),
+    "POL": LeagueInfo("Polonya Ekstraklasa", "POL", "extra", "Polonya"),
+    "AUT": LeagueInfo("Avusturya Bundesliga", "AUT", "extra", "Avusturya"),
+    "SWZ": LeagueInfo("İsviçre Super Lig", "SWZ", "extra", "İsviçre"),
+    "IRL": LeagueInfo("İrlanda Premier Division", "IRL", "extra", "İrlanda"),
+    "ROU": LeagueInfo("Romanya Liga 1", "ROU", "extra", "Romanya"),
+    "RUS": LeagueInfo("Rusya Premier Lig", "RUS", "extra", "Rusya"),
+    "USA": LeagueInfo("ABD MLS", "USA", "extra", "ABD"),
+    "MEX": LeagueInfo("Meksika Liga MX", "MEX", "extra", "Meksika"),
+    "BRA": LeagueInfo("Brezilya Serie A", "BRA", "extra", "Brezilya"),
+    "ARG": LeagueInfo("Arjantin Primera Division", "ARG", "extra", "Arjantin"),
+    "JPN": LeagueInfo("Japonya J1 Lig", "JPN", "extra", "Japonya"),
+    "CHN": LeagueInfo("Çin Super Lig", "CHN", "extra", "Çin"),
 }
 
+# kod -> görünen ad (arayüzde cache tablosunu okunur hale getirmek için)
+LEAGUE_NAMES: dict[str, str] = {info.code: info.name for info in LEAGUES.values()}
+
+
+def league_label(key: str) -> str:
+    """Arayüz seçim kutusu etiketi."""
+    info = LEAGUES.get(key)
+    return f"{info.name} ({key})" if info else key
+
+
+def league_name_for_code(code: str) -> str:
+    """football-data kodundan görünen adı döndürür (bilinmiyorsa kodun kendisi)."""
+    return LEAGUE_NAMES.get(code, code)
+
+
 BASE_URL = "https://www.football-data.co.uk/mmz4281"
+EXTRA_BASE_URL = "https://www.football-data.co.uk/new"
 
 # football-data.org lig id eşlemesi (sakatlık/kadro API'si opsiyonel kullanım)
 # API-Football (api-sports.io) league id'leri
@@ -49,6 +117,13 @@ APIFOOTBALL_LEAGUE_IDS: dict[str, int] = {
     "F1": 61,    # Ligue 1
     "N1": 88,    # Eredivisie
     "P1": 94,    # Primeira Liga
+    "B1": 144,   # Jupiler Pro League
+    "SWE": 113,  # Allsvenskan
+    "NOR": 103,  # Eliteserien
+    "DNK": 119,  # Superliga
+    "POL": 106,  # Ekstraklasa
+    "AUT": 218,  # Österreichische Bundesliga
+    "SWZ": 207,  # Swiss Super League
 }
 
 # --------------------------------------------------------------------------- #

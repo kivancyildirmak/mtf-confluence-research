@@ -39,7 +39,7 @@ def render():
     if summary.empty:
         st.info("Önce **Veri** sekmesinden lig indirin.")
         return
-    name_map = {code: name for _, (name, code) in config.LEAGUES.items()}
+    name_map = config.LEAGUE_NAMES
     league_key = st.selectbox(
         "Lig", options=list(summary["league"]),
         format_func=lambda c: f"{name_map.get(c, c)} ({c})",

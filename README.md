@@ -12,9 +12,10 @@ istatistik modeliyle takım güçlerini öğrenen ve bir maç için olasılık t
 ## Özellikler
 
 - **Otomatik veri:** [football-data.co.uk](https://www.football-data.co.uk/)
-  üzerinden lig CSV'lerini (Süper Lig, Premier Lig, La Liga, Bundesliga,
-  Serie A, Ligue 1 vb.) çoklu sezon halinde indirir, yerel **SQLite cache**'e
-  yazar. Her açılışta baştan indirmez — yalnızca eksik/yeni maçları ekler.
+  üzerinden **32 lig** (büyük Avrupa ligleri + İskandinavya, Polonya, Belçika,
+  Avusturya, İsviçre, ABD, Brezilya…) indirir, yerel **SQLite cache**'e yazar.
+  Her açılışta baştan indirmez — yalnızca eksik/yeni maçları ekler.
+  Desteklenen ligler için [aşağıya](#desteklenen-ligler) bakın.
 - **Dixon-Coles modeli:**
   - Her takım için hücum/savunma katsayısı,
   - veriden öğrenilen ev sahibi avantajı,
@@ -139,9 +140,38 @@ Streamlit sunucusu başlar ve tarayıcı otomatik açılır.
 ## Veri Kaynakları
 
 ### 1) Geçmiş sonuçlar + oranlar — football-data.co.uk
-URL kalıbı: `https://www.football-data.co.uk/mmz4281/{SEZON}/{KOD}.csv`
-(ör. `.../mmz4281/2324/E0.csv`). Uygulama son N sezonu otomatik indirip birleştirir.
-Elle CSV indirmeniz/yüklemeniz **gerekmez** (indirme başarısızsa elle yükleme yedeği vardır).
+
+Site verileri **iki farklı biçimde** yayınlar; uygulama ikisini de destekler ve
+her lig için doğru olanı otomatik seçer:
+
+| Biçim | URL | Kapsam | Sütunlar |
+|---|---|---|---|
+| `main` | `mmz4281/{SEZON}/{KOD}.csv` | Büyük Avrupa ligleri | `HomeTeam, FTHG, FTAG, FTR, B365H…` |
+| `extra` | `new/{KOD}.csv` | İskandinavya, Polonya, ABD, Brezilya… | `Home, HG, AG, Res, AvgH…` |
+
+`main` biçimde her sezon ayrı dosyadır (son N sezon indirilir); `extra` biçimde
+tüm sezonlar tek dosyadadır (tam geçmiş indirilir, sezon seçimi devre dışıdır).
+Elle CSV yüklerken biçim **otomatik algılanır**.
+
+#### Desteklenen ligler
+
+**`main` biçim:** Türkiye Süper Lig (T1), İngiltere Premier Lig / Championship
+(E0, E1), İskoçya Premiership (SC0), İspanya La Liga 1-2 (SP1, SP2), Almanya
+Bundesliga 1-2 (D1, D2), İtalya Serie A-B (I1, I2), Fransa Ligue 1-2 (F1, F2),
+Hollanda Eredivisie (N1), **Belçika Jupiler Pro Lig (B1)**, Portekiz Primeira
+Liga (P1), Yunanistan Super Lig (G1).
+
+**`extra` biçim:** **İsveç Allsvenskan (SWE)**, **Norveç Eliteserien (NOR)**,
+**Danimarka Superliga (DNK)**, Finlandiya (FIN), **Polonya Ekstraklasa (POL)**,
+Avusturya (AUT), İsviçre (SWZ), İrlanda (IRL), Romanya (ROU), Rusya (RUS),
+ABD MLS (USA), Meksika (MEX), Brezilya (BRA), Arjantin (ARG), Japonya (JPN),
+Çin (CHN).
+
+> **Spor Toto listeleri hakkında:** Haftalık kuponlarda sık geçen İskandinav,
+> Belçika ve Polonya ligleri yukarıda kapsanmıştır. Ancak listelerde **kupa
+> maçları** (ör. Şampiyonlar Ligi elemeleri) ve **alt lig takımları** da yer
+> alabilir; football-data.co.uk yalnızca lig maçlarını yayınladığı için bu tür
+> eşleşmeler modelde bulunmaz.
 
 ### 2) Sakatlık / kadro — resmi API (opsiyonel)
 [API-Football (api-sports.io)](https://www.api-sports.io/) gibi ücretsiz kotalı

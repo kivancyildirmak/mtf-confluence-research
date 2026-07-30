@@ -22,7 +22,7 @@ def render():
         st.info("Cache boş. Aşağıdan bir lig seçip **Verileri Güncelle**'ye basın.")
     else:
         # okunur lig adları ekle
-        name_map = {code: name for _, (name, code) in config.LEAGUES.items()}
+        name_map = config.LEAGUE_NAMES
         summary.insert(1, "lig_adı", summary["league"].map(name_map).fillna(summary["league"]))
         st.dataframe(summary, use_container_width=True, hide_index=True)
 
@@ -35,12 +35,23 @@ def render():
         league_key = st.selectbox(
             "Lig",
             options=list(config.LEAGUES.keys()),
-            format_func=lambda k: f"{config.LEAGUES[k][0]} ({k})",
+            format_func=config.league_label,
         )
+    is_extra = config.LEAGUES[league_key].source == "extra"
     with col2:
         seasons_back = st.number_input(
             "Kaç sezon", min_value=1, max_value=15,
             value=config.DEFAULT_SEASONS_BACK,
+            disabled=is_extra,
+            help=("Bu lig tek dosyada tüm sezonlarla geldiği için sezon sayısı "
+                  "seçilemez; tam geçmiş indirilir." if is_extra else
+                  "Kaç sezon geriye gidilsin."),
+        )
+    if is_extra:
+        st.caption(
+            "ℹ️ Bu lig football-data.co.uk'ta **tek dosyada tüm sezonlar** biçiminde "
+            "yayınlanır; indirme tüm geçmişi getirir (model zaten son maçlara "
+            "daha fazla ağırlık verir)."
         )
 
     if st.button("🔄 Verileri Güncelle", type="primary"):
@@ -84,14 +95,15 @@ def _manual_upload_fallback(league_key: str, standalone: bool = False):
     """İndirme başarısızsa kullanıcı football-data CSV'sini elle yükleyebilir."""
     if not standalone:
         st.markdown("**İnternet erişimi yoksa:** CSV'yi elle yükleyebilirsiniz.")
-    _, code = config.LEAGUES[league_key]
+    code = config.LEAGUES[league_key].code
     up = st.file_uploader(
-        f"{config.LEAGUES[league_key][0]} için football-data.co.uk CSV'si",
+        f"{config.LEAGUES[league_key].name} için football-data.co.uk CSV'si",
         type=["csv"], key=f"upload_{league_key}_{standalone}",
     )
     if up is not None:
         try:
-            rows = data_fetch.parse_csv_bytes(up.getvalue(), code)
+            # Biçim otomatik algılanır (HomeTeam/FTHG veya Home/HG)
+            rows = data_fetch.parse_any_csv_bytes(up.getvalue(), code)
             n = db.upsert_matches(rows)
             db.touch_updated(code)
             common.bump_data_version()
