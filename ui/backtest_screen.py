@@ -72,8 +72,82 @@ def render():
     # --- Kalibrasyon / kümülatif doğruluk ---------------------------------- #
     _plot_cumulative(res)
 
+    # --- Kalibrasyon -------------------------------------------------------- #
+    _calibration_panel(res, league_key)
+
     with st.expander("Tahmin kayıtları (ilk 200)"):
         st.dataframe(res.records.head(200), use_container_width=True, hide_index=True)
+
+
+def _calibration_panel(res, league_key: str):
+    """Backtest sonuçlarından kalibrasyon öğrenme ve kaydetme."""
+    from fpredict import calibration
+
+    st.divider()
+    st.subheader("🎚️ Olasılık Kalibrasyonu")
+    st.caption(
+        "Model, yüksek olasılıklarda fazla iddialı olabilir (ör. '%76' dediği "
+        "maçların gerçekte %68'i tutar). Kalibrasyon, bu sapmayı backtest "
+        "kayıtlarından öğrenip gösterilen yüzdeleri gerçekleşme oranına "
+        "yaklaştırır. Tahminlerin **sıralaması değişmez**, yalnızca güven düzeyi "
+        "düzeltilir."
+    )
+
+    existing = calibration.load(league_key)
+    if existing:
+        st.info(f"Bu ligde kayıtlı kalibrasyon var — {existing.describe()}")
+
+    # Mevcut durum tablosu
+    before = calibration.reliability_table(res.records, 1.0)
+    if not before:
+        st.caption("Güvenilirlik tablosu için yeterli kayıt yok.")
+        return
+
+    try:
+        fitted = calibration.fit_from_backtest(res.records, league_key)
+    except ValueError as exc:
+        st.warning(f"Kalibrasyon öğrenilemedi: {exc}")
+        return
+
+    after = calibration.reliability_table(res.records, fitted.t_1x2)
+
+    import pandas as pd
+    tbl = pd.DataFrame(before).rename(columns={
+        "ortalama_tahmin": "tahmin_%", "gerçekleşme": "gerçek_%"})
+    after_map = {r["bant"]: r["gerçekleşme"] for r in after}
+    after_pred = {r["bant"]: r["ortalama_tahmin"] for r in after}
+    tbl["kalibre_tahmin_%"] = tbl["bant"].map(after_pred)
+    tbl["kalibre_gerçek_%"] = tbl["bant"].map(after_map)
+
+    st.markdown("**Model güveni vs gerçekleşme** (fark ne kadar küçükse o kadar iyi)")
+    st.dataframe(tbl, use_container_width=True, hide_index=True)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Öğrenilen sıcaklık (1X2)", f"{fitted.t_1x2:.2f}",
+              help="1.0 = değişiklik yok. >1 = güven azaltılıyor.")
+    c2.metric("Log-loss (kalibrasyonsuz)", f"{fitted.logloss_before:.4f}")
+    c3.metric("Log-loss (kalibre)", f"{fitted.logloss_after:.4f}",
+              delta=f"{fitted.logloss_after - fitted.logloss_before:+.4f}",
+              delta_color="inverse")
+
+    if fitted.is_identity:
+        st.success(
+            "Model bu ligde zaten iyi kalibre görünüyor — kaydetmeye gerek yok."
+        )
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("💾 Kalibrasyonu Kaydet ve Uygula", type="primary"):
+            calibration.save(fitted)
+            st.success(
+                "Kaydedildi. **Ana (Tahmin)** ekranındaki olasılıklar artık "
+                "kalibre edilmiş olarak gösterilecek."
+            )
+    with col_b:
+        if existing and st.button("🗑️ Kayıtlı kalibrasyonu sil"):
+            calibration.clear(league_key)
+            st.success("Silindi. Tahminler ham model çıktısına döndü.")
+            st.rerun()
 
 
 def _plot_comparison(res):

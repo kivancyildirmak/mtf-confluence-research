@@ -77,12 +77,25 @@ def render():
         st.error(f"Tahmin yapılamadı: {exc}")
         return
 
-    _render_prediction(pred)
+    # Bu lig için kalibrasyon öğrenilmişse olasılıkları düzelt
+    from fpredict import calibration
+    cal = calibration.load(league_key)
+    if cal and not cal.is_identity:
+        pred = calibration.calibrate_prediction(pred, cal)
+
+    _render_prediction(pred, cal)
 
 
-def _render_prediction(pred: dict):
+def _render_prediction(pred: dict, cal=None):
     st.divider()
     st.subheader(f"{pred['home']}  vs  {pred['away']}")
+
+    if pred.get("calibrated") and cal is not None:
+        st.caption(
+            f"🎚️ **Kalibre edilmiş olasılıklar** — {cal.n_matches} maçlık backtest'ten "
+            f"öğrenilen düzeltme uygulandı (T={cal.t_1x2:.2f}). Beklenen goller ve "
+            "en olası skor ham model çıktısıdır."
+        )
 
     # Beklenen goller + en olası skor
     c1, c2, c3 = st.columns(3)
@@ -118,6 +131,13 @@ def _render_prediction(pred: dict):
         )
         st.dataframe(show, use_container_width=True)
         st.caption("Değerler yüzde (%). En koyu hücre en olası skordur.")
+
+    if not pred.get("calibrated"):
+        st.caption(
+            "ℹ️ Bu olasılıklar ham model çıktısıdır. Model yüksek olasılıklarda "
+            "fazla iddialı olabilir; **Backtest** ekranından kalibrasyon "
+            "öğretebilirsiniz."
+        )
 
     st.warning(
         "⚠️ Bu bir **istatistiksel olasılık tahminidir**, garanti sonuç değildir. "

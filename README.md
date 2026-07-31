@@ -28,6 +28,9 @@ istatistik modeliyle takım güçlerini öğrenen ve bir maç için olasılık t
   çarpanı" girişi (kaba yaklaşım olduğu arayüzde belirtilir).
 - **Backtest:** walk-forward (veri sızıntısız) test; doğruluk, log-loss, Brier;
   naif temellerle grafik karşılaştırma ve otomatik yorum.
+- **Olasılık kalibrasyonu:** model yüksek olasılıklarda fazla iddialıdır;
+  backtest kayıtlarından sıcaklık ölçekleme (temperature scaling) öğrenilerek
+  gösterilen yüzdeler gerçekleşme oranına yaklaştırılır ([ayrıntı](#olasılık-kalibrasyonu)).
 - **Değer analizi (bonus):** model olasılıkları vs oranların ima olasılıkları;
   net risk uyarısıyla.
 
@@ -265,6 +268,44 @@ Dixon-Coles `τ(x,y)` düzeltmesi uygulanır. Her maç, güncelliğine göre üs
 azalan bir ağırlık alır: `w = 2^(−yaş_gün / yarı_ömür)`. Parametreler ağırlıklı
 maksimum olabilirlikle (`L-BFGS-B`) bulunur; hücum ortalaması 0'a sabitlenerek
 konum belirsizliği kırılır.
+
+---
+
+## Olasılık Kalibrasyonu
+
+Ham Dixon-Coles modeli düşük/orta olasılıklarda iyi kalibredir ama **yüksek
+olasılıklarda fazla iddialıdır**. Norveç Eliteserien'de 2.676 maçlık
+walk-forward backtest ile ölçülen gerçek davranış:
+
+| Model ne dedi | Maç | Gerçekleşme (ham) | Gerçekleşme (kalibre) |
+|---|---|---|---|
+| %0–40 | 354 | %37.3 (fark 0.7) | fark **0.5** |
+| %40–50 | 925 | %43.0 (fark 1.8) | fark **1.4** |
+| %50–60 | 711 | %52.7 (fark 2.0) | fark **0.9** |
+| %60–70 | 403 | %61.8 (fark 2.5) | fark **0.4** |
+| **%70+** | 283 | %69.3 (fark **7.5**) | fark **2.8** |
+
+**Yöntem:** sıcaklık ölçekleme — olasılıklar `p^(1/T)` ile yumuşatılır ve
+normalize edilir. T, backtest kayıtlarından log-olabilirlik en büyüklenerek
+bulunur. Tek parametreli olduğu için aşırı uyum riski çok düşüktür ve
+tahminlerin **sıralamasını değiştirmez**, yalnızca güven düzeyini düzeltir.
+
+Backtest kayıtları örneklem-dışıdır (her maç yalnızca kendisinden önceki
+verilerle tahmin edilir), bu yüzden kalibrasyon eğitimi için uygundur.
+
+**Pazar başına ayrı sıcaklık öğrenilir.** Ölçümler, aşırı güvenin asıl olarak
+gol pazarlarında olduğunu gösterdi:
+
+| Pazar | Öğrenilen T | Etki (örnek maç) |
+|---|---|---|
+| 1X2 | 1.19 | %87.6 → %82.2 |
+| Üst/Alt 2.5 | **1.81** | %82.2 → **%70.0** |
+| KG Var/Yok | 1.63 | %54.4 → %52.7 |
+
+**Kullanımı:** *Backtest* ekranında testi çalıştırın → **Kalibrasyonu Kaydet ve
+Uygula**. Kayıt lig bazındadır (`settings.json`) ve *Ana (Tahmin)* ekranındaki
+olasılıklara otomatik uygulanır. Beklenen gol sayıları ve en olası skor ham
+model çıktısı olarak kalır.
 
 ---
 

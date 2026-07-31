@@ -150,9 +150,15 @@ def run_backtest(
         base_uniform_logloss += -np.sum(y * np.log(np.array([1/3, 1/3, 1/3])))
 
         n += 1
+        total_goals = row["home_goals"] + row["away_goals"]
         records.append({
             "date": row["date"], "home": home, "away": away, "actual": actual,
             "p_home": p[0], "p_draw": p[1], "p_away": p[2], "pred": pred_outcome,
+            # Kalibrasyon için ek pazarlar: tahmin edilen olasılık + gerçekleşme
+            "p_over25": pred["prob_over25"],
+            "over25": int(total_goals >= 3),
+            "p_btts": pred["prob_btts_yes"],
+            "btts": int(row["home_goals"] >= 1 and row["away_goals"] >= 1),
         })
 
     if n == 0:
