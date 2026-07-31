@@ -307,6 +307,16 @@ Uygula**. Kayıt lig bazındadır (`settings.json`) ve *Ana (Tahmin)* ekranında
 olasılıklara otomatik uygulanır. Beklenen gol sayıları ve en olası skor ham
 model çıktısı olarak kalır.
 
+**Neden lig bazında?** Ev sahibi avantajı, beraberlik oranı ve gol dağılımı
+ligden lige değişir; dolayısıyla modelin aşırı güven miktarı da değişir. Bir
+ligde öğrenilen sıcaklığı diğerine uygulamak yanlış olur.
+
+**Toplu kalibrasyon:** Her ligi elle kalibre etmemek için *Backtest* ekranındaki
+**⚙️ Tüm ligleri toplu kalibre et** bölümünü kullanın. Cache'teki her lig için
+backtest çalıştırıp kalibrasyonu kaydeder, sonuçları tablo halinde özetler.
+Verisi yetersiz ligler atlanır; bir ligdeki hata diğerlerini durdurmaz.
+(Lig başına birkaç dakika sürebilir.)
+
 ---
 
 ## 🔒 Yasal / Etik Uyarı

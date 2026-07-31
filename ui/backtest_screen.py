@@ -37,6 +37,9 @@ def render():
         "refit yavaş olabilir. Refit aralığını artırmak hızlandırır."
     )
 
+    _batch_calibration_panel(list(summary["league"]), half_life,
+                             int(min_train), int(refit_every))
+
     if not st.button("▶️ Backtest'i Çalıştır", type="primary"):
         return
 
@@ -77,6 +80,77 @@ def render():
 
     with st.expander("Tahmin kayıtları (ilk 200)"):
         st.dataframe(res.records.head(200), use_container_width=True, hide_index=True)
+
+
+def _batch_calibration_panel(leagues: list[str], half_life, min_train, refit_every):
+    """Cache'teki tüm ligleri tek seferde kalibre eder.
+
+    Kalibrasyon lig bazındadır (ev sahibi avantajı, beraberlik oranı ve gol
+    dağılımı ligden lige değişir), ancak bunu elle tek tek yapmak zahmetlidir.
+    """
+    from fpredict import backtest, calibration, db
+
+    with st.expander(f"⚙️ Tüm ligleri toplu kalibre et ({len(leagues)} lig)"):
+        st.caption(
+            "Her lig için backtest çalıştırıp kalibrasyonu öğrenir ve kaydeder. "
+            "Yukarıdaki parametreler (yarı-ömür, ısınma, refit aralığı) kullanılır.\n\n"
+            "⏱️ **Lig başına birkaç dakika sürebilir** — büyük cache'lerde uzun sürer. "
+            "Veri yetersiz olan ligler atlanır."
+        )
+
+        # Hangi liglerde kalibrasyon zaten var?
+        existing = {lg: calibration.load(lg) for lg in leagues}
+        have = [lg for lg, c in existing.items() if c]
+        if have:
+            st.caption(f"Kayıtlı kalibrasyonu olanlar: {', '.join(have)}")
+
+        skip_done = st.checkbox("Kalibrasyonu olan ligleri atla", value=True)
+
+        if not st.button("⚙️ Toplu Kalibrasyonu Başlat"):
+            return
+
+        targets = [lg for lg in leagues if not (skip_done and existing.get(lg))]
+        if not targets:
+            st.info("Kalibre edilecek lig kalmadı.")
+            return
+
+        prog = st.progress(0.0, text="Başlatılıyor…")
+        rows = []
+        for i, lg in enumerate(targets):
+            name = config.LEAGUE_NAMES.get(lg, lg)
+            prog.progress(i / len(targets), text=f"{name} — backtest çalışıyor…")
+            try:
+                df = db.load_matches(lg)
+                res = backtest.run_backtest(
+                    df, half_life=half_life, min_train=min_train,
+                    refit_every=refit_every,
+                )
+                cal = calibration.fit_from_backtest(res.records, lg)
+                calibration.save(cal)
+                rows.append({
+                    "lig": name,
+                    "maç": res.n_predicted,
+                    "doğruluk %": round(res.accuracy * 100, 1),
+                    "T (1X2)": round(cal.t_1x2, 2),
+                    "log-loss": round(cal.logloss_before, 4),
+                    "kalibre log-loss": round(cal.logloss_after, 4),
+                    "durum": "✅ kaydedildi",
+                })
+            except ValueError as exc:
+                rows.append({"lig": name, "maç": 0, "durum": f"⏭️ atlandı — {exc}"})
+            except Exception as exc:  # beklenmeyen; diğer ligler devam etsin
+                rows.append({"lig": name, "maç": 0, "durum": f"⚠️ hata — {exc}"})
+
+        prog.empty()
+        import pandas as pd
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        ok = sum(1 for r in rows if r.get("durum", "").startswith("✅"))
+        st.success(
+            f"{ok}/{len(targets)} lig kalibre edildi ve kaydedildi. "
+            "**Ana (Tahmin)** ekranındaki olasılıklar artık kalibre gösterilecek."
+        )
+        common.bump_data_version()
 
 
 def _calibration_panel(res, league_key: str):
