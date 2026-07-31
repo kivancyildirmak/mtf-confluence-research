@@ -229,6 +229,52 @@ def calibrate_prediction(pred: dict, cal: Calibration | None) -> dict:
 # --------------------------------------------------------------------------- #
 # Güvenilirlik tablosu (arayüzde öncesi/sonrası göstermek için)
 # --------------------------------------------------------------------------- #
+def calibration_comparison(records, temperature: float):
+    """Kalibrasyonun etkisini AYNI maçlar üzerinde karşılaştırır.
+
+    `reliability_table` bantları kendi olasılığına göre kurar; kalibrasyon
+    olasılıkları sıkıştırdığı için maçlar bantlar arasında yer değiştirir ve
+    "önce/sonra" sütunları farklı maç kümelerini gösterir — yan yana konursa
+    yanıltıcı olur (hatta kalibrasyon iyileştirmişken kötüleşmiş gibi görünür).
+
+    Bu fonksiyon bantları HAM olasılığa göre sabitler. Sıcaklık ölçekleme
+    sıralamayı değiştirmediği için isabet oranı iki durumda da aynıdır; böylece
+    tek soru kalır: gösterilen yüzde gerçekleşmeye yaklaştı mı?
+
+    Returns:
+        [{"bant", "maç", "ham_tahmin", "kalibre_tahmin", "gerçekleşme",
+          "ham_fark", "kalibre_fark"}, ...]
+    """
+    probs = records[["p_home", "p_draw", "p_away"]].to_numpy(dtype=float)
+    cal_probs = apply_temperature(probs, temperature)
+    outcomes = records["actual"].to_numpy()
+    labels = np.array(["H", "D", "A"])
+
+    idx = probs.argmax(axis=1)          # sıralama değişmez -> tek indeks yeter
+    p_raw = probs.max(axis=1)
+    p_cal = cal_probs[np.arange(len(cal_probs)), idx]
+    hit = labels[idx] == outcomes
+
+    rows = []
+    for lo, hi in [(0.0, 0.4), (0.4, 0.5), (0.5, 0.6), (0.6, 0.7), (0.7, 1.01)]:
+        m = (p_raw >= lo) & (p_raw < hi)
+        if m.sum() < 10:
+            continue
+        ham = float(p_raw[m].mean()) * 100
+        kal = float(p_cal[m].mean()) * 100
+        ger = float(hit[m].mean()) * 100
+        rows.append({
+            "bant": f"%{int(lo*100)}–{int(min(hi, 1.0)*100)}",
+            "maç": int(m.sum()),
+            "ham_tahmin": round(ham, 1),
+            "kalibre_tahmin": round(kal, 1),
+            "gerçekleşme": round(ger, 1),
+            "ham_fark": round(abs(ham - ger), 1),
+            "kalibre_fark": round(abs(kal - ger), 1),
+        })
+    return rows
+
+
 def reliability_table(records, temperature: float = 1.0):
     """Model güveni ile gerçekleşme oranını bantlar halinde karşılaştırır.
 

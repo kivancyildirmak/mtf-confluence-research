@@ -255,3 +255,49 @@ def test_clear_removes_only_target_league(tmp_path, monkeypatch):
     cal.clear("NOR")
     assert cal.load("NOR") is None
     assert cal.load("SWE") is not None
+
+
+# --------------------------------------------------------------------------- #
+# Sabit üyelikli karşılaştırma (bantlar arası kayma sorunu)
+# --------------------------------------------------------------------------- #
+def test_comparison_bands_have_fixed_membership():
+    """Bantlar HAM olasılığa göre kurulmalı; kalibrasyon maç sayısını değiştirmemeli."""
+    rec = _records(n=600, seed=7)
+    c = cal.fit_from_backtest(rec, "NOR")
+
+    rows_id = cal.calibration_comparison(rec, 1.0)      # kimlik dönüşümü
+    rows_cal = cal.calibration_comparison(rec, c.t_1x2)
+
+    assert [r["bant"] for r in rows_id] == [r["bant"] for r in rows_cal]
+    assert [r["maç"] for r in rows_id] == [r["maç"] for r in rows_cal]
+    # Gerçekleşme oranı da değişmemeli (sıralama korunduğu için isabet aynıdır)
+    assert [r["gerçekleşme"] for r in rows_id] == [r["gerçekleşme"] for r in rows_cal]
+
+
+def test_comparison_shows_calibration_moves_toward_reality():
+    """Aşırı güvenli veride kalibre tahmin gerçekleşmeye yaklaşmalı."""
+    rec = _records(n=1200, seed=11)
+    c = cal.fit_from_backtest(rec, "NOR")
+    rows = cal.calibration_comparison(rec, c.t_1x2)
+
+    improved = [r for r in rows if r["kalibre_fark"] <= r["ham_fark"]]
+    assert len(improved) >= len(rows) - 1        # neredeyse tüm bantlarda iyileşme
+    # Toplamda ortalama sapma azalmalı
+    ham = np.mean([r["ham_fark"] for r in rows])
+    kal = np.mean([r["kalibre_fark"] for r in rows])
+    assert kal < ham
+
+
+def test_comparison_identity_temperature_is_noop():
+    rec = _records(n=300, seed=2)
+    rows = cal.calibration_comparison(rec, 1.0)
+    for r in rows:
+        assert r["ham_tahmin"] == r["kalibre_tahmin"]
+        assert r["ham_fark"] == r["kalibre_fark"]
+
+
+def test_comparison_reports_match_counts():
+    rec = _records(n=500, seed=4)
+    rows = cal.calibration_comparison(rec, 1.3)
+    assert sum(r["maç"] for r in rows) <= len(rec)
+    assert all(r["maç"] >= 10 for r in rows)     # küçük bantlar elenir

@@ -109,18 +109,38 @@ def _calibration_panel(res, league_key: str):
         st.warning(f"Kalibrasyon öğrenilemedi: {exc}")
         return
 
-    after = calibration.reliability_table(res.records, fitted.t_1x2)
-
     import pandas as pd
-    tbl = pd.DataFrame(before).rename(columns={
-        "ortalama_tahmin": "tahmin_%", "gerçekleşme": "gerçek_%"})
-    after_map = {r["bant"]: r["gerçekleşme"] for r in after}
-    after_pred = {r["bant"]: r["ortalama_tahmin"] for r in after}
-    tbl["kalibre_tahmin_%"] = tbl["bant"].map(after_pred)
-    tbl["kalibre_gerçek_%"] = tbl["bant"].map(after_map)
 
-    st.markdown("**Model güveni vs gerçekleşme** (fark ne kadar küçükse o kadar iyi)")
+    comp = calibration.calibration_comparison(res.records, fitted.t_1x2)
+    tbl = pd.DataFrame(comp).rename(columns={
+        "ham_tahmin": "ham tahmin %",
+        "kalibre_tahmin": "kalibre tahmin %",
+        "gerçekleşme": "gerçekleşme %",
+        "ham_fark": "ham fark",
+        "kalibre_fark": "kalibre fark",
+    })
+
+    st.markdown(
+        "**Model güveni vs gerçekleşme** — bantlar ham olasılığa göre sabittir, "
+        "yani her satır **aynı maçları** gösterir. Sıcaklık ölçekleme sıralamayı "
+        "değiştirmediği için gerçekleşme oranı iki durumda da aynıdır; tek soru "
+        "gösterilen yüzdenin gerçeğe yaklaşıp yaklaşmadığıdır (**fark küçüldü mü?**)."
+    )
     st.dataframe(tbl, use_container_width=True, hide_index=True)
+
+    # Küçük örneklem uyarısı — dar bantlarda oranlar gürültülüdür
+    small = [r["bant"] for r in comp if r["maç"] < 50]
+    if small:
+        st.caption(
+            f"⚠️ Şu bantlarda 50'den az maç var: {', '.join(small)}. "
+            "Bu bantlardaki gerçekleşme oranları gürültülüdür; tek başına "
+            "yorumlamayın — asıl ölçüt aşağıdaki log-loss'tur."
+        )
+
+    improved = sum(1 for r in comp if r["kalibre_fark"] < r["ham_fark"])
+    st.caption(
+        f"{improved}/{len(comp)} bantta gösterilen yüzde gerçekleşmeye yaklaştı."
+    )
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Öğrenilen sıcaklık (1X2)", f"{fitted.t_1x2:.2f}",
