@@ -70,6 +70,24 @@ bir kabuğa taşınabilir.
 
 ---
 
+## Hızlı Başlangıç (Windows — komut yazmadan)
+
+Python 3.11+ kurulu olsun ([python.org](https://www.python.org/downloads/),
+kurulumda **"Add python.exe to PATH"** kutusunu işaretleyin).
+
+1. **`Baslat.bat`** dosyasına **çift tıklayın.** Hepsi bu.
+   - Eksik paketleri ilk açılışta kendisi kurar
+   - Streamlit'in ilk çalıştırma e-posta sorusunu atlar
+   - Tarayıcıyı otomatik açar
+2. Her seferinde daha da kolay olsun isterseniz **`Masaustu_Kisayolu_Olustur.bat`**
+   dosyasını bir kez çalıştırın — masaüstüne kısayol ekler.
+
+Kapatmak için açılan siyah pencereyi kapatın.
+
+**macOS / Linux:** `chmod +x baslat.sh` (bir kez) → `./baslat.sh`
+
+---
+
 ## Kurulum (kaynaktan çalıştırma)
 
 Python 3.11+ gerekir.
