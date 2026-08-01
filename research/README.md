@@ -1,0 +1,247 @@
+# Paribu ML Sinyal Araştırma Hattı (offline)
+
+Makine öğrenmesi tabanlı bir kripto sinyal modelinin **araştırma ve backtest**
+altyapısı. Bu aşamada **canlı API bağlantısı yoktur**: veri çekme ve emir
+gönderme fonksiyonları imzaları ve dokümantasyonları hazır, gövdeleri
+`NotImplementedError` olan stub'lardır. Odak, canlıya geçildiğinde sonuçların
+tekrar edeceği **sağlam bir offline hat** kurmaktır.
+
+---
+
+## 1. Hızlı başlangıç
+
+```bash
+pip install -r research/requirements.txt
+
+# Sentetik veriyle uçtan uca çalıştır
+python -m research.run_research --synthetic
+
+# Kendi verinizle
+python -m research.run_research --data data/btc_tl_1m.parquet
+
+# Testler (pytest gerekmez)
+python -m research.tests.test_pipeline
+```
+
+Çıktılar `artifacts/` klasörüne yazılır: `model.pkl`, `report.json`,
+`backtest.png`, `feature_importance.png`, `cpcv_distribution.png`, `trades.csv`
+ve metrik tabloları.
+
+---
+
+## 2. Hattın akışı
+
+```
+data.py           Veri (yerel CSV/parquet | sentetik | TODO: Paribu API)
+   |
+features.py       ORTAK özellik üretimi  <-- canlı bot da BURAYI kullanacak
+   |
+labeling.py       CUSUM olayları -> triple-barrier -> meta-label
+   |              + örnek benzersizliği ağırlıkları
+   |
+validation.py     Purged K-Fold (+embargo) -> OOS olasılıklar
+   |              Combinatorial Purged CV -> performans DAĞILIMI
+   |              Walk-forward -> nihai doğrulama
+   |
+model.py          LightGBM (ağırlıklı) + SHAP + kaydet/yükle
+   |
+sizing.py         olasılık -> bahis boyutu -> kapaklı Kelly -> vol hedefleme
+   |
+backtest.py       komisyon + slippage + GECİKME ile icra, metrikler
+   |
+validation.py     Deflated Sharpe Ratio (çoklu deneme düzeltmesi)
+```
+
+`run_research.py` bu sırayı uçtan uca çalıştırır ve özet tablo + grafik üretir.
+
+---
+
+## 3. En kritik kural: FEATURE PARITY
+
+Backtest ile canlı botun **birebir aynı** hesabı yapması gerekir. Bunun için:
+
+* Tüm özellikler **tek bir fonksiyondan** üretilir: `features.make_features()`.
+  Canlı bot da yalnızca bunu çağırmalıdır — kopyalanmış/yeniden yazılmış bir
+  gösterge kodu paritenin en yaygın bozulma sebebidir.
+* Fonksiyon **deterministiktir**, global durum tutmaz, rastgelelik içermez.
+* Emir defteri veya referans varlık verisi yoksa sütunlar **silinmez, NaN
+  bırakılır**. Böylece özellik şeması her koşulda aynıdır (LightGBM NaN'ı
+  doğal olarak işler).
+* Sütun sırası alfabetik olarak sabitlenir.
+* `model.save_model()` modeli, özellik listesini ve tüm konfigürasyonu **tek
+  dosyada** saklar. Canlı taraf `model.check_feature_parity()` ile şemayı
+  doğrulamadan sinyal üretmemelidir.
+
+```python
+from research.features import make_features
+from research.model import load_model, check_feature_parity
+
+m = load_model("artifacts/model.pkl")
+X = make_features(son_barlar, orderbook=defter, reference=btc)
+check_feature_parity(m, X)          # şema uyuşmazlığında ValueError
+p = m.predict_proba(X.iloc[[-1]])   # yalnızca KAPANMIŞ son bar
+```
+
+---
+
+## 4. Sızıntı (look-ahead / leakage) politikası
+
+Hattın her katmanında uygulanan kurallar:
+
+| Katman | Risk | Önlem |
+|---|---|---|
+| `data.py` | Kapanmamış son bar verinin içinde | `drop_unclosed_bar()` — canlıda zorunlu |
+| `data.py` | Eksik barları sessizce doldurmak | `align_to_bars(fill_gaps=False)` varsayılan |
+| `features.py` | `shift(-k)`, `center=True`, global ortalama/std | Yalnızca trailing `rolling`/`ewm`; global istatistik yok |
+| `features.py` | Çapraz varlık aynı-bar getirisi | Ayrıca gecikmeli (`shift(lag)`) sürümler üretilir |
+| `labeling.py` | Bariyer taramasının olay barını içermesi | Tarama `t+1`'den başlar |
+| `labeling.py` | Ufku veri sonuna sığmayan olaylar | `NaT` işaretlenip **elenir** (kırpılmış etiket = yanlı etiket) |
+| `labeling.py` | Meta-label için ML birincil model | Birincil model **deterministik kural** (`primary_side_rule`) |
+| `validation.py` | Çakışan etiketler | **Purging**: `t1` üzerinden iki yönlü eleme |
+| `validation.py` | Seri korelasyon | **Embargo**: test bloğu sonrası karantina |
+| `backtest.py` | Sinyal barından işlem | **Gecikme**: `t + latency_bars` barının açılışı |
+| `backtest.py` | Bariyerden tam fiyatla çıkış | Çıkış, temas barının SONRASINDAKİ açılıştan |
+| `sizing.py` | Tüm örneklem volatilitesiyle ölçekleme | Yalnızca kayan pencere vol tahmini |
+
+Bunların yorumda kalmaması için `research/tests/test_pipeline.py` içinde
+**davranışsal testler** vardır. En önemlisi `test_features_are_causal`: seri
+`k`. bardan kesildiğinde hesaplanan son satır, tüm seride hesaplanan aynı
+satıra **birebir eşit** olmalıdır. Değilse o özellik geleceği görüyordur.
+
+---
+
+## 5. Etiketleme (triple-barrier + meta-labeling)
+
+**Neden sabit ufuklu etiket değil?** "60 bar sonraki getirinin işareti" gerçek
+bir işlemin nasıl kapandığını (zarar-kes / kâr-al) yansıtmaz.
+
+1. **Olay örnekleme (CUSUM).** Her bar bir örnek değildir; kümülatif hareket
+   eşiği aşınca olay üretilir. Etiket çakışmasını ciddi biçimde azaltır.
+2. **Üç bariyer.** Üst = `pt_mult × hedef_vol`, alt = `sl_mult × hedef_vol`,
+   dikey = `vertical_bars`. Etiket, **ilk değilen** bariyerdir. Aynı barda iki
+   bariyer de değerse kötümser varsayım (zarar-kes) uygulanır.
+3. **Meta-labeling.** Birincil model (deterministik EMA kuralı) **yönü** verir;
+   LightGBM yalnızca "bu işleme gir / girme" ikili kararını öğrenir. Çıktı bir
+   olasılıktır ve doğrudan pozisyon boyutuna çevrilir.
+4. **Örnek ağırlıkları** (López de Prado): ortalama benzersizlik × getiri atfı
+   × zaman sönümü. Ağırlıklar **yalnızca eğitimde** kullanılır; raporlanan
+   metrikler ağırlıksızdır.
+
+> **Bariyer genişliği maliyetten büyük olmalı.** Gidiş-dönüş maliyet ~%0.5 iken
+> bariyeri %0.3'e kurmak, model ne kadar iyi olursa olsun matematiksel olarak
+> kaybeden bir strateji üretir. Varsayılanlar (`pt_sl=(2.0, 2.0)`,
+> `vertical_bars=240`) bu kısıt gözetilerek seçilmiştir.
+
+---
+
+## 6. Doğrulama
+
+* **Purged K-Fold + embargo** — tüm örneklem için OOS olasılık üretir.
+* **Combinatorial Purged CV** — `C(N,k)` bölünme, `C(N,k)·k/N` bağımsız
+  backtest yolu. Tek skor yerine **dağılım** verir; her bölünmede maliyetli
+  mini-backtest de çalıştırılır, yani dağılım AUC'de değil **parada** görülür.
+* **Walk-forward** — dağıtımın en yakın taklidi: geçmişte eğit, hemen sonrasını
+  test et, kaydır.
+* **Deflated Sharpe Ratio** — gözlenen Sharpe'ı 0 ile değil, `n_trials` deneme
+  sonrası **şans eseri beklenen maksimum Sharpe** ile karşılaştırır.
+
+> `CVConfig.n_trials` dürüstçe doldurulmalıdır: denenen tüm özellik setleri,
+> hiperparametreler, bariyerler, eşikler. Küçük beyan etmek DSR'yi şişirir ve
+> testi anlamsızlaştırır.
+
+---
+
+## 7. Backtest varsayımları
+
+Bilinçli olarak **kötümser**:
+
+| Varsayım | Değer / davranış |
+|---|---|
+| Komisyon | `commission_rate` × 2 (giriş + çıkış), varsayılan %0.20 taker |
+| Slippage | `slippage_bps`, fiyata yön **aleyhine** uygulanır |
+| Gecikme | Sinyal bar `t` kapanışında; emir `t + latency_bars` **açılışında** |
+| Çıkış | Bariyer teması bar kapanışında fark edilir, çıkış sonraki açılıştan |
+| Eşzamanlılık | Varsayılan **tek pozisyon**; açıkken gelen sinyaller atlanır |
+| Modellenmeyen | Kısmi dolum, piyasa etkisi, fonlama → sonuç bir **ÜST SINIRDIR** |
+
+**Metrikler:** maliyet sonrası toplam getiri, CAGR, Sharpe, Sortino, maksimum
+drawdown ve süresi, Calmar, işlem sayısı, isabet oranı, ortalama kazanç/kayıp,
+kazanç/kayıp oranı, profit factor, toplam maliyet, maliyetin brüte oranı,
+piyasada kalma oranı. Ayrıca **al-ve-tut ölçütü** ve **maliyet duyarlılık
+analizi** (0×, 0.5×, 1×, 1.5×, 2× maliyet) raporlanır.
+
+> **Accuracy'e güvenmeyin.** Dengesiz etiketlerde çoğunluk sınıfını söylemek
+> yüksek accuracy verir. Karar, maliyet sonrası backtest ve DSR'dedir. Sharpe
+> ise 1 dakikalık barlarda değil, `metric_freq` (varsayılan saatlik) frekansına
+> indirgenerek hesaplanır — nakitte geçen barların sıfır getirisi oranı aksi
+> halde yapay olarak şişirir.
+
+---
+
+## 8. Pozisyon boyutlandırma
+
+`sizing.py` üç bileşeni birleştirir ve **en muhafazakârını** seçer:
+
+1. Olasılık boyutu — `2·Φ((p−0.5)/√(p(1−p))) − 1`.
+2. Kapaklı (fractional) Kelly — `f* = (p·b − (1−p))/b`, `kelly_fraction` ile
+   kesirli, `kelly_cap` ile kapaklı. Tam Kelly **önerilmez**.
+3. Volatilite hedefleme — `hedef_vol / tahmini_vol`, `max_leverage` ile sınırlı.
+
+`method="combined"` (varsayılan): `min(olasılık, Kelly) × vol_ölçeği`.
+
+---
+
+## 9. Konfigürasyon
+
+Tüm parametreler `config.py` içindedir; kodda sihirli sayı yoktur.
+`DataConfig`, `FeatureConfig`, `LabelConfig`, `ModelConfig`, `CVConfig`,
+`BacktestConfig`, `SizingConfig` → `ResearchConfig`.
+
+Tekrarlanabilirlik: tek bir `RANDOM_SEED`, `set_global_seed()` ile Python/NumPy'a
+ve `ModelConfig.params` üzerinden LightGBM'e dağıtılır (`deterministic: True`).
+Config, eğitilen modelle birlikte diske yazılır.
+
+---
+
+## 10. Paribu API'sini bağlarken (TODO)
+
+Doldurulacak üç fonksiyon `data.py` içindedir:
+
+* `fetch_paribu_ohlcv(symbol, interval_minutes, start, end, limit)`
+* `fetch_orderbook(symbol, depth, snapshot_interval_minutes, start, end)`
+* `submit_order(symbol, side, quantity, order_type, price)`
+
+Uyulması gerekenler:
+
+1. Dönen veri `validate_ohlcv()` sözleşmesine uymalı (UTC `DatetimeIndex`,
+   `open/high/low/close/volume`, artan ve tekilleştirilmiş).
+2. **Kapanmamış son bar atılmalı** (`drop_unclosed_bar`).
+3. Eksik barlar sessizce doldurulmamalı.
+4. Emir defteri anlık görüntüsü **barın kapanış anına** hizalanmalı.
+5. Canlı sinyal üretiminden önce `check_feature_parity()` çağrılmalı.
+6. Isınma: elde `features.warmup_bars()` kadar geçmiş yoksa sinyal üretilmemeli.
+
+---
+
+## 11. Sentetik veri hakkında
+
+`generate_synthetic_ohlcv()` stokastik volatilite (OU süreci), gün içi
+mevsimsellik, Brownian köprüyle bar içi ekstremler ve volatiliteyle
+korelasyonlu hacim üretir. İçinde **çok zayıf** bir momentum bileşeni vardır.
+
+Sentetik veride hattın **kâr göstermemesi beklenen ve doğru sonuçtur**: orada
+gerçek bir kenar (edge) yoktur ve bu altyapının asıl işi, olmayan bir kenarı
+"var" göstermemektir. `run_research.py` sonunda basılan KARAR bloğu bunu açıkça
+söyler. Gerçek veriyle çalışırken de aynı eşikler geçerlidir.
+
+---
+
+## 12. Bilinen sınırlar
+
+* Kısmi dolum, piyasa etkisi ve emir defteri tüketimi modellenmez.
+* Tek sembol, tek pozisyon; portföy düzeyi risk yönetimi yoktur.
+* Hiperparametre araması yoktur (eklenirse `n_trials` güncellenmelidir).
+* Model kalibrasyonu (Platt/isotonic) uygulanmaz; Kelly kalibre olasılık ister,
+  bu yüzden `kelly_fraction` düşük tutulmuştur.
+* Rejim değişimi tespiti yalnızca özellik seviyesindedir; ayrı bir rejim modeli
+  yoktur.
