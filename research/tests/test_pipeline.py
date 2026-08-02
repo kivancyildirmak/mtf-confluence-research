@@ -31,6 +31,7 @@ from ..config import ResearchConfig
 from ..data import (
     fetch_orderbook,
     fetch_paribu_ohlcv,
+    submit_order,
     generate_synthetic_ohlcv,
     generate_synthetic_orderbook,
     generate_synthetic_reference,
@@ -95,13 +96,37 @@ def test_csv_and_parquet_roundtrip() -> None:
 
 
 def test_api_stubs_raise() -> None:
-    """Canlı API metotları bilinçli olarak NotImplementedError atmalı."""
-    for fn, args in ((fetch_paribu_ohlcv, ("BTC_TL",)), (fetch_orderbook, ("BTC_TL",))):
+    """Bağlanmamış uçlar NotImplementedError atmalı.
+
+    ``fetch_paribu_ohlcv`` artık stub DEĞİL (yerel poll-forward deposunu okur),
+    bu yüzden buradan çıkarıldı; onun davranışı
+    :func:`test_fetch_ohlcv_reports_missing_collection` ile test edilir.
+    Emir defteri ucu Paribu'da yok, ``submit_order`` ise bilinçli olarak
+    bağlanmadı.
+    """
+    for fn, args in ((fetch_orderbook, ("BTC_TL",)), (submit_order, ("BTC_TL", "buy", 1.0))):
         try:
             fn(*args)
         except NotImplementedError:
             continue
         raise AssertionError(f"{fn.__name__} NotImplementedError atmalıydı.")
+
+
+def test_fetch_ohlcv_reports_missing_collection() -> None:
+    """Hiç veri toplanmamışsa açıklayıcı bir hata verilmeli (sessiz boş DataFrame değil)."""
+    import research.tools.collect_paribu as cp
+
+    with tempfile.TemporaryDirectory() as tmp:
+        orig = cp.CONFIG.collector.tick_dir
+        cp.CONFIG.collector.tick_dir = str(Path(tmp) / "bos")
+        try:
+            fetch_paribu_ohlcv("BTC_TL")
+        except FileNotFoundError as e:
+            assert "collect" in str(e), "Hata mesajı ne yapılacağını söylemeli."
+            return
+        finally:
+            cp.CONFIG.collector.tick_dir = orig
+    raise AssertionError("Veri yokken FileNotFoundError beklenirdi.")
 
 
 def test_validate_ohlcv_rejects_bad_schema() -> None:
@@ -418,6 +443,147 @@ def test_no_overlapping_positions_by_default() -> None:
     entries = res.trades["entry_pos"].to_numpy()
     exits = res.trades["exit_pos"].to_numpy()
     assert (entries[1:] > exits[:-1]).all(), "Çakışan pozisyon açılmış."
+
+
+# --------------------------------------------------------------------------- #
+# Poll-forward toplayıcı
+# --------------------------------------------------------------------------- #
+
+
+def _make_ticks(
+    prices: list[float],
+    volumes: list[float],
+    start: str = "2026-08-02 10:00:00",
+    step_seconds: int = 5,
+    spread: float = 100.0,
+    symbol: str = "BTC_TL",
+) -> pd.DataFrame:
+    """Test için elle kurulmuş tick tablosu."""
+    ts = pd.date_range(start, periods=len(prices), freq=f"{step_seconds}s", tz="UTC")
+    return pd.DataFrame(
+        {
+            "ts": ts,
+            "symbol": symbol,
+            "last": prices,
+            "lowest_ask": [p + spread / 2 for p in prices],
+            "highest_bid": [p - spread / 2 for p in prices],
+            "volume24h": volumes,
+        }
+    )
+
+
+def test_ticker_parsing_handles_strings_and_missing_pairs() -> None:
+    """Borsa sayıları dizge döndürebilir; olmayan parite çökmeye yol açmamalı."""
+    from ..tools.collect_paribu import parse_ticker
+
+    from ..tools.collect_paribu import _to_float
+
+    payload = {
+        "BTC_TL": {"last": "3000000.50", "lowestAsk": 3000100, "highestBid": "2999900",
+                   "volume": "12.5"},
+    }
+    ts = pd.Timestamp("2026-08-02 10:00:00", tz="UTC")
+    rows = parse_ticker(payload, ["BTC_TL", "YOK_TL"], ts)
+    assert len(rows) == 1, "Olmayan parite atlanmalı, hata atmamalı."
+    assert rows[0]["last"] == 3_000_000.50
+    assert rows[0]["lowest_ask"] == 3_000_100.0, "Sayısal (dizge olmayan) değer de çalışmalı."
+    assert rows[0]["volume24h"] == 12.5
+
+    # EN KRİTİK: ondalıklı dizge asla binlik ayıracı sanılıp bozulmamalı.
+    assert _to_float("3000.50") == 3000.50, "Ondalık nokta silinirse fiyat 100 katına çıkar!"
+    # TR biçimi ancak standart çözüm BAŞARISIZ olursa devreye girer.
+    assert _to_float("3.000.000,25") == 3_000_000.25
+    assert _to_float("") != _to_float(""), "Boş değer NaN olmalı (NaN != NaN)."
+
+
+def test_tick_storage_is_append_only_and_deduplicated() -> None:
+    """Tekrar yazımlar veri kaybettirmemeli, çift kayıt da bırakmamalı."""
+    import research.tools.collect_paribu as cp
+
+    with tempfile.TemporaryDirectory() as tmp:
+        orig = cp.CONFIG.collector.tick_dir
+        cp.CONFIG.collector.tick_dir = tmp
+        try:
+            first = _make_ticks([100.0, 101.0], [10.0, 11.0])
+            second = _make_ticks([102.0, 103.0], [12.0, 13.0], start="2026-08-02 10:00:10")
+            cp.append_ticks(first.to_dict("records"))
+            cp.append_ticks(second.to_dict("records"))
+            cp.append_ticks(second.to_dict("records"))  # aynı veriyi tekrar yaz
+
+            back = cp.load_ticks(symbol="BTC_TL")
+            assert len(back) == 4, f"4 benzersiz tick beklenirdi, {len(back)} bulundu."
+            assert back["ts"].is_monotonic_increasing
+            assert not back["ts"].duplicated().any()
+        finally:
+            cp.CONFIG.collector.tick_dir = orig
+
+
+def test_resample_builds_ohlc_from_last_prices() -> None:
+    """OHLC 'last' tick'lerinden doğru kurulmalı."""
+    from ..tools.collect_paribu import resample_ticks_to_ohlcv
+
+    ticks = _make_ticks([100.0, 105.0, 95.0, 102.0], [10.0, 11.0, 12.0, 13.0])
+    bars = resample_ticks_to_ohlcv(ticks, now=pd.Timestamp("2026-08-02 11:00:00", tz="UTC"))
+    assert len(bars) == 1
+    row = bars.iloc[0]
+    assert row["open"] == 100.0 and row["close"] == 102.0
+    assert row["high"] == 105.0 and row["low"] == 95.0
+    assert row["tick_count"] == 4
+    assert bars.index.tz is not None and str(bars.index.tz) == "UTC"
+
+
+def test_resample_drops_unclosed_bar() -> None:
+    """Kapanmamış son bar atılmalı (README bölüm 10 sözleşmesi)."""
+    from ..tools.collect_paribu import resample_ticks_to_ohlcv
+
+    # 10:00 ve 10:01 dakikalarına yayılan tick'ler.
+    ticks = _make_ticks([100.0] * 24, list(np.arange(24.0)), step_seconds=5)
+    now = pd.Timestamp("2026-08-02 10:01:30", tz="UTC")  # 10:01 barı henüz kapanmadı
+    kept = resample_ticks_to_ohlcv(ticks, drop_unclosed=True, now=now)
+    all_bars = resample_ticks_to_ohlcv(ticks, drop_unclosed=False, now=now)
+    assert len(all_bars) == 2
+    assert len(kept) == 1, "Kapanmamış bar atılmalıydı."
+    assert kept.index[-1] == pd.Timestamp("2026-08-02 10:00:00", tz="UTC")
+
+
+def test_resample_volume_excludes_unmeasurable_intervals() -> None:
+    """24s kümülatif hacimdeki negatif sıçrama ölçülemez sayılmalı, uydurulmamalı."""
+    from ..tools.collect_paribu import resample_ticks_to_ohlcv
+
+    # 100 -> 110 -> 120 -> 5 (gün dönümü sıfırlanması) -> 15
+    ticks = _make_ticks([100.0] * 5, [100.0, 110.0, 120.0, 5.0, 15.0])
+    bars = resample_ticks_to_ohlcv(ticks, now=pd.Timestamp("2026-08-02 11:00:00", tz="UTC"))
+    row = bars.iloc[0]
+    # Geçerli farklar: +10, +10, +10  (negatif olan -115 DIŞLANIR)
+    assert row["volume"] == 30.0, f"Beklenen 30.0, bulunan {row['volume']}"
+    assert abs(row["volume_gecerli_oran"] - 0.75) < 1e-9, "4 farkın 3'ü geçerli olmalı."
+
+
+def test_volume_diagnosis_distinguishes_rolling_from_daily_reset() -> None:
+    """Tanılama, kayan 24s penceresini gün sonu sıfırlanmasından ayırmalı."""
+    from ..tools.collect_paribu import diagnose_volume_series
+
+    # Gün ortasına yayılmış negatif farklar -> kayan pencere.
+    rolling = _make_ticks([100.0] * 6, [100.0, 99.0, 101.0, 100.0, 102.0, 101.0],
+                          start="2026-08-02 12:00:00")
+    d1 = diagnose_volume_series(rolling)
+    assert d1["mod"] == "kayan_24s", d1
+
+    # Tek negatif fark, tam gün dönümünde -> günlük sıfırlanan sayaç.
+    reset = _make_ticks([100.0] * 4, [100.0, 110.0, 5.0, 15.0], start="2026-08-02 23:59:50")
+    d2 = diagnose_volume_series(reset)
+    assert d2["mod"] == "gunluk_sifirlanan", d2
+
+
+def test_resample_writes_spread_columns() -> None:
+    """Spread sütunları mikroyapı sinyali olarak yazılmalı."""
+    from ..tools.collect_paribu import resample_ticks_to_ohlcv
+
+    ticks = _make_ticks([1000.0, 1000.0], [10.0, 11.0], spread=10.0)
+    bars = resample_ticks_to_ohlcv(ticks, now=pd.Timestamp("2026-08-02 11:00:00", tz="UTC"))
+    row = bars.iloc[0]
+    assert abs(row["spread_mean"] - 10.0) < 1e-9
+    assert abs(row["spread_rel_mean"] - 0.01) < 1e-9, "10/1000 = %1"
 
 
 # --------------------------------------------------------------------------- #

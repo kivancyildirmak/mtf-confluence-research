@@ -87,6 +87,46 @@ class DataConfig:
 
 
 # --------------------------------------------------------------------------- #
+# Veri toplayıcı (poll-forward)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class CollectorConfig:
+    """Paribu public ticker toplayıcısının ayarları.
+
+    Paribu'da tarihsel mum/işlem/defter ucu YOKTUR (probe ile doğrulandı:
+    candles/orderbook/trades -> 404). Elimizdeki tek public uç anlık
+    ticker'dır; bu yüzden geçmiş ancak BUGÜNDEN İTİBAREN biriktirilebilir.
+    """
+
+    #: Doğrulanmış public ticker ucu (anahtar/imza gerektirmez).
+    ticker_url: str = "https://www.paribu.com/ticker"
+    #: Toplanacak pariteler (ticker yanıtındaki anahtarlar).
+    symbols: tuple[str, ...] = ("BTC_TL",)
+    #: Yoklama aralığı (saniye). Dakika içi high/low'u makul yakalamak için
+    #: sık tutulur; küçültmek doğruluğu artırır ama rate-limit riskini de.
+    poll_interval_seconds: float = 5.0
+    #: Ham tick'lerin yazılacağı klasör (gün başına bir parquet).
+    tick_dir: str = "research/data/ticks"
+    #: Toplulaştırılmış barların yazılacağı klasör.
+    ohlcv_dir: str = "research/data/ohlcv"
+    #: Bellekteki tampon kaç saniyede bir diske yazılsın. Ani kapanmada en
+    #: fazla bu kadarlık tick kaybedilir.
+    flush_interval_seconds: float = 30.0
+    #: "Çalışıyorum" kalp atışı logu aralığı (saniye).
+    heartbeat_interval_seconds: float = 60.0
+    #: HTTP zaman aşımı (saniye).
+    request_timeout: float = 15.0
+    #: Hata sonrası ilk geri çekilme süresi (saniye).
+    backoff_base_seconds: float = 2.0
+    #: Üstel geri çekilmenin üst sınırı (saniye).
+    backoff_max_seconds: float = 300.0
+    #: İstek başlığı (borsaya kim olduğumuzu bildirmek nezakettir).
+    user_agent: str = "paribu-research-collector/1.0"
+
+
+# --------------------------------------------------------------------------- #
 # Özellik mühendisliği
 # --------------------------------------------------------------------------- #
 
@@ -323,6 +363,7 @@ class ResearchConfig:
 
     seed: int = RANDOM_SEED
     data: DataConfig = field(default_factory=DataConfig)
+    collector: CollectorConfig = field(default_factory=CollectorConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
     labeling: LabelConfig = field(default_factory=LabelConfig)
     model: ModelConfig = field(default_factory=ModelConfig)

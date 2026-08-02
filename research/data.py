@@ -53,28 +53,20 @@ def fetch_paribu_ohlcv(
     end: pd.Timestamp | str | None = None,
     limit: int | None = None,
 ) -> pd.DataFrame:
-    """Paribu borsasından OHLCV mum verisi çeker. **(HENÜZ BAĞLANMADI)**
+    """Paribu OHLCV barlarını YEREL poll-forward deposundan okur.
 
-    DURUM (2026-08-02): Bağlama denemesi yapıldı ancak tamamlanamadı. Geliştirme
-    ortamının çıkış politikası ``docs.paribu.com``, ``www.paribu.com``,
-    ``api.paribu.com`` ve ``v1.paribu.com`` hostlarına CONNECT'i 403 ile
-    reddediyor; resmî doküman okunamadı ve canlı istek atılamadı.
+    **Paribu'da tarihsel mum ucu YOKTUR** (probe ile doğrulandı: ``candles`` /
+    ``orderbook`` / ``trades`` -> 404). Tek public uç anlık ticker'dır
+    (``https://www.paribu.com/ticker``). Bu yüzden "geçmiş veri çekmek" mümkün
+    değildir; geçmiş ancak :mod:`research.tools.collect_paribu` ile BUGÜNDEN
+    İTİBAREN biriktirilir. Bu fonksiyon o birikimi okur ve hattın geri kalanına
+    standart OHLCV sözleşmesiyle sunar.
 
-    Eksik olan TEK şey olgusal bilgidir: gerçek URL yolu, parametre adları ve
-    yanıt şeması. Tahmin edilmiş bir yolu buraya yazmak, doğrulanmamış bir şeyi
-    doğrulanmış gibi göstermek olurdu; bu yüzden fonksiyon bilinçli olarak stub
-    bırakıldı. Eksik bilgiyi üretmek için:
-    ``python3 research/tools/probe_paribu.py --dump-docs`` (kendi makinenizde,
-    anahtarsız) — ayrıntı için ``research/README.md`` bölüm 10.1.
-
-    Ayrıca Paribu'da TARİHSEL mum ucunun var olup olmadığı da doğrulanamadı.
-    Yoksa izlenecek iki yol (poll-forward toplayıcı / üçüncü parti geçmiş)
-    README bölüm 10.2'de karşılaştırılmıştır.
-
-    Bu imza, ileride yazılacak canlı bot ile araştırma hattının aynı sözleşmeyi
-    paylaşması için şimdiden sabitlenmiştir. Gerçekleştirim yapıldığında dönen
-    DataFrame :data:`OHLCV_COLUMNS` sütunlarına ve UTC ``DatetimeIndex``'e sahip
-    olmalı, ayrıca :func:`validate_ohlcv` ile doğrulanmalıdır.
+    VERİ KALİTESİ: Barlar ticker anlık görüntülerinden kurulduğu için
+    ``high``/``low`` gerçeğinden DARDIR ve ``volume`` 24 saatlik kümülatifin
+    farkından türetilir. İkisi de README bölüm 10.3'te ayrıntılı anlatılan
+    yanlılıklar taşır; Parkinson/Garman-Klass ve hacim özelliklerini
+    yorumlarken bu göz önünde tutulmalıdır.
 
     Args:
         symbol: Paribu sembolü (örn. ``"BTC_TL"``).
@@ -85,24 +77,47 @@ def fetch_paribu_ohlcv(
 
     Returns:
         ``open, high, low, close, volume`` sütunlu, UTC indeksli DataFrame.
+        Toplayıcının ürettiği ek mikroyapı sütunları (``spread_mean``,
+        ``spread_rel_mean``, ``tick_count``, ``volume_gecerli_oran``) varsa
+        korunur.
 
     Raises:
-        NotImplementedError: Her zaman — API bağlantısı henüz yapılmadı.
+        FileNotFoundError: Henüz hiç veri toplanmamışsa (toplayıcı hiç
+            çalıştırılmamış).
 
     Notes:
-        Gerçekleştirim sırasında dikkat edilecekler:
+        Bu fonksiyon ağa GİTMEZ; yerel poll-forward deposunu okur. Sözleşme
+        gereği: UTC indeks, artan sıra, tekilleştirme ve **kapanmamış son barın
+        atılması** :func:`tools.collect_paribu.resample_ticks_to_ohlcv`
+        tarafından uygulanır.
 
-        * Sayfalama (pagination) ve rate-limit yönetimi.
-        * Borsa saat dilimi -> UTC dönüşümü.
-        * **En son bar kapanmamış olabilir**; :func:`drop_unclosed_bar` ile
-          atılmalı, aksi halde canlı tarafta look-ahead bias oluşur.
-        * Eksik barlar (borsa duraklaması) ``reindex`` ile açıkça NaN yapılmalı,
-          sessizce ileri doldurulmamalı.
+        Eksik barlar (toplayıcının durduğu dönemler) sessizce doldurulmaz —
+        boşluk olarak kalır. Doldurmak isterseniz :func:`align_to_bars`
+        açıkça çağrılmalıdır.
     """
-    raise NotImplementedError(
-        "TODO: Paribu API sonra bağlanacak. "
-        "Şimdilik load_ohlcv() veya generate_synthetic_ohlcv() kullanın."
-    )
+    # Yerel (lazy) import: tools.collect_paribu bu modülden import ettiği için
+    # modül seviyesinde import edilirse döngüsel bağımlılık oluşur.
+    from .tools.collect_paribu import load_ticks, resample_ticks_to_ohlcv
+
+    ticks = load_ticks(symbol=symbol)
+    if ticks.empty:
+        raise FileNotFoundError(
+            f"'{symbol}' için toplanmış tick verisi yok.\n"
+            "Paribu'da tarihsel mum ucu bulunmadığı için geçmiş, ancak ileriye\n"
+            "dönük toplanabilir. Toplayıcıyı başlatın:\n"
+            "    python -m research.tools.collect_paribu collect\n"
+            "Ayrıntı: research/README.md bölüm 10.3"
+        )
+
+    bars = resample_ticks_to_ohlcv(ticks, bar_minutes=interval_minutes)
+
+    if start is not None:
+        bars = bars.loc[bars.index >= pd.Timestamp(start, tz="UTC")]
+    if end is not None:
+        bars = bars.loc[bars.index <= pd.Timestamp(end, tz="UTC")]
+    if limit is not None and len(bars) > limit:
+        bars = bars.iloc[-int(limit) :]  # en YENİ barlar tutulur
+    return bars
 
 
 def fetch_orderbook(

@@ -304,6 +304,94 @@ Binance BTCTRY spot geçmişi public ve anahtarsızdır; toplu dökümü de vard
 > Yalnızca (b) ile canlıya geçmek, bu hattın kaçınmak için kurulduğu hatanın
 > ta kendisidir: doğru görünen ama gerçek icra koşullarını ölçmeyen bir backtest.
 
+### 10.3 Poll-forward toplayıcı (uygulandı)
+
+Probe sonucu doğrulandı: Paribu'da **tek public market-data ucu** vardır.
+
+| Uç | Durum |
+|---|---|
+| `GET https://www.paribu.com/ticker` | **çalışıyor** (anahtarsız) |
+| candles / klines | **404 — yok** |
+| orderbook | **404 — yok** |
+| trades | **404 — yok** |
+
+Ticker yanıtı parite başına: `last`, `lowestAsk`, `highestBid`, `low24hr`,
+`high24hr`, `avg24hr`, `volume`, `change`, `percentChange`.
+
+Tarihsel uç olmadığı için `research/tools/collect_paribu.py` geçmişi
+**bugünden itibaren** biriktirir:
+
+```bash
+# Toplamayı başlat (Ctrl+C ile temiz kapanır)
+python -m research.tools.collect_paribu collect
+
+# Kesintisiz arka planda
+nohup python -m research.tools.collect_paribu collect > collector.log 2>&1 &
+
+# Ne kadar birikti?
+python -m research.tools.collect_paribu status
+
+# 1 dakikalık barlara çevir
+python -m research.tools.collect_paribu resample --symbol BTC_TL
+```
+
+Ham tick'ler `research/data/ticks/YYYY-MM-DD.parquet` dosyalarına append-only
+yazılır (geçici dosya + `os.replace` ile **atomik**, yani yazarken süreç ölse
+bile dosya bozulmaz). Ayarlar `config.CollectorConfig` içindedir: pariteler,
+yoklama aralığı (varsayılan **5 sn**), flush ve kalp atışı periyotları.
+
+Sağlamlık: ağ hatasında süreç **düşmez**; üstel geri çekilme uygulanır
+(2s → 4s → 8s … `backoff_max_seconds` sınırına kadar), başarılı okumada sıfırlanır.
+`SIGINT`/`SIGTERM` alındığında tampon diske yazılır. Ani kapanmada en fazla
+`flush_interval_seconds` (varsayılan 30 sn) kadarlık tick kaybedilir.
+
+`data.fetch_paribu_ohlcv()` artık bu yerel depoyu okur (ağa gitmez) ve
+standart OHLCV sözleşmesini uygular: UTC indeks, artan sıra, tekilleştirme,
+**kapanmamış son bar atılır**.
+
+#### Bu verinin üç yapısal sınırı
+
+**1. `high`/`low` sistematik olarak DARDIR.** Barlar ticker anlık
+görüntülerinden kurulur; 5 sn aralıkta dakikada ~12 örnek görülür. Bu örnekler
+arasındaki gerçek ekstremler kaybolur. Sonuç: `vol_pk_*` (Parkinson) ve
+`vol_gk_*` (Garman-Klass) tahmincileri **gerçek volatiliteyi düşük gösterir**;
+`vol_rv_*` (kapanış-kapanış) bundan daha az etkilenir. Bar başına örnek
+sayısını `tick_count` sütunundan izleyin.
+
+**2. `volume` 24 SAATLİK KÜMÜLATİFTİR, anlık değil.** Dakikalık hacim ardışık
+okumaların farkından türetilir ve bu iki senaryoda iki farklı şey demektir:
+
+* *Günlük sıfırlanan sayaç:* negatif fark yalnızca gün dönümünde görülür ve
+  fark = o aralığın gerçek hacmidir. **Kullanılabilir.**
+* *Kayan 24s penceresi:* pencereye giren kadar çıkan işlem de vardır, yani
+  fark = (yeni hacim) − (24 saat önce düşen hacim). Negatif farklar güne
+  yayılır ve **fark artık aralık hacmi değildir (aşağı yanlı)**.
+
+Hangisinin geçerli olduğunu varsaymıyoruz: `resample`, negatif farkların gün
+dönümünde kümelenip kümelenmediğine bakarak modu **ölçer** ve raporlar
+(`diagnose_volume_series`). Negatif farklar "ölçülemedi" sayılıp NaN yapılır —
+uydurma değer üretilmez — ve `volume_gecerli_oran` sütunu her bar için
+farkların ne kadarının kullanılabildiğini söyler. Bu oran 1.0'ın belirgin
+altındaysa hacim özelliklerine (`volm_*`) temkinli yaklaşın.
+
+**3. `avg24hr`/`change` gibi türetilmiş alanlar kullanılmaz** — hepsi 24 saatlik
+pencereye bağlıdır ve dakikalık araştırma için bilgi taşımaz.
+
+Buna karşılık **bir kazanç**: `lowestAsk`/`highestBid` sayesinde gerçek spread
+ölçülür. `resample` çıktısındaki `spread_mean` ve `spread_rel_mean` sütunları,
+emir defteri ucu olmamasına rağmen elimizdeki tek gerçek mikroyapı sinyalidir
+ve maliyet/slippage varsayımlarını kalibre etmek için değerlidir.
+
+#### Doğrulanmamış tek nokta: sayı biçimi
+
+Paribu'nun sayıları hangi biçimde döndürdüğü (`3000000.5` mi, `"3.000.000,50"`
+mi) canlı yanıt görülmeden doğrulanamadı. `_to_float` bu yüzden muhafazakâr
+çalışır: **önce** standart `float()` denenir, **yalnızca o başarısız olursa** TR
+biçimi (nokta=binlik, virgül=ondalık) denenir. Sıra kritiktir — baştan nokta
+silmek `"3000.50"` değerini `300050` yapar, yani fiyatı 100 katına çıkaran
+sessiz bir bozulma olurdu. İlk gerçek yanıt geldiğinde biçim netleşir; tek
+belirsiz durum `"3.000"` gibi her iki biçimde de geçerli değerlerdir.
+
 ---
 
 ## 11. Sentetik veri hakkında
