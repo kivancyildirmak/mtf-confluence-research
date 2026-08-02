@@ -55,6 +55,22 @@ def fetch_paribu_ohlcv(
 ) -> pd.DataFrame:
     """Paribu borsasından OHLCV mum verisi çeker. **(HENÜZ BAĞLANMADI)**
 
+    DURUM (2026-08-02): Bağlama denemesi yapıldı ancak tamamlanamadı. Geliştirme
+    ortamının çıkış politikası ``docs.paribu.com``, ``www.paribu.com``,
+    ``api.paribu.com`` ve ``v1.paribu.com`` hostlarına CONNECT'i 403 ile
+    reddediyor; resmî doküman okunamadı ve canlı istek atılamadı.
+
+    Eksik olan TEK şey olgusal bilgidir: gerçek URL yolu, parametre adları ve
+    yanıt şeması. Tahmin edilmiş bir yolu buraya yazmak, doğrulanmamış bir şeyi
+    doğrulanmış gibi göstermek olurdu; bu yüzden fonksiyon bilinçli olarak stub
+    bırakıldı. Eksik bilgiyi üretmek için:
+    ``python3 research/tools/probe_paribu.py --dump-docs`` (kendi makinenizde,
+    anahtarsız) — ayrıntı için ``research/README.md`` bölüm 10.1.
+
+    Ayrıca Paribu'da TARİHSEL mum ucunun var olup olmadığı da doğrulanamadı.
+    Yoksa izlenecek iki yol (poll-forward toplayıcı / üçüncü parti geçmiş)
+    README bölüm 10.2'de karşılaştırılmıştır.
+
     Bu imza, ileride yazılacak canlı bot ile araştırma hattının aynı sözleşmeyi
     paylaşması için şimdiden sabitlenmiştir. Gerçekleştirim yapıldığında dönen
     DataFrame :data:`OHLCV_COLUMNS` sütunlarına ve UTC ``DatetimeIndex``'e sahip
@@ -97,6 +113,16 @@ def fetch_orderbook(
     end: pd.Timestamp | str | None = None,
 ) -> pd.DataFrame:
     """Paribu emir defteri (order book) anlık görüntülerini çeker. **(STUB)**
+
+    DURUM (2026-08-02): :func:`fetch_paribu_ohlcv` ile aynı sebepten
+    bağlanamadı — ``paribu.com`` hostları geliştirme ortamının çıkış
+    politikasınca 403 ile kapalı, doküman okunamadı. Bkz. README bölüm 10.1.
+
+    AYRICA ÖNEMLİ: Emir defterinin **tarihsel** verisi hiçbir kaynakta yoktur;
+    hiçbir borsa geçmiş defter anlık görüntüsü sunmaz. Dolayısıyla ``mk_*``
+    özellikleri ancak ileriye dönük toplamayla (README 10.2, seçenek "a")
+    doldurulabilir. Üçüncü parti tarihsel bar verisiyle çalışılırsa bu sütunlar
+    NaN kalır — hat bunu zaten destekler.
 
     Mikroyapı özellikleri (spread, imbalance, derinlik) bu veriyi kullanır.
     Veri yoksa :func:`features.make_features` ilgili sütunları NaN bırakır —

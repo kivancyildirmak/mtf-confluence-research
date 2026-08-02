@@ -221,6 +221,89 @@ Uyulması gerekenler:
 5. Canlı sinyal üretiminden önce `check_feature_parity()` çağrılmalı.
 6. Isınma: elde `features.warmup_bars()` kadar geçmiş yoksa sinyal üretilmemeli.
 
+### 10.1 Bağlantı durumu (2026-08-02) — HENÜZ BAĞLANMADI
+
+Market-data uçlarını gerçek API'ye bağlama denemesi, **geliştirme ortamının
+çıkış (egress) politikası** yüzünden tamamlanamadı. Doğrulanabilir olgular:
+
+```
+docs.paribu.com:443   CONNECT reddedildi (403)
+www.paribu.com:443    CONNECT reddedildi (403)
+api.paribu.com:443    CONNECT reddedildi (403)
+v1.paribu.com:443     CONNECT reddedildi (403)
+```
+
+Bu Paribu'ya özel bir engel değil; ortam **katı bir allowlist** kullanıyor
+(`example.com` ve `api.binance.com` de kapalı, yalnızca GitHub ve paket
+kayıtları açık). Dolayısıyla resmî doküman okunamadı ve canlı istek atılamadı.
+
+**Bilinçli karar:** Doğrulanmamış endpoint yolları koda gömülmedi. Tahmin
+edilmiş bir yolu "dokümandan alındı" gibi göstermek, hattın tüm dürüstlük
+kuralını çiğnerdi. Stub'lar `NotImplementedError` olarak duruyor; hangi bilginin
+eksik olduğu docstring'lerinde açıkça yazılı.
+
+**Engeli kaldırmanın iki yolu:**
+
+1. `research/tools/probe_paribu.py` betiğini **kendi makinenizde** çalıştırın
+   (bağımlılık yok, anahtar yok) ve `paribu_probe.json` çıktısını paylaşın:
+
+   ```bash
+   python3 research/tools/probe_paribu.py --dump-docs
+   ```
+
+   Betik aday uçları dener ve hangisinin gerçekten cevap verdiğini, yanıt
+   yapısıyla birlikte raporlar. Listedeki adaylar **doğrulanmış yollar değil,
+   test edilecek adaylardır**.
+
+2. Ya da ortamın ağ politikasında `*.paribu.com` erişimine izin verin; o zaman
+   dokümanı okuyup uçları doğrudan bağlayabilirim.
+
+### 10.2 Tarihsel mum (OHLCV) verisi sorunu
+
+Paribu'da tarihsel mum ucu olup olmadığı **doğrulanamadı** (doküman
+okunamadı — yukarı bakın). Bu yüzden aşağıdaki iki seçenek, ucun var
+olmaması ihtimaline karşı hazırdır. Not: emir defteri (`mk_*`) özellikleri için
+tarihsel veri **hiçbir kaynakta yoktur**; onlar yalnızca ileriye dönük
+toplamayla elde edilebilir.
+
+**(a) Poll-forward toplayıcı — Paribu-native, ileriye dönük**
+
+Public ucu düzenli aralıkla çekip bardan bar geçmiş biriktiren bir servis
+(cron/systemd). Parquet'e ekler, tekilleştirir, UTC'ye çevirir.
+
+* Artı: Paribu'nun **kendi** fiyatı, spread'i ve defteri. Mikroyapı özellikleri
+  (`mk_spread_rel`, `mk_imbalance`, `mk_depth_*`) yalnızca böyle doldurulabilir.
+* Eksi: **Sıfırdan başlar.** Hattın varsayılan ayarlarıyla anlamlı sayıda olay
+  (~2.900) için kabaca **45 gün kesintisiz toplama** gerekir.
+* Teknik uyarı: Barları *ticker* anlık görüntülerinden kurarsanız `high`/`low`
+  **sistematik olarak dar** çıkar (yalnızca yoklama anlarını görürsünüz) ve bu
+  Parkinson/Garman-Klass tahmincilerini bozar. **Trades (işlemler) ucundan
+  toplayın**; gerçek işlemleri toplulaştırmak tam doğru OHLCV verir.
+
+**(b) Üçüncü parti tarihsel BTC/TRY barları — anında derinlik**
+
+Binance BTCTRY spot geçmişi public ve anahtarsızdır; toplu dökümü de vardır
+(`data.binance.vision`). CryptoCompare/CoinAPI da BTC-TRY sunar.
+
+* Artı: **Bugün** yıllarca geçmişe erişim; araştırmaya hemen başlanır.
+* Eksi: Binance BTCTRY ≠ Paribu BTC_TL. Farklı likidite, farklı spread, farklı
+  TL primi ve farklı mikroyapı. Fiyat dinamiği araştırması için makul bir vekil,
+  **icra gerçekliği için değil**. `mk_*` sütunları NaN kalır.
+
+**Öneri: ikisini birden, bu sırayla.**
+
+1. **Bugün (a)'yı başlatın** — toplayıcı arka planda çalışsın, Paribu-native
+   veri ve defter geçmişi birikmeye başlasın. Gecikilen her gün geri gelmez.
+2. **Paralelde (b) ile araştırın** — model geliştirme, özellik seçimi ve
+   hiperparametreler Binance BTCTRY üzerinde şekillensin.
+3. **Canlıya geçmeden önce (a)'nın verisiyle doğrulayın.** Nihai karar
+   (özellikle maliyet/slippage varsayımları ve `mk_*` özellikleri)
+   Paribu-native veride verilmelidir; aksi halde backtest başka bir borsanın
+   mikroyapısını ölçmüş olur.
+
+> Yalnızca (b) ile canlıya geçmek, bu hattın kaçınmak için kurulduğu hatanın
+> ta kendisidir: doğru görünen ama gerçek icra koşullarını ölçmeyen bir backtest.
+
 ---
 
 ## 11. Sentetik veri hakkında
