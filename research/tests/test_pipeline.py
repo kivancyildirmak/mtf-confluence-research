@@ -21,6 +21,7 @@ pytest kuruluysa:
 from __future__ import annotations
 
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +30,7 @@ import pandas as pd
 from ..backtest import run_backtest, total_cost_rate
 from ..config import ResearchConfig
 from ..data import (
+    OHLCV_COLUMNS,
     fetch_orderbook,
     fetch_paribu_ohlcv,
     submit_order,
@@ -584,6 +586,167 @@ def test_resample_writes_spread_columns() -> None:
     row = bars.iloc[0]
     assert abs(row["spread_mean"] - 10.0) < 1e-9
     assert abs(row["spread_rel_mean"] - 0.01) < 1e-9, "10/1000 = %1"
+
+
+# --------------------------------------------------------------------------- #
+# Binance geçmiş veri indirici
+# --------------------------------------------------------------------------- #
+
+
+def _kline_rows(start_ms: int, n: int, unit_mult: int = 1, price: float = 100.0) -> list[list]:
+    """Binance kline satırları üretir (REST dizisi ve CSV satırı aynı düzendedir).
+
+    Args:
+        start_ms: İlk barın açılış zamanı (ms).
+        n: Bar sayısı.
+        unit_mult: Zaman damgası çarpanı (1=ms, 1000=mikrosaniye dökümleri).
+        price: Baz fiyat.
+    """
+    rows = []
+    for i in range(n):
+        t = (start_ms + i * 60_000) * unit_mult
+        p = price + i * 0.5
+        rows.append([
+            t, f"{p:.2f}", f"{p + 1:.2f}", f"{p - 1:.2f}", f"{p + 0.25:.2f}", "12.5",
+            t + 59_999 * unit_mult, "1250.0", 42, "6.0", "600.0", "0",
+        ])
+    return rows
+
+
+def test_binance_epoch_unit_is_measured_not_assumed() -> None:
+    """Zaman damgası birimi büyüklükten çıkarılmalı (ms/µs karışırsa veri çöp olur)."""
+    from ..tools.fetch_binance import infer_epoch_unit
+
+    assert infer_epoch_unit(1_754_000_000) == "s"
+    assert infer_epoch_unit(1_754_000_000_000) == "ms"
+    assert infer_epoch_unit(1_754_000_000_000_000) == "us"
+
+
+def test_binance_zip_parsing_handles_header_and_microseconds() -> None:
+    """Toplu döküm zip'i: başlık satırı ve mikrosaniye damgası doğru işlenmeli."""
+    import csv
+    import io as _io
+    import zipfile as _zip
+
+    from ..tools.fetch_binance import parse_kline_zip
+
+    start_ms = int(pd.Timestamp("2026-06-01 00:00:00", tz="UTC").timestamp() * 1000)
+    rows = _kline_rows(start_ms, 5, unit_mult=1000)  # mikrosaniye dökümü
+
+    buf = _io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(list(range(12)))  # yeni dökümlerdeki başlık satırı (sayısal değil)
+    buf.seek(0)
+    text = "open_time,open,high,low,close,volume,close_time,q,n,tb,tq,ig\n"
+    text += "\n".join(",".join(str(c) for c in r) for r in rows)
+
+    zbuf = _io.BytesIO()
+    with _zip.ZipFile(zbuf, "w") as zf:
+        zf.writestr("BTCTRY-1m-2026-06.csv", text)
+
+    df = parse_kline_zip(zbuf.getvalue())
+    assert len(df) == 5, "Başlık satırı atılmalı, 5 bar kalmalı."
+    assert df.index[0] == pd.Timestamp("2026-06-01 00:00:00", tz="UTC"), "µs birimi çözülmeli."
+    assert df.index[1] - df.index[0] == pd.Timedelta(minutes=1)
+    assert df["close"].iloc[0] == 100.25
+
+
+def test_binance_rest_rows_parse_to_contract() -> None:
+    """REST yanıtı (dizi dizisi) doğru çerçeveye dönmeli."""
+    from ..tools.fetch_binance import klines_to_frame
+
+    start_ms = int(pd.Timestamp("2026-06-01 00:00:00", tz="UTC").timestamp() * 1000)
+    df = klines_to_frame(_kline_rows(start_ms, 3))
+    assert list(df.columns) == ["open", "high", "low", "close", "volume"]
+    assert str(df.index.tz) == "UTC"
+    assert df["volume"].iloc[0] == 12.5
+
+
+def test_binance_normalize_enforces_pipeline_contract() -> None:
+    """Sıralama, tekilleştirme ve kapanmamış bar atma uygulanmalı."""
+    from ..tools.fetch_binance import klines_to_frame, normalize
+
+    start_ms = int(pd.Timestamp("2026-06-01 00:00:00", tz="UTC").timestamp() * 1000)
+    df = klines_to_frame(_kline_rows(start_ms, 10))
+    shuffled = pd.concat([df.iloc[5:], df.iloc[:5], df.iloc[:2]])  # karışık + tekrarlı
+
+    now = pd.Timestamp("2026-06-01 00:09:30", tz="UTC")  # son bar (00:09) kapanmadı
+    out = normalize(shuffled, now=now)
+    assert out.index.is_monotonic_increasing
+    assert not out.index.has_duplicates
+    assert len(out) == 9, "Kapanmamış son bar atılmalıydı."
+    assert out.index[-1] == pd.Timestamp("2026-06-01 00:08:00", tz="UTC")
+
+
+def test_binance_symbol_choice_measures_coverage_and_falls_back() -> None:
+    """BTCTRY ince ise otomatik BTCUSDT'ye düşmeli — varsayımla değil, ÖLÇÜMLE."""
+    from ..tools.fetch_binance import choose_symbol, klines_to_frame
+
+    now = datetime(2026, 6, 3, tzinfo=timezone.utc)
+    start_ms = int((now - timedelta(days=2)).timestamp() * 1000)
+
+    def thin_try(symbol, a, b):
+        # BTCTRY: 2 gunluk pencerede sadece 100 bar -> %3.5 doluluk (ince).
+        n = 100 if symbol == "BTCTRY" else 2880
+        return klines_to_frame(_kline_rows(start_ms, n)), {}
+
+    chosen, reports = choose_symbol(downloader=thin_try, now=now)
+    assert chosen == "BTCUSDT", f"Ince BTCTRY yerine BTCUSDT secilmeliydi, secilen: {chosen}"
+    assert reports[0]["symbol"] == "BTCTRY" and not reports[0]["kullanilabilir"]
+    assert reports[0]["doluluk"] < 0.1
+
+    def both_full(symbol, a, b):
+        return klines_to_frame(_kline_rows(start_ms, 2880)), {}
+
+    chosen2, _ = choose_symbol(downloader=both_full, now=now)
+    assert chosen2 == "BTCTRY", "Yeterli veri varsa tercih sirasi korunmali (once TL)."
+
+
+def test_binance_bulk_urls_split_monthly_and_daily() -> None:
+    """Tamamlanmış aylar için aylık, içinde bulunulan ay için günlük zip kullanılmalı."""
+    from ..tools.fetch_binance import bulk_urls
+
+    urls = bulk_urls(
+        "BTCUSDT",
+        datetime(2026, 5, 15, tzinfo=timezone.utc),
+        datetime(2026, 8, 2, tzinfo=timezone.utc),
+    )
+    monthly = [u for u in urls if "/monthly/" in u]
+    daily = [u for u in urls if "/daily/" in u]
+    assert len(monthly) == 3, f"2026-05/06/07 beklenirdi: {monthly}"
+    assert "BTCUSDT-1m-2026-07.zip" in monthly[-1]
+    assert len(daily) == 2, f"1-2 Agustos beklenirdi: {daily}"
+    assert daily[0].endswith("BTCUSDT-1m-2026-08-01.zip")
+
+
+def test_binance_download_feeds_the_pipeline() -> None:
+    """İndirilen veri doğrudan make_features'a girebilmeli (şema uyumu)."""
+    from ..tools.fetch_binance import fetch_history, klines_to_frame
+
+    now = datetime(2026, 6, 5, tzinfo=timezone.utc)
+    start_ms = int((now - timedelta(days=3)).timestamp() * 1000)
+
+    def fake(symbol, a, b):
+        return klines_to_frame(_kline_rows(start_ms, 3 * 1440, price=3_000_000.0)), {"kaynak": "test"}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        import research.tools.fetch_binance as fb
+
+        orig = fb.download_rest
+        fb.download_rest = fake  # type: ignore[assignment]
+        try:
+            bars, meta = fetch_history(symbol="BTCUSDT", days=3, source="rest",
+                                       out_dir=tmp, now=now)
+        finally:
+            fb.download_rest = orig  # type: ignore[assignment]
+
+    assert len(bars) > 4000, f"3 gunluk 1m veri beklenirdi, {len(bars)} geldi."
+    assert meta["secilen_sembol"] == "BTCUSDT"
+    assert Path(meta["dosya"]).name == "BTCUSDT_1m_binance.parquet", "Sembol dosya adinda olmali."
+    assert list(bars.columns) == list(OHLCV_COLUMNS)
+    X = make_features(bars)
+    assert X.shape[0] == len(bars) and X.shape[1] > 50
+    assert X["mk_spread_rel"].isna().all(), "Binance'te defter yok; mk_* NaN kalmali."
 
 
 # --------------------------------------------------------------------------- #

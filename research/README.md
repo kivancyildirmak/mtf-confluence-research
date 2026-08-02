@@ -382,7 +382,7 @@ Buna karşılık **bir kazanç**: `lowestAsk`/`highestBid` sayesinde gerçek spr
 emir defteri ucu olmamasına rağmen elimizdeki tek gerçek mikroyapı sinyalidir
 ve maliyet/slippage varsayımlarını kalibre etmek için değerlidir.
 
-#### Doğrulanmamış tek nokta: sayı biçimi
+#### Doğrulanmamış nokta: sayı biçimi
 
 Paribu'nun sayıları hangi biçimde döndürdüğü (`3000000.5` mi, `"3.000.000,50"`
 mi) canlı yanıt görülmeden doğrulanamadı. `_to_float` bu yüzden muhafazakâr
@@ -391,6 +391,65 @@ biçimi (nokta=binlik, virgül=ondalık) denenir. Sıra kritiktir — baştan no
 silmek `"3000.50"` değerini `300050` yapar, yani fiyatı 100 katına çıkaran
 sessiz bir bozulma olurdu. İlk gerçek yanıt geldiğinde biçim netleşir; tek
 belirsiz durum `"3.000"` gibi her iki biçimde de geçerli değerlerdir.
+
+### 10.4 Binance prototip verisi — `fetch_binance.py`
+
+Poll-forward toplayıcının hattın ölçeğine ulaşması ~45 gün sürer. O süreyi
+beklemeden hattı **gerçek** (sentetik olmayan) kripto verisiyle sınamak için
+`research/tools/fetch_binance.py` geçmiş 1 dakikalık bar indirir. Anahtarsızdır.
+
+```bash
+python -m research.tools.fetch_binance                  # ~60 gun, sembol olculerek secilir
+python -m research.tools.fetch_binance --days 90
+python -m research.tools.fetch_binance --symbol BTCUSDT --source rest
+python -m research.tools.fetch_binance --probe-only     # sadece olc, indirme
+```
+
+> ## ⚠ BU VERİ PARİBU DEĞİLDİR
+>
+> Binance BTCTRY/BTCUSDT ile Paribu BTC_TL **farklı borsalardır**: farklı
+> likidite, farklı spread, farklı TL primi, farklı mikroyapı, farklı icra.
+> Burada elde edilen **hiçbir sonuç Paribu için geçerli sayılamaz** — ne Sharpe,
+> ne isabet oranı, ne de maliyet varsayımları.
+>
+> Bu bir **PROTOTİPTİR**. Amacı yalnızca (1) hattın gerçek veriyle uçtan uca
+> çalıştığını görmek ve (2) özellik/etiket parametrelerini kabaca kalibre
+> etmektir. Sonuç ne kadar iyi görünürse görünsün, **canlıya geçmeden önce her
+> şey Paribu'nun kendi verisiyle (bölüm 10.3, poll-forward) yeniden
+> doğrulanmalıdır.**
+
+**Kaynaklar (tercih sırasıyla).** Önce toplu döküm `data.binance.vision`
+(tamamlanmış aylar için aylık zip, içinde bulunulan ay için günlük zip — tek
+istekte bir ay, çok verimli); erişilemez veya boşsa REST
+`api.binance.com/api/v3/klines` ile 1000'lik sayfalama. Toplu dökümde eksik
+(404) dosya hata sayılmaz, atlanır ve raporlanır.
+
+**Sembol seçimi ölçümle yapılır, varsayımla değil.** Önce `BTCTRY` denenir; son
+2 gün indirilip **doluluk oranı** (gerçek bar / beklenen bar) hesaplanır. Oran
+`MIN_COVERAGE` (%60) altındaysa parite "ince" sayılır ve otomatik olarak
+`BTCUSDT`'ye düşülür. Hangisinin kullanıldığı hem loglanır hem de **dosya adına
+yazılır** (`BTCTRY_1m_binance.parquet` / `BTCUSDT_1m_binance.parquet`), böylece
+sonradan hangi veriyle çalışıldığı karışmaz.
+
+İnce parite meselesi önemsiz değil: saatlerce işlem görmeyen bir seride model,
+gerçekte olmayan boşlukları ve sahte volatilite rejimlerini öğrenir.
+
+**Çıktı** `research/data/ohlcv/` altına parquet olarak yazılır ve hattın
+sözleşmesine uyar: UTC `DatetimeIndex`, artan, tekrarsız, kapanmamış son bar
+atılmış, sütunlar `open, high, low, close, volume`. Zaman damgası birimi
+(ms/µs — Binance dökümlerde ikisini de kullanmıştır) **büyüklüğünden ölçülerek**
+çıkarılır; varsaymak tarihleri 1000 kat kaydırıp veriyi sessizce çöpe çevirirdi.
+
+Bu kaynakta emir defteri yoktur, dolayısıyla `mk_*` mikroyapı sütunları NaN
+kalır — hat bunu zaten destekler (özellik şeması değişmez, LightGBM NaN'ı
+doğal olarak işler). Gerçek spread verisi yalnızca Paribu toplayıcısından gelir.
+
+Kullanım:
+
+```bash
+python -m research.tools.fetch_binance --days 60
+python -m research.run_research --data research/data/ohlcv/BTCUSDT_1m_binance.parquet
+```
 
 ---
 
