@@ -14,13 +14,18 @@
 // high'i pencereye girseydi close > high gerekirdi ki bu imkansizdir.
 // request.security() kullanilmaz, tek zaman dilimi.
 //
-// slippage = 5 notu: TradingView'de slippage TICK cinsindendir, yuzde degil.
-// BIST hisselerinde mintick genelde 0.01 TL oldugundan 5 tick = 0.05 TL'dir;
-// 20 TL'lik bir hissede bu ~%0.25, 100 TL'lik bir hissede ~%0.05 eder. Yani
-// kayma etkisi fiyat seviyesine gore degisir - semboller arasi karsilastirma
-// yaparken bunu akilda tutun. Kayma ve komisyon sadece K/Z'yi etkiler;
-// sinyaller close ve hesaplanan stop seviyesinden uretildigi icin islem
-// SAYISI ve TARIHLERI bu ayarlardan etkilenmez.
+// Maliyet modeli: slippage = 0, tum maliyet yuzde bazli komisyona gomuldu.
+// Sebep: TradingView'de slippage TICK cinsindendir, yuzde degil. Geriye donuk
+// duzeltme yapildigi icin eski fiyatlar cok kucuk cikiyor (BTCIM 2015'te
+// 0.08 TL) ve 5 tick = 0.05 TL, fiyatin %62'sine denk geliyordu. Sabit tick
+// maliyeti fiyat seviyesine gore devasa sapma uretiyor; yuzde bazli komisyon
+// her fiyat seviyesinde ayni orani uyguluyor.
+//
+// Komisyon ISLEM BASINA yuzdedir, alista ve satista ayri kesilir:
+// varsayilan %0.30 -> gidis-donus %0.60. Input olarak ayarlanabilir.
+//
+// Maliyetler sadece K/Z'yi etkiler; sinyaller close ve hesaplanan stop
+// seviyesinden uretildigi icin islem SAYISI ve TARIHLERI degismez.
 // =============================================================================
 
 strategy(
@@ -29,8 +34,12 @@ strategy(
      overlay                 = true,
      initial_capital         = 100000,
      commission_type         = strategy.commission.percent,
-     commission_value        = 0.05,
-     slippage                = 5,
+     commission_value        = input.float(0.30, "Komisyon % (islem basina)",
+       minval = 0, step = 0.05, group = "0) Maliyet",
+       tooltip = "Islem BASINA yuzde - alista ve satista ayri kesilir, yani " +
+         "gidis-donus maliyet bunun iki katidir (%0.30 -> %0.60). Kayma " +
+         "(slippage) 0'a alindigi icin kayma maliyeti de bu orana gomulmustur."),
+     slippage                = 0,
      process_orders_on_close = true,
      calc_on_every_tick      = false,
      pyramiding              = 0,

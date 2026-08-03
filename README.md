@@ -19,8 +19,9 @@ sonuclari okumak icin tasarlandi.
 | Hedef | yok — cikis sadece stopla |
 | Pozisyon | `qty = (strategy.equity * 0.005) / (giris - stop)`, `pyramiding = 0` |
 
-`strategy()` ayarlari sabit: komisyon %0.05 (percent), slippage 5,
-`process_orders_on_close=true`, `calc_on_every_tick=false`, `initial_capital=100000`.
+`strategy()` ayarlari: komisyon yuzde bazli (input, varsayilan **%0.30**),
+**slippage 0**, `process_orders_on_close=true`, `calc_on_every_tick=false`,
+`initial_capital=100000`.
 
 ### Kurulum
 
@@ -67,11 +68,25 @@ oranla %).
 
 ### Dikkat edilecek iki nokta
 
-**Slippage tick cinsindendir, yuzde degil.** BIST'te mintick genelde 0.01 TL, yani
-5 tick = 0.05 TL. Bu 20 TL'lik hissede ~%0.25, 100 TL'lik hissede ~%0.05 eder —
-sembol karsilastirirken akilda tutun. Kayma ve komisyon sadece K/Z'yi etkiler;
-sinyaller `close` ve hesaplanan stop seviyesinden uretildigi icin islem
-**sayisi ve tarihleri** bu ayarlardan etkilenmez.
+**Maliyet: slippage 0, hepsi yuzde bazli komisyonda.** TradingView'de slippage
+tick cinsindendir, yuzde degil. Geriye donuk duzeltme yuzunden eski fiyatlar cok
+kucuk cikiyor (BTCIM 2015'te 0.08 TL) ve 5 tick = 0.05 TL fiyatin **%62'sine**
+denk geliyordu. Sabit tick maliyeti fiyat seviyesine gore devasa sapma urettigi
+icin slippage 0'a alindi ve tum maliyet komisyona gomuldu.
+
+`Komisyon %` **input**, varsayilan **0.30**. Islem BASINA uygulanir — alista ve
+satista ayri kesilir, yani gidis-donus maliyet **%0.60**. Test ederken Inputs
+sekmesindeki `0) Maliyet` grubundan degistirebilirsiniz.
+
+Maliyetler sadece K/Z'yi etkiler; sinyaller `close` ve hesaplanan stop
+seviyesinden uretildigi icin islem **sayisi ve tarihleri** degismez. Ayni
+sembolde komisyonu degistirip islem sayisinin sabit kaldigini gorerek bunu
+dogrulayabilirsiniz.
+
+Not: yuksek komisyon `Ort kayip (R)` degerini daha negatif yapar. Maliyetin R
+cinsinden agirligi `gidis-donus % x fiyat / (3*ATR)` kadardir — ATR fiyata gore
+kucukse (dar stop) maliyet R'nin ciddi bir kismini yer. `Ort kayip (R)`
+-1.5R'i asip kirmizi yaniyorsa once bunu kontrol edin.
 
 **Ortuk kaldirac — lot uc tavanin en kucugu.** Illikit ya da durgun veride ayni
 kapanis tekrar edince TR sifir olur ve ATR cokmeye yaklasir. `risk / (3*ATR)`
