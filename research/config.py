@@ -280,8 +280,17 @@ class CVConfig:
     #: Walk-forward eğitim penceresi sabit mi (rolling) yoksa genişleyen mi?
     wf_expanding: bool = False
     #: Deflated Sharpe hesabında beyan edilen deneme sayısı (N trials).
-    #: DÜRÜSTLÜK NOTU: burayı küçük tutmak DSR'yi yapay olarak şişirir.
-    n_trials: int = 50
+    #:
+    #: DÜRÜSTLÜK NOTU: burayı küçük tutmak DSR'yi yapay olarak ŞİŞİRİR. Sayı,
+    #: yalnızca "kaç kez çalıştırdım"ı değil, araştırmacının kullandığı TÜM
+    #: serbestlik derecelerini yansıtmalıdır (bariyerler, eşikler, boyutlandırma,
+    #: özellik grupları, bar boyutu...). Defter README bölüm 11'de tutulur.
+    #:
+    #: Mevcut değer, uçtan uca değerlendirilen ~8 konfigürasyon × ~15 belgelenmiş
+    #: serbestlik derecesinden gelir. Bilinçli olarak YUKARI yuvarlanmıştır:
+    #: fazla beyan etmek testi yalnızca sertleştirir, az beyan etmek ise
+    #: sonucu sahte biçimde anlamlı gösterir.
+    n_trials: int = 120
 
 
 # --------------------------------------------------------------------------- #
@@ -353,6 +362,44 @@ class SizingConfig:
 
 
 # --------------------------------------------------------------------------- #
+# Grid (ızgara) stratejisi
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class GridConfig:
+    """Mekanik grid stratejisinin parametreleri.
+
+    Grid bir TAHMİN modeli değildir; kural tabanlı bir stratejidir. Yine de aynı
+    maliyet ve dürüstlük disiplinine tabidir: maliyetsiz grid her zaman kârlı
+    görünür ve bu görüntü tamamen sahtedir.
+    """
+
+    #: Aralığın alt sınırı (fiyat). ``None`` ise veriden türetilir.
+    lower_price: float | None = None
+    #: Aralığın üst sınırı (fiyat). ``None`` ise veriden türetilir.
+    upper_price: float | None = None
+    #: Sınırlar veriden türetilirken ilk fiyatın etrafında ±bu oran kullanılır.
+    auto_range_pct: float = 0.15
+    #: Kademe (grid seviyesi) sayısı.
+    n_levels: int = 20
+    #: Toplam sermaye (TL).
+    total_capital: float = 100_000.0
+    #: Kademe aralığı: ``"geometric"`` (eşit yüzde) veya ``"linear"``.
+    spacing: str = "geometric"
+    #: Mod: ``"static"`` (aralık sabit) veya ``"trailing"`` (fiyat çıkınca kayar).
+    mode: str = "static"
+    #: Tek yön komisyon oranı (ML backtest'iyle AYNI varsayım).
+    commission_rate: float = 0.0020
+    #: Tek yön slippage (baz puan). Komisyonla birlikte gidiş-dönüş ~%0.5.
+    slippage_bps: float = 5.0
+    #: Rejim analizi pencere uzunluğu (pandas frekansı).
+    regime_window: str = "7D"
+    #: Rejim etiketlemesinde "yatay" sayılacak azami net değişim (mutlak oran).
+    sideways_threshold: float = 0.02
+
+
+# --------------------------------------------------------------------------- #
 # Kök konfigürasyon
 # --------------------------------------------------------------------------- #
 
@@ -370,6 +417,7 @@ class ResearchConfig:
     cv: CVConfig = field(default_factory=CVConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     sizing: SizingConfig = field(default_factory=SizingConfig)
+    grid: GridConfig = field(default_factory=GridConfig)
 
     def to_dict(self) -> dict[str, Any]:
         """Config'i JSON'a yazılabilir sözlüğe çevirir (deney kaydı için)."""
@@ -378,3 +426,50 @@ class ResearchConfig:
 
 #: Modüller arası paylaşılan varsayılan konfigürasyon örneği.
 CONFIG = ResearchConfig()
+
+
+def scale_config_for_bars(cfg: ResearchConfig, new_bar_minutes: int) -> ResearchConfig:
+    """Konfigürasyonu farklı bir bar boyutuna uyarlar (deney için).
+
+    **Neyi ölçekler:** yalnızca DUVAR SAATİNE bağlı olan tutma ufkunu.
+    ``vertical_bars`` bar sayısı cinsindendir ama anlamı süredir; bar boyutu
+    değişince aynı süreyi verecek şekilde yeniden hesaplanır. Örneğin 1 dk'da
+    240 bar = 4 saat; 15 dk'da bu 16 bar, 1 saatte 4 bar olur. Sabit sayı
+    gömülmez, oran config'ten türetilir.
+
+    **Neyi ölçeklemez ve neden:** özellik pencereleri ve ``vol_span`` BAR
+    cinsinden bırakılır. Duvar saatine göre küçültülselerdi göstergeler
+    bozulurdu — 1 saatlik barda MACD(12,26,9) → MACD(1,1,1), RSI(14) → RSI(1)
+    olur ki ikisi de tanımsızdır. Bar cinsinde bırakmak her çözünürlüğe aynı
+    İSTATİSTİKSEL geçmişi verir.
+
+    Bunun bilinen bedeli (deneyin bilinçli kabul ettiği karışıklık): kaba
+    barlarda özellikler duvar saati olarak daha geriye bakar. Yani karşılaştırma
+    saf "çözünürlük" karşılaştırması değil, "çözünürlük + geriye bakış"
+    birleşimidir. Sonuçları yorumlarken bu akılda tutulmalıdır.
+
+    Hedef volatilitenin bu ölçeklemeyle tutarlı kaldığına dikkat: hedef vol
+    ``bar_vol * sqrt(vertical_bars)`` olduğundan ve ``bar_vol`` bar boyutuyla
+    ``sqrt`` oranında büyüdüğünden, bariyer genişliği her çözünürlükte AYNI
+    duvar saati oynaklığına denk gelir. Yani bariyerler karşılaştırılabilir.
+
+    Args:
+        cfg: Kaynak konfigürasyon.
+        new_bar_minutes: Hedef bar süresi (dakika).
+
+    Returns:
+        Yeni, ölçeklenmiş kopya (girdi değiştirilmez).
+
+    Raises:
+        ValueError: Hedef bar süresi pozitif değilse.
+    """
+    import copy
+
+    if new_bar_minutes <= 0:
+        raise ValueError("new_bar_minutes pozitif olmalı.")
+
+    out = copy.deepcopy(cfg)
+    ratio = float(new_bar_minutes) / float(cfg.data.bar_minutes)
+    out.data.bar_minutes = int(new_bar_minutes)
+    out.labeling.vertical_bars = max(1, int(round(cfg.labeling.vertical_bars / ratio)))
+    return out

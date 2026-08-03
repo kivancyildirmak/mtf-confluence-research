@@ -340,6 +340,94 @@ def drop_unclosed_bar(
     return df
 
 
+def rule_to_minutes(rule: str) -> int:
+    """pandas frekans dizgesini dakikaya çevirir.
+
+    Args:
+        rule: ``"15min"``, ``"1h"`` gibi frekans dizgesi.
+
+    Returns:
+        Dakika cinsinden bar süresi.
+
+    Raises:
+        ValueError: Süre bir dakikanın tam katı değilse.
+    """
+    minutes = pd.Timedelta(rule).total_seconds() / 60.0
+    if minutes <= 0 or abs(minutes - round(minutes)) > 1e-9:
+        raise ValueError(f"Bar süresi dakikanın tam katı olmalı: {rule}")
+    return int(round(minutes))
+
+
+def resample_ohlcv(
+    df: pd.DataFrame,
+    rule: str,
+    drop_incomplete_tail: bool = True,
+    now: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """OHLCV barlarını daha uzun bir bar boyutuna toplulaştırır.
+
+    Toplulaştırma kuralları (tek doğru olanlar):
+    ``open`` = aralığın İLK açılışı, ``high`` = maksimum, ``low`` = minimum,
+    ``close`` = SON kapanış, ``volume`` = toplam.
+
+    Args:
+        df: Kaynak OHLCV (örn. 1 dakikalık).
+        rule: Hedef frekans (``"15min"``, ``"1h"``).
+        drop_incomplete_tail: Kaynak barları eksik olan SON aralığı at.
+        now: "Şimdi" (kapanmamış bar kontrolü için; test edilebilirlik).
+
+    Returns:
+        Hedef frekansta, sözleşmeye uygun OHLCV tablosu.
+
+    Notes:
+        Barlar AÇILIŞ zamanlarıyla indekslenir (``label="left"``,
+        ``closed="left"``) — kaynak veriyle aynı gelenek. Bu kritiktir: sağ
+        etiketleme kullanılsaydı bar, kendi geleceğindeki bir zaman damgasını
+        taşır ve tüm hat bir bar ileri kayardı (sistematik look-ahead).
+
+        Kaynak barı olmayan aralıklar bara DÖNÜŞTÜRÜLMEZ (boşluk sessizce
+        doldurulmaz). Son aralık eksik kaynak barı içeriyorsa — örn. veri
+        10:07'de bitiyorsa 15 dakikalık 10:00 barı yalnızca 8 dakika içerir —
+        ``drop_incomplete_tail`` ile atılır; aksi halde yarım bir bar tam bar
+        gibi etiketlenir.
+    """
+    if df.empty:
+        return df.copy()
+
+    validate_ohlcv(df)
+    target_minutes = rule_to_minutes(rule)
+
+    # Kaynak bar süresini ölç (varsayma): zaman damgası farklarının medyanı.
+    if len(df) > 1:
+        source_minutes = float(pd.Series(df.index).diff().dropna().median().total_seconds() / 60.0)
+    else:
+        source_minutes = float(target_minutes)
+    if source_minutes > target_minutes + 1e-9:
+        raise ValueError(
+            f"Hedef bar ({target_minutes}dk) kaynaktan ({source_minutes:g}dk) kısa olamaz."
+        )
+
+    grouper = df.resample(rule, label="left", closed="left")
+    out = grouper.agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    )
+    counts = grouper["close"].count()
+
+    # Hiç kaynak barı olmayan aralıklar bar değildir.
+    out = out[counts.reindex(out.index).fillna(0) > 0]
+    counts = counts.reindex(out.index)
+
+    if drop_incomplete_tail and len(out) > 0:
+        expected = max(1, int(round(target_minutes / max(source_minutes, 1e-9))))
+        if counts.iloc[-1] < expected:
+            out = out.iloc[:-1]
+            counts = counts.iloc[:-1]
+
+    out.index.name = "timestamp"
+    out = validate_ohlcv(out)
+    return drop_unclosed_bar(out, now=now, bar_minutes=target_minutes)
+
+
 def align_to_bars(
     df: pd.DataFrame,
     bar_minutes: int = 1,

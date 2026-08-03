@@ -475,3 +475,145 @@ söyler. Gerçek veriyle çalışırken de aynı eşikler geçerlidir.
   bu yüzden `kelly_fraction` düşük tutulmuştur.
 * Rejim değişimi tespiti yalnızca özellik seviyesindedir; ayrı bir rejim modeli
   yoktur.
+
+---
+
+## 11. Deney defteri ve bar boyutu deneyi
+
+### 11.1 `n_trials` neden 120?
+
+Deflated Sharpe, gözlenen Sharpe'ı **kaç deneme yapıldığına** göre cezalandırır.
+Bu sayıyı küçük beyan etmek DSR'yi sahte biçimde yükseltir, yani tüm testi
+anlamsızlaştırır. Defter:
+
+**Uçtan uca değerlendirilen konfigürasyonlar (~8):** sentetik 1m (ilk ayar:
+`pt_sl=1.5`, `vertical=60`, `cusum=1.0`, bar-bazlı Sharpe) · sentetik 1m
+(yeniden ayarlanmış: `pt_sl=2.0`, `vertical=240`, `cusum=0.35`) · boyutlandırma
+revizyonu (`kelly_fraction` 0.25→0.5, `target_vol` 0.20→0.30,
+`min_position` 0.05→0.01) · metrik frekansı değişimi (bar → saatlik) · 1m
+kontrol (600k bar) · 15m · 1h · (planlanan) Binance 1m.
+
+**Belgelenen serbestlik dereceleri (~15):** bariyer çarpanları, dikey bariyer,
+CUSUM eşiği, `prob_threshold`, `min_edge_over_cost`, boyutlandırma yöntemi,
+Kelly kesri/kapağı, vol hedefi, maksimum kaldıraç, özellik grupları (7 grup),
+birincil kural parametreleri, ağırlıklandırma seçenekleri, embargo oranı,
+CPCV grup sayısı, metrik frekansı.
+
+`8 × 15 = 120`. Bilinçli olarak **yukarı** yuvarlanmıştır: fazla beyan etmek
+testi yalnızca sertleştirir, az beyan etmek sonucu sahte biçimde anlamlı
+gösterir.
+
+### 11.2 Bar boyutu deneyi (`--resample`)
+
+**Hipotez:** 1 dakikalık barlarda yön neredeyse rastgeledir; daha uzun barlarda
+mikroyapı gürültüsü ortalanır ve sinyal belirginleşir.
+
+**Tasarım.** Aynı sentetik 1m seri (600.000 bar ≈ 416 gün) üç çözünürlükte
+işlendi. **Tutma ufku her üçünde de 4 saat** olacak şekilde config'ten yeniden
+türetildi (`scale_config_for_bars`), yani tahmin ufku sabit — değişen tek şey
+bar çözünürlüğü. Tüm sızıntı korumaları, purging, embargo, maliyetli backtest,
+CPCV ve DSR **aynen** korundu; hiçbir güvence gevşetilmedi.
+
+```bash
+python -m research.run_research --synthetic --bars 600000 --resample 15min
+python -m research.run_research --synthetic --bars 600000 --resample 1h
+```
+
+**Sonuçlar (sentetik veri):**
+
+| bar | olay | ufuk | CV AUC | CPCV AUC | CPCV Sharpe | poz. yol | işlem | isabet | getiri | Sharpe | maxDD | DSR |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1m (kontrol) | 27.232 | 240 bar | 0.510 | 0.509 | −3.56 | %0 | 1.182 | 0.397 | −21.9% | −6.21 | −22.0% | 0.00 |
+| 15m | 7.581 | 16 bar | 0.502 | 0.503 | −2.87 | %0 | 892 | 0.379 | −21.1% | −5.76 | −21.2% | 0.00 |
+| 1h | 2.795 | 4 bar | 0.519 | 0.520 | −1.44 | %7 | 675 | 0.373 | −11.8% | −3.09 | −12.7% | 0.00 |
+
+**Yorum — hipotez DESTEKLENMEDİ.** AUC her üç çözünürlükte de 0.50–0.52
+bandında kaldı; yani öngörülebilirlik artmadı. Sharpe'ın −6.2'den −3.1'e
+"iyileşmesi" bir sinyal kazanımı değil, **daha az işlem yapıldığı için daha az
+maliyet ödenmesidir**: işlem sayısı 1.182'den 675'e düşerken isabet oranı da
+0.397'den 0.373'e geriledi. Üç çalıştırmanın da DSR'si ≈ 0'dır ve KARAR bloğu
+beş kontrolün dördünde "KALDI" verir.
+
+**Bu deneyin kanıtlayamayacağı şey.** Sentetik seride gerçek bir kenar yoktur
+(zayıf bir AR(1) momentum bileşeni vardır ve toplulaştırma onu zaten ortalar).
+Dolayısıyla bu sonuç, gerçek piyasada uzun barların işe yaramayacağını
+**göstermez**; yalnızca hattın olmayan bir kenarı üretmediğini gösterir. Hipotez
+ancak gerçek veriyle (Binance prototipi veya Paribu toplayıcısı) test edilebilir.
+
+**Bilinen karışıklık (confound).** Özellik pencereleri BAR cinsinden sabit
+tutuldu, duvar saatine göre ölçeklenmedi. Ölçeklenselerdi göstergeler bozulurdu
+(1 saatlik barda MACD(12,26,9) → MACD(1,1,1), RSI(14) → RSI(1)). Bunun bedeli:
+kaba barlarda özellikler duvar saati olarak daha geriye bakar, yani
+karşılaştırma saf "çözünürlük" değil "çözünürlük + geriye bakış" birleşimidir.
+
+---
+
+## 12. Grid (ızgara) stratejisi — `grid_backtest.py`
+
+Mekanik grid stratejisinin maliyetli ve **dürüst** backtest'i. ML hattından
+bağımsızdır (tahmin yok, kural var) ama aynı maliyet disiplinini kullanır.
+
+```bash
+python -m research.grid_backtest                      # varsayilan: BTCTRY 1m -> 1h
+python -m research.grid_backtest --levels 30 --capital 50000
+python -m research.grid_backtest --synthetic --plot artifacts/grid.png
+```
+
+Veri `research/data/ohlcv/BTCTRY_1m_binance.parquet`'ten okunur ve 1 saatlik
+bara indirilir (1 dakikalık gridde işlem/maliyet patlar). Dosya yoksa araç ne
+yapılacağını söyler; `--synthetic` yalnızca motoru göstermek içindir.
+
+### Neden bu modül "toplam kâr" raporlamıyor
+
+Grid backtest'leri sektörde sistematik olarak yanıltıcıdır: genellikle sadece
+**gerçekleşmiş kâr** (tamamlanan al-sat çiftleri) raporlanır ve bu sayı
+neredeyse her zaman pozitiftir. Fiyat düştükçe grid almaya devam eder, her
+yükselişte kâr kilitler. Gizlenen şey dönem sonunda **elde kalan coin**'dir.
+Bu yüzden üç kalem AYRI raporlanır:
+
+```
+Gerceklesmis kar  :       2,912.66 TL  (+2.91%)
+Gerceklesmemis K/Z:      -7,260.99 TL  (-7.26%)
+TOPLAM K/Z        :      -4,348.33 TL  (-4.35%)
+  DIKKAT: gerceklesmis kar POZITIF ama toplam NEGATIF.
+  Yalnizca 'gerceklesmis kar' raporlansaydi strateji karli gorunecekti.
+```
+
+Ayrıca raporlanır: **aralık kırıldı mı** (fiyat alt sınırın altına indiyse
+strateji fiilen çökmüştür), aralık dışı geçen sürenin oranı, maksimum drawdown,
+elde kalan envanterin değeri/maliyeti, toplam maliyet, nakit yetmediği için
+atlanan alışlar ve **al-ve-tut karşılaştırması**.
+
+**Kademe adımı / maliyet oranı** başta basılır. Adım gidiş-dönüş maliyetten
+küçükse strateji matematiksel olarak kaybeder — model ya da rejim fark etmez.
+
+### İcra varsayımları (kötümser)
+
+1. Her işlemde komisyon + slippage (varsayılan gidiş-dönüş ~%0.5, ML
+   backtest'iyle aynı).
+2. Aynı barda alınan lot aynı barda **satılamaz** — bar içi sıralama
+   bilinmediği için sahte scalping üretilmez.
+3. Piyasa üstü limit alım verilmez: bir kademede alım ancak fiyat oraya
+   **düştüğünde** tetiklenir.
+4. Nakit yetmezse alım **atlanır** ve sayılır (bedava kaldıraç yok).
+5. Bir lotun satış hedefi **alım anında sabitlenir**; grid kaysa bile açık
+   pozisyonun çıkış fiyatı geriye dönük değişmez.
+
+Statik gridde sermaye kademelere önceden bölündüğü için (`sermaye / n_levels`)
+alımların toplamı tanım gereği sermayeyi aşamaz; nakit tükenmesi ancak
+maliyetlerle veya trailing modda yeniden alımla ortaya çıkar.
+
+### Modlar
+
+* **static** — aralık sabit. Fiyat aralıktan çıkarsa strateji durur.
+* **trailing** — fiyat üst sınırı aşınca grid bir kademe yukarı kayar (en alt
+  kademe boşsa). Yükselişte daha iyi, düşüşte aynı riski taşır.
+
+İkisi de ayrı çalıştırılıp karşılaştırma tablosunda yan yana raporlanır.
+
+### Rejim analizi (dönem seçme yanlılığına karşı)
+
+Tek bir 60 günlük toplam sayı, hangi rejimin baskın olduğunu gizler. Bu yüzden
+dönem haftalık pencerelere bölünür; her pencere için getiri, drawdown, fiyatın
+net değişimi ve **rejim etiketi** (`yukselis` / `dusus` / `yatay`) raporlanır.
+Beklenen ve gözlenen davranış: grid yatay piyasada kazanır, düşüşte kaybeder.

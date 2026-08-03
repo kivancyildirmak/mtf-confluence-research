@@ -42,8 +42,8 @@ from .backtest import (
     sensitivity_analysis,
     total_cost_rate,
 )
-from .config import CONFIG, ResearchConfig, set_global_seed
-from .data import build_synthetic_dataset, load_ohlcv
+from .config import CONFIG, ResearchConfig, scale_config_for_bars, set_global_seed
+from .data import build_synthetic_dataset, load_ohlcv, resample_ohlcv, rule_to_minutes
 from .features import make_features, warmup_bars
 from .labeling import (
     cusum_filter,
@@ -83,12 +83,21 @@ def _log(msg: str) -> None:
 def prepare_dataset(
     cfg: ResearchConfig,
     data_path: str | None = None,
+    resample_rule: str | None = None,
+    source_bar_minutes: int = 1,
 ) -> dict[str, Any]:
-    """Veriyi yükler, özellikleri ve etiketleri üretir, hizalar.
+    """Veriyi yükler, (istenirse) toplulaştırır, özellik ve etiketleri üretir.
 
     Args:
-        cfg: Kök konfigürasyon.
+        cfg: Kök konfigürasyon (``resample_rule`` verildiyse ZATEN
+            :func:`config.scale_config_for_bars` ile ölçeklenmiş olmalıdır).
         data_path: Yerel veri dosyası. ``None`` ise sentetik veri üretilir.
+        resample_rule: Hedef bar frekansı (``"15min"``, ``"1h"``). ``None`` ise
+            kaynak çözünürlük korunur.
+        source_bar_minutes: KAYNAK verinin bar süresi. Sentetik veri her zaman
+            bu çözünürlükte üretilir, sonra toplulaştırılır — çünkü 15 dakikalık
+            barı doğrudan üretmek ile 1 dakikalıkları toplamak farklı
+            mikroyapılar verir; deneyin gerçekçi olması için ikincisi gerekir.
 
     Returns:
         ``ohlcv``, ``X``, ``events``, ``weights``, ``target_vol`` anahtarlı sözlük.
@@ -102,12 +111,37 @@ def prepare_dataset(
         reference = orderbook = stable = None
     else:
         _log("Sentetik veri üretiliyor (Paribu API bağlı değil).")
-        pack = build_synthetic_dataset(cfg)
+        # Sentetik üretim KAYNAK çözünürlükte yapılır; ölçeklenmiş config'in
+        # bar_minutes'ı hedef bar boyutunu gösterdiği için geçici olarak geri alınır.
+        import copy as _copy
+
+        gen_cfg = _copy.deepcopy(cfg)
+        gen_cfg.data.bar_minutes = source_bar_minutes
+        pack = build_synthetic_dataset(gen_cfg)
         ohlcv = pack["ohlcv"]
         reference = pack["reference"]
         orderbook = pack["orderbook"]
         stable = pack["stable_premium"]
-    _log(f"  {len(ohlcv):,} bar | {ohlcv.index[0]} -> {ohlcv.index[-1]}")
+    _log(f"  {len(ohlcv):,} kaynak bar | {ohlcv.index[0]} -> {ohlcv.index[-1]}")
+
+    if resample_rule:
+        _log(f"Barlar toplulaştırılıyor: {source_bar_minutes}dk -> {resample_rule}")
+        ohlcv = resample_ohlcv(ohlcv, resample_rule)
+        if reference is not None:
+            reference = resample_ohlcv(reference, resample_rule)
+        # Emir defteri ve prim serisi fiyat değil DURUM serileridir: bar
+        # kapanışındaki son değer alınır (ortalama almak bar içi bilgiyi karıştırır).
+        if orderbook is not None:
+            orderbook = orderbook.resample(resample_rule, label="left", closed="left").last()
+            orderbook = orderbook.reindex(ohlcv.index)
+        if stable is not None:
+            stable = stable.resample(resample_rule, label="left", closed="left").last()
+            stable = stable.reindex(ohlcv.index)
+        _log(
+            f"  {len(ohlcv):,} bar ({cfg.data.bar_minutes}dk) | "
+            f"tutma ufku: {cfg.labeling.vertical_bars} bar "
+            f"= {cfg.labeling.vertical_bars * cfg.data.bar_minutes / 60:.1f} saat"
+        )
 
     _log("Özellikler üretiliyor (features.make_features)...")
     X = make_features(
@@ -364,6 +398,7 @@ def run(
     data_path: str | None = None,
     output_dir: str | None = None,
     skip_shap: bool = False,
+    resample: str | None = None,
 ) -> dict[str, Any]:
     """Tüm araştırma hattını uçtan uca çalıştırır.
 
@@ -372,11 +407,18 @@ def run(
         data_path: Yerel veri dosyası. ``None`` ise sentetik veri.
         output_dir: Çıktı klasörü.
         skip_shap: SHAP hesabını atla (hız için).
+        resample: Hedef bar frekansı (``"15min"``, ``"1h"``). Verilirse veri
+            toplulaştırılır ve tutma ufku aynı DUVAR SAATİ süresini verecek
+            şekilde config'ten yeniden türetilir. Diğer tüm güvenceler
+            (purging, embargo, maliyet, CPCV, DSR) aynen korunur.
 
     Returns:
         Tüm ara ve nihai sonuçları içeren sözlük.
     """
     c = cfg or CONFIG
+    source_bar_minutes = c.data.bar_minutes
+    if resample:
+        c = scale_config_for_bars(c, rule_to_minutes(resample))
     set_global_seed(c.seed)
     out_dir = Path(output_dir or c.data.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -384,10 +426,17 @@ def run(
 
     print("=" * 78)
     print("PARIBU ML SİNYAL ARAŞTIRMA HATTI — offline (canlı API bağlı değil)")
+    if resample:
+        print(
+            f"DENEY: bar boyutu {source_bar_minutes}dk -> {c.data.bar_minutes}dk"
+            f" | tutma ufku {c.labeling.vertical_bars} bar"
+            f" ({c.labeling.vertical_bars * c.data.bar_minutes / 60:.1f} saat)"
+        )
     print("=" * 78)
 
     # --- 1-4 ---------------------------------------------------------------- #
-    ds = prepare_dataset(c, data_path)
+    ds = prepare_dataset(c, data_path, resample_rule=resample,
+                         source_bar_minutes=source_bar_minutes)
     ohlcv, X, events, weights = ds["ohlcv"], ds["X"], ds["events"], ds["weights"]
 
     print("\n--- Etiket özeti ---")
@@ -668,6 +717,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=str, default=None, help="Çıktı klasörü.")
     parser.add_argument("--seed", type=int, default=None, help="Rastgelelik tohumu.")
     parser.add_argument("--skip-shap", action="store_true", help="SHAP hesabını atla.")
+    parser.add_argument(
+        "--resample",
+        type=str,
+        default=None,
+        help="Barları toplulaştır (örn. 15min, 1h). Tutma ufku config'ten yeniden türetilir.",
+    )
     args = parser.parse_args(argv)
 
     cfg = CONFIG
@@ -677,7 +732,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.bars is not None:
         cfg.data.synthetic_bars = args.bars
 
-    run(cfg=cfg, data_path=args.data, output_dir=args.output, skip_shap=args.skip_shap)
+    run(cfg=cfg, data_path=args.data, output_dir=args.output,
+        skip_shap=args.skip_shap, resample=args.resample)
     return 0
 
 

@@ -589,6 +589,71 @@ def test_resample_writes_spread_columns() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Bar toplulaştırma deneyi (--resample)
+# --------------------------------------------------------------------------- #
+
+
+def test_resample_ohlcv_aggregation_is_correct() -> None:
+    """open=ilk, high=maks, low=min, close=son, volume=toplam olmalı."""
+    from ..data import resample_ohlcv
+
+    idx = pd.date_range("2026-01-01 00:00", periods=30, freq="1min", tz="UTC")
+    df = pd.DataFrame(
+        {
+            "open": np.arange(100.0, 130.0),
+            "high": np.arange(100.0, 130.0) + 2.0,
+            "low": np.arange(100.0, 130.0) - 2.0,
+            "close": np.arange(100.0, 130.0) + 0.5,
+            "volume": np.ones(30),
+        },
+        index=idx,
+    )
+    out = resample_ohlcv(df, "15min", now=pd.Timestamp("2026-01-01 02:00", tz="UTC"))
+    assert len(out) == 2
+    first = out.iloc[0]
+    assert first["open"] == 100.0, "open ilk barin acilisi olmali."
+    assert first["high"] == df["high"].iloc[:15].max()
+    assert first["low"] == df["low"].iloc[:15].min()
+    assert first["close"] == df["close"].iloc[14], "close son barin kapanisi olmali."
+    assert first["volume"] == 15.0, "volume toplam olmali."
+    assert out.index[0] == idx[0], "Barlar ACILIS zamaniyla etiketlenmeli (sag etiket = look-ahead)."
+
+
+def test_resample_drops_incomplete_tail_bar() -> None:
+    """Kaynak barları eksik olan son aralık atılmalı (yarım bar tam sayılmamalı)."""
+    from ..data import resample_ohlcv
+
+    idx = pd.date_range("2026-01-01 00:00", periods=23, freq="1min", tz="UTC")
+    df = pd.DataFrame(
+        {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1.0},
+        index=idx,
+    )
+    now = pd.Timestamp("2026-01-01 05:00", tz="UTC")  # her sey duvar saatine gore kapali
+    out = resample_ohlcv(df, "15min", drop_incomplete_tail=True, now=now)
+    kept = resample_ohlcv(df, "15min", drop_incomplete_tail=False, now=now)
+    assert len(kept) == 2, "00:00 ve 00:15 araliklari"
+    assert len(out) == 1, "00:15 araliginda yalnizca 8 dakika var -> atilmali."
+
+
+def test_scale_config_keeps_wall_clock_horizon() -> None:
+    """Tutma ufku bar boyutundan bağımsız olarak aynı SÜREYİ vermeli."""
+    from ..config import ResearchConfig, scale_config_for_bars
+
+    base = ResearchConfig()  # 1dk bar, 240 bar ufuk = 4 saat
+    base_hours = base.labeling.vertical_bars * base.data.bar_minutes / 60.0
+
+    for minutes, beklenen_bar in ((15, 16), (60, 4)):
+        scaled = scale_config_for_bars(base, minutes)
+        assert scaled.data.bar_minutes == minutes
+        assert scaled.labeling.vertical_bars == beklenen_bar
+        hours = scaled.labeling.vertical_bars * scaled.data.bar_minutes / 60.0
+        assert abs(hours - base_hours) < 1e-9, f"{minutes}dk: ufuk {hours}s, beklenen {base_hours}s"
+
+    # Girdi degistirilmemeli (yan etki yok).
+    assert base.data.bar_minutes == 1 and base.labeling.vertical_bars == 240
+
+
+# --------------------------------------------------------------------------- #
 # Binance geçmiş veri indirici
 # --------------------------------------------------------------------------- #
 
@@ -747,6 +812,183 @@ def test_binance_download_feeds_the_pipeline() -> None:
     X = make_features(bars)
     assert X.shape[0] == len(bars) and X.shape[1] > 50
     assert X["mk_spread_rel"].isna().all(), "Binance'te defter yok; mk_* NaN kalmali."
+
+
+# --------------------------------------------------------------------------- #
+# Grid stratejisi
+# --------------------------------------------------------------------------- #
+
+
+def _price_path(prices: list[float], start: str = "2026-01-01") -> pd.DataFrame:
+    """Verilen kapanış dizisinden OHLCV çerçevesi (high/low = kapanışları kapsar)."""
+    idx = pd.date_range(start, periods=len(prices), freq="1h", tz="UTC")
+    p = np.asarray(prices, dtype="float64")
+    prev = np.concatenate([[p[0]], p[:-1]])
+    return pd.DataFrame(
+        {
+            "open": prev,
+            "high": np.maximum(prev, p),
+            "low": np.minimum(prev, p),
+            "close": p,
+            "volume": np.ones(len(p)),
+        },
+        index=idx,
+    )
+
+
+def test_grid_levels_spacing() -> None:
+    """Geometrik kademelerde her adım eşit YÜZDE olmalı."""
+    from ..grid_backtest import build_levels, grid_step_pct
+
+    lv = build_levels(100.0, 200.0, 11, "geometric")
+    assert len(lv) == 11 and lv[0] == 100.0 and lv[-1] == 200.0
+    steps = np.diff(lv) / lv[:-1]
+    assert np.allclose(steps, steps[0]), "Geometrik aralikta adimlar esit yuzde olmali."
+    assert abs(grid_step_pct(lv) - steps[0]) < 1e-12
+
+    lin = build_levels(100.0, 200.0, 11, "linear")
+    assert np.allclose(np.diff(lin), 10.0)
+
+
+def test_grid_buys_on_drop_and_sells_on_rise() -> None:
+    """Bir kademe düşünce al, bir kademe çıkınca sat."""
+    from ..config import GridConfig
+    from ..grid_backtest import run_grid_backtest
+
+    cfg = GridConfig(lower_price=90.0, upper_price=110.0, n_levels=11,
+                     total_capital=11_000.0, spacing="linear",
+                     commission_rate=0.0, slippage_bps=0.0)
+    # 100'den 96'ya in (alislar), sonra 104'e cik (satislar).
+    df = _price_path([100, 99, 98, 97, 96, 97, 98, 99, 100, 101, 102, 103, 104])
+    res = run_grid_backtest(df, cfg)
+
+    assert not res.trades.empty, "Hic islem olusmadi."
+    buys = res.trades[res.trades["yon"] == "AL"]
+    sells = res.trades[res.trades["yon"] == "SAT"]
+    assert len(buys) >= 4, f"Dususte alim bekleniyordu: {len(buys)}"
+    assert len(sells) >= 4, f"Yukseliste satim bekleniyordu: {len(sells)}"
+    assert (res.pairs["kar"] > 0).all(), "Maliyetsiz gridde her cift kar etmeli."
+    # Her cift bir kademe (=2 birim fiyat) kar etmeli.
+    assert res.metrics["gerceklesmis_kar"] > 0
+
+
+def test_grid_costs_are_applied_to_every_trade() -> None:
+    """Maliyet her işleme uygulanmalı; maliyetli sonuç maliyetsizden kötü olmalı."""
+    from ..config import GridConfig
+    from ..grid_backtest import run_grid_backtest
+
+    df = _price_path([100, 98, 96, 98, 100, 98, 96, 98, 100])
+    free = GridConfig(lower_price=90.0, upper_price=110.0, n_levels=11,
+                      total_capital=11_000.0, spacing="linear",
+                      commission_rate=0.0, slippage_bps=0.0)
+    costly = GridConfig(lower_price=90.0, upper_price=110.0, n_levels=11,
+                        total_capital=11_000.0, spacing="linear",
+                        commission_rate=0.002, slippage_bps=5.0)
+
+    r_free = run_grid_backtest(df, free)
+    r_cost = run_grid_backtest(df, costly)
+
+    assert r_free.metrics["toplam_maliyet"] == 0.0
+    assert r_cost.metrics["toplam_maliyet"] > 0.0
+    assert r_cost.metrics["toplam_kz"] < r_free.metrics["toplam_kz"], \
+        "Maliyet toplam sonucu KOTULESTIRMELI."
+    assert r_cost.metrics["gidis_donus_maliyet"] == 2 * (0.002 + 0.0005)
+
+
+def test_grid_unrealized_loss_is_reported_separately() -> None:
+    """EN KRİTİK: fiyat aralıktan düşünce elde kalan coin'in zararı ayrı görünmeli."""
+    from ..config import GridConfig
+    from ..grid_backtest import run_grid_backtest
+
+    cfg = GridConfig(lower_price=90.0, upper_price=110.0, n_levels=11,
+                     total_capital=11_000.0, spacing="linear",
+                     commission_rate=0.0, slippage_bps=0.0)
+    # Once biraz zikzak (gerceklesmis kar olussun), sonra sert dusus.
+    path = [100, 98, 100, 98, 96, 94, 92, 90, 85, 80, 75, 70]
+    res = run_grid_backtest(_price_path(path), cfg)
+    m = res.metrics
+
+    assert m["elde_kalan_miktar"] > 0, "Dususte elde envanter kalmali."
+    assert m["gerceklesmemis_kz"] < 0, "Elde kalan coin zararda olmali."
+    assert m["aralik_kirildi"] is True, "Fiyat alt sinirin altina indi."
+    assert m["alt_sinir_alti_bar"] > 0
+    assert m["aralik_disi_sure_orani"] > 0
+
+    # Toplam = gerceklesmis + gerceklesmemis (muhasebe tutarliligi).
+    assert abs(m["toplam_kz"] - (m["gerceklesmis_kar"] + m["gerceklesmemis_kz"])) < 1e-6
+    # Sermaye egrisi de ayni sonuca varmali.
+    assert abs(res.equity.iloc[-1] - (cfg.total_capital + m["toplam_kz"])) < 1e-6
+    # Ve asil mesele: gerceklesmis kar pozitifken toplam negatif olabilmeli.
+    assert m["gerceklesmis_kar"] > 0 and m["toplam_kz"] < 0, \
+        "Bu senaryo tam da 'gizlenen risk' vakasi olmali."
+
+
+def test_grid_never_spends_money_it_does_not_have() -> None:
+    """Nakit asla negatife düşmemeli; yetmezse alım atlanmalı (bedava kaldıraç yok).
+
+    Not: statik gridde sermaye kademelere ÖNCEDEN bölündüğü için (kademe başına
+    ``sermaye / n_levels``) alımların toplamı tanım gereği sermayeyi aşamaz.
+    Nakit tükenmesi ancak MALİYETLER eklendiğinde (veya trailing modda grid
+    kayıp yeniden alım yapıldığında) ortaya çıkar. Test bu mekanizmayı yüksek
+    komisyonla zorlar.
+    """
+    from ..config import GridConfig
+    from ..grid_backtest import run_grid_backtest
+
+    düsüs = _price_path(list(range(100, 49, -1)))
+    base = dict(lower_price=50.0, upper_price=110.0, n_levels=21,
+                total_capital=200.0, spacing="linear", slippage_bps=0.0)
+
+    # 1) Maliyetsiz: onceden bolunmus sermaye tasmaz, atlama olmaz.
+    r0 = run_grid_backtest(düsüs, GridConfig(**base, commission_rate=0.0))
+    assert r0.cash.min() >= -1e-9, "Nakit negatife dusmemeli."
+    assert r0.metrics["atlanan_alis_nakit_yok"] == 0
+
+    # 2) Asiri maliyet (%30 — gercekci degil, korumayi tetiklemek icin): son
+    #    alimlara para kalmaz, atlanmali.
+    r1 = run_grid_backtest(düsüs, GridConfig(**base, commission_rate=0.30))
+    assert r1.cash.min() >= -1e-9, "Nakit maliyetle bile negatife dusmemeli."
+    assert r1.metrics["atlanan_alis_nakit_yok"] > 0, "Maliyet nakiti tuketmeliydi."
+
+
+def test_grid_regime_analysis_labels_trends() -> None:
+    """Alt dönemler rejim etiketiyle raporlanmalı."""
+    from ..config import GridConfig
+    from ..grid_backtest import label_trend, regime_analysis, run_grid_backtest
+
+    assert label_trend(100, 110, 0.02) == "yukselis"
+    assert label_trend(100, 90, 0.02) == "dusus"
+    assert label_trend(100, 100.5, 0.02) == "yatay"
+
+    cfg = GridConfig(lower_price=90.0, upper_price=110.0, n_levels=11,
+                     total_capital=11_000.0, spacing="linear")
+    n = 24 * 21  # 3 hafta saatlik
+    prices = 100 + 3 * np.sin(np.arange(n) / 12.0)
+    df = _price_path(list(prices))
+    res = run_grid_backtest(df, cfg)
+    reg = regime_analysis(df, res.equity, cfg)
+    assert len(reg) >= 2, "Haftalik pencereler olusmali."
+    assert set(reg["rejim"]).issubset({"yukselis", "dusus", "yatay"})
+    assert {"strateji_getiri", "strateji_max_dd", "fiyat_degisim"} <= set(reg.columns)
+
+
+def test_grid_trailing_mode_shifts_range_up() -> None:
+    """Hareketli modda fiyat üst sınırı aşınca grid yukarı kaymalı."""
+    from ..config import GridConfig
+    from ..grid_backtest import run_grid_backtest
+
+    base = dict(lower_price=90.0, upper_price=110.0, n_levels=11,
+                total_capital=11_000.0, spacing="linear",
+                commission_rate=0.0, slippage_bps=0.0)
+    df = _price_path(list(range(100, 141)))  # surekli yukselis
+
+    static = run_grid_backtest(df, GridConfig(**base, mode="static"))
+    trailing = run_grid_backtest(df, GridConfig(**base, mode="trailing"))
+
+    assert static.metrics["grid_kaydirma"] == 0
+    assert trailing.metrics["grid_kaydirma"] > 0, "Trailing modda kaydirma olmaliydi."
+    assert trailing.levels[-1] > static.levels[-1], "Aralik yukari tasinmali."
+    assert static.metrics["ust_sinir_ustu_bar"] > 0, "Sabit grid aralik disinda kalmali."
 
 
 # --------------------------------------------------------------------------- #
