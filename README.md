@@ -34,9 +34,12 @@ Script tarih araligini kisitlar ama gostergeleri **tum** veriden hesaplar — ya
 yeni donemi test ederken EMA(200) zaten isinmis olur, donem basinda 200 barlik
 olu bolge olusmaz.
 
+Baslangic varsayilani 01.01.2015 (2005 oncesi TRY verisi kullanilamaz — asagiya
+bakin). Bolme tarihini bu baslangica gore hesaplayin.
+
 Her sembol icin:
 
-1. Once tarih araligini genis birak, grafikte ilk barin tarihini not et.
+1. Once bitis tarihini bugune al, grafikte ilk islem gorulen barin tarihini not et.
 2. Toplam gun sayisinin %60'ini ekleyip bolme tarihini bul.
 3. **Eski donem:** Baslangic = ilk bar, Bitis = bolme tarihi.
 4. **Yeni donem:** Baslangic = bolme tarihi, Bitis = bugun.
@@ -49,7 +52,7 @@ sonunda acik kalan islem hic kapanmaz ve istatistiklere girmez.
 
 Sembol · islem sayisi · kazanma orani % · net getiri % · max drawdown % ·
 profit factor · maks ardisik kayip · ortalama kazanc/kayip (R ve oran) ·
-net kar · acik pozisyon var/yok.
+net kar · acik pozisyon var/yok · **poz. siniri** (kirpma/asim sayisi).
 
 Islem sayisi **20'nin altindaysa** hucre turuncuya doner ve `(veri yetersiz)`
 yazar. Max drawdown TradingView'in kendi kutusundan degil, `strategy.equity`
@@ -64,10 +67,25 @@ sembol karsilastirirken akilda tutun. Kayma ve komisyon sadece K/Z'yi etkiler;
 sinyaller `close` ve hesaplanan stop seviyesinden uretildigi icin islem
 **sayisi ve tarihleri** bu ayarlardan etkilenmez.
 
-**Ortuk kaldirac.** Dusuk volatilitede `3*ATR` kucuk kalir ve
-`risk / (3*ATR)` formulu sermayeyi asan pozisyon uretebilir. Varsayilan olarak
-sinir yok (spesifikasyon aynen uygulanir). Sinirlamak icin
-`Maks pozisyon buyuklugu` girdisine `100` yazin.
+**Ortuk kaldirac — varsayilan sinir %100.** Illikit ya da durgun veride ayni
+kapanis tekrar edince TR sifir olur ve ATR cokede yaklasir. `risk / (3*ATR)`
+formulu o barda sermayenin katlarina ulasan lot uretir; ustune bir fiyat
+sureksizligi gelirse tek islemde sermayenin katlari kadar zarar yazilir.
+Bu yuzden `Maks pozisyon buyuklugu` varsayilani **100** (pozisyon degeri
+sermayeyi asamaz). `0` yazarak sinirsiz hale getirebilirsiniz — spesifikasyonun
+ham hali budur ama ne yaptiginizi bilerek kullanin.
+
+Sinirin devreye girip girmedigi tabloda **`Poz. siniri`** satirinda gorunur:
+kac islemde kirpildigi, kac islemde pozisyon sermayeyi astigi ve sinir
+olmasaydi ulasilacak en buyuk pozisyon (`ham maks %`). Bu deger %100'un cok
+uzerindeyse sembolun verisinde durgun/bozuk bolge var demektir.
+
+**2005 oncesi TRY verisi kullanilamaz.** Redenominasyon (6 sifir atilmasi) ve
+hiperenflasyon yuzunden fiyat serisi sureksiz. Bu yuzden `Tarih araligi kullan`
+varsayilan olarak **acik** ve baslangic **01.01.2015**. Kapatirsaniz sembolun
+tum gecmisi islenir; eski veride yukaridaki kaldirac patolojisi tetiklenir.
+Pozisyon siniri bu durumda tek islem zararini sermayenin ~1 katiyla sinirlar
+ama artefakti yok etmez — tarih filtresi asil koruma.
 
 ### Cikis modeli
 
