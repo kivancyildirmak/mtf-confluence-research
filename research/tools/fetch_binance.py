@@ -516,27 +516,73 @@ def choose_symbol(
 # --------------------------------------------------------------------------- #
 
 
+def parse_date(value: str | datetime | None) -> datetime | None:
+    """``"2022-05-01"`` gibi bir tarihi UTC ``datetime``'a çevirir.
+
+    Args:
+        value: Tarih dizgesi veya ``datetime``.
+
+    Returns:
+        UTC ``datetime`` veya ``None``.
+
+    Raises:
+        ValueError: Biçim tanınmıyorsa.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    ts = pd.Timestamp(str(value))
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return ts.to_pydatetime()
+
+
 def fetch_history(
     symbol: str | None = None,
     days: int = 60,
     source: str = "auto",
     out_dir: str | Path | None = None,
     now: datetime | None = None,
+    start: str | datetime | None = None,
+    end: str | datetime | None = None,
+    tag: str | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Geçmiş barları indirir, sözleşmeye sokar ve parquet'e yazar.
 
     Args:
         symbol: Sembol. ``None`` ise :data:`DEFAULT_SYMBOLS` ölçülerek seçilir.
-        days: Kaç günlük geçmiş.
+        days: Kaç günlük geçmiş (``start``/``end`` verilmediyse kullanılır).
         source: ``"auto"`` (önce toplu, olmazsa REST), ``"bulk"`` veya ``"rest"``.
         out_dir: Çıktı klasörü. ``None`` ise ``CollectorConfig.ohlcv_dir``.
         now: "Şimdi" (test için).
+        start: Açık başlangıç tarihi (örn. ``"2022-05-01"``). Verilirse
+            ``days`` yok sayılır.
+        end: Açık bitiş tarihi. ``start`` verilip ``end`` verilmezse
+            ``start + days`` kullanılır.
+        tag: Dosya adına eklenecek etiket (örn. ``"luna"``). Farklı dönemlerin
+            birbirinin üstüne yazmasını engeller.
 
     Returns:
         ``(bars, meta)``. ``meta`` seçilen sembolü, kaynağı ve ölçümleri taşır.
+
+    Notes:
+        Tarihsel bir pencere indirirken sembol ÖLÇÜMÜ de o pencereden yapılır;
+        aksi hâlde "bugün BTCTRY var" diye 2021'e bakılırdı — oysa parite o
+        tarihte listelenmemiş olabilir.
     """
-    end = now or datetime.now(timezone.utc)
-    start = end - timedelta(days=days)
+    explicit_start = parse_date(start)
+    explicit_end = parse_date(end)
+    if explicit_start is not None:
+        start_dt = explicit_start
+        end_dt = explicit_end or (start_dt + timedelta(days=days))
+    elif explicit_end is not None:
+        end_dt = explicit_end
+        start_dt = end_dt - timedelta(days=days)
+    else:
+        end_dt = now or datetime.now(timezone.utc)
+        start_dt = end_dt - timedelta(days=days)
+    end, start = end_dt, start_dt
 
     def bulk_dl(s: str, a: datetime, b: datetime) -> tuple[pd.DataFrame, dict]:
         return download_bulk(s, a, b)
@@ -552,6 +598,8 @@ def fetch_history(
         _log("Sembol olculuyor (once BTCTRY, yetersizse BTCUSDT)...")
         # Ölçüm REST ile daha ucuz; toplu döküm bir aylık zip indirmeyi gerektirir.
         probe_dl = rest_dl if source != "bulk" else bulk_dl
+        # Ölçüm penceresi istenen dönemin SONU olmalı: sembolün bugün var olması,
+        # 2021'de de listelendiği anlamına gelmez.
         symbol, reports = choose_symbol(DEFAULT_SYMBOLS, days=2, downloader=probe_dl, now=end)
         if symbol is None:
             _log("Hicbir aday sembol kullanilabilir veri dondurmedi.")
@@ -581,7 +629,10 @@ def fetch_history(
         d = Path(out_dir) if out_dir else Path(CONFIG.collector.ohlcv_dir)
         d.mkdir(parents=True, exist_ok=True)
         # Dosya adı HANGİ sembolün kullanıldığını açıkça taşır.
-        path = d / f"{symbol}_1m_binance.parquet"
+        suffix = f"_{tag}" if tag else ""
+        if explicit_start is not None or explicit_end is not None:
+            suffix += f"_{start:%Y%m%d}_{end:%Y%m%d}"
+        path = d / f"{symbol}_1m_binance{suffix}.parquet"
         bars.to_parquet(path, index=True)
         meta["dosya"] = str(path)
     return bars, meta
@@ -642,6 +693,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--days", type=int, default=60, help="Kac gunluk gecmis (varsayilan 60).")
     ap.add_argument("--source", choices=["auto", "bulk", "rest"], default="auto")
     ap.add_argument("--out-dir", type=str, default=None, help="Cikti klasoru.")
+    ap.add_argument("--start", type=str, default=None, help="Baslangic tarihi (2022-05-01).")
+    ap.add_argument("--end", type=str, default=None, help="Bitis tarihi (2022-06-15).")
+    ap.add_argument("--tag", type=str, default=None, help="Dosya adina eklenecek etiket.")
     ap.add_argument("--probe-only", action="store_true", help="Sadece sembolleri olc, indirme.")
     args = ap.parse_args(argv)
 
@@ -656,7 +710,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if chosen else 1
 
     bars, meta = fetch_history(
-        symbol=args.symbol, days=args.days, source=args.source, out_dir=args.out_dir
+        symbol=args.symbol, days=args.days, source=args.source, out_dir=args.out_dir,
+        start=args.start, end=args.end, tag=args.tag
     )
     summarize(bars, meta)
     return 0 if not bars.empty else 1

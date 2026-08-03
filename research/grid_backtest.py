@@ -110,6 +110,51 @@ def build_levels(
     raise ValueError(f"Bilinmeyen spacing: {spacing}")
 
 
+def select_range_from_warmup(
+    df: pd.DataFrame,
+    warmup_days: float,
+    pad_pct: float = 0.0,
+) -> tuple[float, float, pd.DataFrame, pd.DataFrame]:
+    """Aralığı YALNIZCA ilk ``warmup_days`` günün fiyatlarından belirler.
+
+    **Neden şart?** Aralığı dönemin tamamına bakarak seçmek (örn. "dönemin en
+    düşüğü alt sınır olsun") look-ahead'dir: gerçekte grid'i kurarken geleceği
+    bilemezsiniz. O yanlış kurulum, grid'i asla kırılmayacak bir bant içinde
+    gösterir ve çöküş riskini tamamen görünmez kılar.
+
+    Bu fonksiyon ısınma penceresini **işlem dışı** tutar: o günler yalnızca
+    gözlenir, aralık onlardan türetilir, işlem penceresi ondan SONRA başlar.
+
+    Args:
+        df: OHLCV verisi.
+        warmup_days: Gözlem penceresi (gün).
+        pad_pct: Aralığa eklenecek pay (üstten ve alttan, oran).
+
+    Returns:
+        ``(alt, ust, isinma_verisi, islem_verisi)``.
+
+    Raises:
+        ValueError: Isınma penceresi veriyi tümüyle tüketiyorsa veya
+            pencerede geçerli fiyat yoksa.
+    """
+    if df.empty:
+        raise ValueError("Boş veri.")
+    cutoff = df.index[0] + pd.Timedelta(days=float(warmup_days))
+    warmup = df.loc[df.index < cutoff]
+    trade = df.loc[df.index >= cutoff]
+    if warmup.empty:
+        raise ValueError("Isınma penceresi boş.")
+    if trade.empty:
+        raise ValueError(
+            f"Isınma ({warmup_days} gün) tüm veriyi tüketti; işlem dönemi kalmadı."
+        )
+    lo = float(warmup["low"].min())
+    hi = float(warmup["high"].max())
+    if not (0 < lo < hi):
+        raise ValueError(f"Isınma penceresinden geçerli aralık çıkmadı: {lo}-{hi}")
+    return lo * (1.0 - pad_pct), hi * (1.0 + pad_pct), warmup, trade
+
+
 def grid_step_pct(levels: np.ndarray) -> float:
     """Ortalama kademe adımını yüzde olarak döndürür.
 
@@ -160,16 +205,34 @@ def run_grid_backtest(
         if col not in df.columns:
             raise ValueError(f"Eksik sütun: {col}")
 
+    # --- Aralık seçimi (look-ahead'siz) ---------------------------------- #
+    warmup_info: dict[str, Any] = {"kullanildi": False}
+    if c.lower_price is not None and c.upper_price is not None:
+        lower, upper = c.lower_price, c.upper_price
+    elif c.range_warmup_days and c.range_warmup_days > 0:
+        lower, upper, warm, df = select_range_from_warmup(
+            df, c.range_warmup_days, c.range_pad_pct
+        )
+        warmup_info = {
+            "kullanildi": True,
+            "gun": c.range_warmup_days,
+            "bar": int(len(warm)),
+            "baslangic": warm.index[0],
+            "bitis": warm.index[-1],
+        }
+    else:
+        p0 = float(df["open"].iloc[0])
+        lower = p0 * (1.0 - c.auto_range_pct)
+        upper = p0 * (1.0 + c.auto_range_pct)
+
     close = df["close"].to_numpy(dtype="float64")
     high = df["high"].to_numpy(dtype="float64")
     low = df["low"].to_numpy(dtype="float64")
     n = len(df)
-
-    # --- Aralık --------------------------------------------------------- #
     p0 = float(df["open"].iloc[0])
-    lower = c.lower_price if c.lower_price is not None else p0 * (1.0 - c.auto_range_pct)
-    upper = c.upper_price if c.upper_price is not None else p0 * (1.0 + c.auto_range_pct)
     levels = build_levels(lower, upper, c.n_levels, c.spacing)
+    # Stop seviyesi başlangıç alt sınırına göre sabitlenir (grid kaysa bile).
+    stop_price = lower * (1.0 - c.stop_loss_pct) if c.stop_loss_pct is not None else None
 
     slip = c.slippage_bps / 10_000.0
     quote_per_level = c.total_capital / c.n_levels
@@ -197,9 +260,54 @@ def run_grid_backtest(
     range_broken = False
     prev_close = p0
 
+    stopped = False
+    stop_time: Any = None
+    stop_realized = 0.0
+
     for i in range(n):
         ts = df.index[i]
         hi, lo, cl = high[i], low[i], close[i]
+
+        # --- STOP-LOSS: alt sınırın X% altına inildiyse her şeyi sat, dur --- #
+        # Kötümser icra: satış tam stop fiyatından değil, o barın DÜŞÜĞÜNDEN
+        # yapılır — sert çöküşte stop emri genelde daha kötü dolar (gap).
+        if stop_price is not None and not stopped and lo <= stop_price:
+            fill = min(stop_price, lo) * (1.0 - slip)
+            for k in range(len(held_qty)):
+                if held_qty[k] <= 0:
+                    continue
+                qty = held_qty[k]
+                proceeds = qty * fill
+                commission = proceeds * c.commission_rate
+                net = proceeds - commission
+                pnl = net - held_cost[k]
+                cash += net
+                realized += pnl
+                stop_realized += pnl
+                total_cost += commission + proceeds * slip
+                pairs.append({
+                    "kademe": k, "alis_zamani": held_time[k], "satis_zamani": ts,
+                    "alis_maliyeti": held_cost[k], "satis_neti": net, "kar": pnl,
+                    "kar_orani": pnl / held_cost[k] if held_cost[k] else 0.0,
+                })
+                trades.append({
+                    "zaman": ts, "yon": "STOP-SAT", "kademe": k, "fiyat": fill,
+                    "miktar": qty, "tutar": proceeds, "komisyon": commission,
+                })
+                held_qty[k] = 0.0
+                held_cost[k] = 0.0
+                held_target[k] = 0.0
+                held_time[k] = None
+            stopped = True
+            stop_time = ts
+
+        if stopped:
+            # Grid durdu: bundan sonra yalnızca nakit tutulur.
+            cash_curve[i] = cash
+            inv_curve[i] = 0.0
+            equity[i] = cash
+            prev_close = cl
+            continue
 
         # --- Hareketli aralık: fiyat üst sınırı aşarsa grid bir kademe kayar - #
         # En alttaki kademe düşürülür, tepeye yeni bir kademe eklenir (klasik
@@ -306,6 +414,11 @@ def run_grid_backtest(
         remaining_cost, total_cost, len(pairs), len(trades), skipped_buys,
         grid_shifts, below_lower, above_upper, range_broken, levels, c, n,
     )
+    metrics["stop_tetiklendi"] = bool(stopped)
+    metrics["stop_zamani"] = stop_time
+    metrics["stop_fiyati"] = stop_price
+    metrics["stopta_gerceklesen_kz"] = stop_realized
+    metrics["isinma"] = warmup_info
 
     return GridResult(
         trades=pd.DataFrame(trades),
@@ -321,6 +434,8 @@ def run_grid_backtest(
             "alt_sinir": float(levels[0]), "ust_sinir": float(levels[-1]),
             "commission_rate": c.commission_rate, "slippage_bps": c.slippage_bps,
             "gidis_donus_maliyet": 2.0 * (c.commission_rate + c.slippage_bps / 10_000.0),
+            "stop_loss_pct": c.stop_loss_pct,
+            "isinma_gun": c.range_warmup_days if warmup_info["kullanildi"] else None,
         },
     )
 

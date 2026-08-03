@@ -695,3 +695,79 @@ katmandır ve testlerde enjekte edilir (`getter` / `PriceSources`). Böylece
 üçgen matematiği, ask/bid yönü, komisyon düşümü, prim formülü ve `--watch`
 sayaçları internet olmadan doğrulanır. `--watch` döngüleri `sleeper`/`clock`
 enjeksiyonuyla anında test edilir.
+
+---
+
+## 14. Çöküş deneyi — grid'in en kötü senaryosu
+
+`research/tools/crash_experiment.py`, grid'i **sert düşüş dönemlerinde** stres
+testine sokar. Amaç para kazandığını göstermek değil, **en kötü senaryoda ne
+kaybettiğini ölçmektir**. Grid'i yalnızca fiyatın bantta salındığı sakin bir
+dönemde görmek (bölüm 12'deki +%2.9 gerçekleşmiş kâr gibi) yanıltıcıdır.
+
+```bash
+python -m research.tools.crash_experiment --download    # once veriyi indir
+python -m research.tools.crash_experiment
+python -m research.tools.crash_experiment --synthetic   # veri yoksa motoru gor
+```
+
+Hedeflenen pencereler: **2021 Mayıs** (Çin yasağı), **2022 Mayıs** (LUNA/UST),
+**2022 Kasım** (FTX). `fetch_binance.py` artık `--start` / `--end` / `--tag`
+kabul ediyor; her dönem ayrı parquet'e yazılır (dosya adı sembol + etiket +
+tarih taşır, dönemler birbirinin üstüne yazmaz).
+
+### Look-ahead'siz aralık seçimi (deneyin en kritik parçası)
+
+Grid aralığını dönemin **tamamına** bakarak seçmek klasik bir look-ahead
+hatasıdır: gerçekte grid'i kurarken geleceği bilemezsiniz. O yanlış kurulum,
+grid'i asla kırılmayacak bir bantta gösterip çöküş riskini tamamen görünmez
+kılar.
+
+Bunun yerine aralık **yalnızca ilk 7 günün** fiyat aralığından türetilir
+(`GridConfig.range_warmup_days`). O 7 gün **işlem yapılmadan** gözlenir; işlem
+ondan sonra başlar. Böylece "grid kuruldu, sonra fiyat çöktü" senaryosu
+gerçekçi simüle edilir. `test_range_comes_only_from_warmup_window` bu güvenceyi
+sabitler: ısınmadan türetilen alt sınır, dönemin dibini **görmemelidir**.
+
+### Stop-loss'lu varyant
+
+`GridConfig.stop_loss_pct`: fiyat alt sınırın X% altına inerse grid **tüm
+pozisyonu satar ve durur** — düşen bıçağı yakalamayı bırakır. Kötümser icra:
+satış tam stop fiyatından değil, o barın **düşüğünden** yapılır (sert çöküşte
+stop emirleri genelde daha kötü dolar). Stop sonrası envanter sıfırdır ve
+sermaye nakitte sabit kalır.
+
+### Sonuçlar (SENTETİK stres senaryoları)
+
+> Binance indirmesi bu ortamda yapılamadı (egress politikası). Aşağıdaki
+> seriler gerçek olayların **büyüklüğünü** taklit eden kurgusal fiyat
+> yollarıdır. Motorun çöküşte nasıl davrandığını gösterirler; "2022 Mayıs'ta
+> şunu kazanırdınız" demezler. Gerçek sayılar için önce `--download`.
+
+| senaryo (dip) | static | static+stop | trailing | trailing+stop |
+|---|---|---|---|---|
+| Çin yasağı (−63%) | **−13.76%** | −2.00% | −13.76% | −2.00% |
+| LUNA/UST (−55%) | **−9.21%** | −1.09% | −9.21% | −1.09% |
+| FTX (−47%) | **−11.98%** | −2.52% | −11.98% | −2.52% |
+
+Max drawdown sırasıyla: −16.3% / −3.1%, −10.3% / −1.7%, −13.4% / −4.1%.
+
+**Üç bulgu:**
+
+1. **Gerçekleşmiş kâr yanıltıyor.** Çin senaryosunda gerçekleşmiş kâr
+   **+%0.49** ama toplam **−%13.76**. Aradaki fark, elde kalan ~10.800 TL'lik
+   envanterin gerçekleşmemiş zararı. Yalnızca gerçekleşmiş kâr raporlansaydı
+   strateji kârlı görünecekti.
+2. **Trailing çöküşte HİÇBİR koruma sağlamıyor.** Üç senaryonun üçünde de
+   trailing = static. Sebep basit: trailing yalnızca fiyat **üst sınırı**
+   aştığında kayar; çöküşte fiyat hiç yukarı gitmediği için kaydırma
+   tetiklenmez. Araç bu eşitliği tespit edip açıkça yazıyor.
+3. **Stop-loss zararın %79-88'ini önlüyor.** Ancak bu bir kazanç değil, daha
+   küçük bir kayıptır — üç senaryoda da sonuç **negatif**.
+
+Aralık **üç senaryonun üçünde de kırıldı** (%100), pozitif getiri oranı **%0**.
+
+**Dürüst kıyas:** grid bu senaryolarda al-ve-tut'tan iyi (al-tut −47%…−57%).
+Ama bu grid'in iyi olduğunu değil, çöküşte **nakitte kalmanın** iyi olduğunu
+gösterir — stop-loss varyantının kazancı erken nakde geçmekten geliyor, grid
+mekaniğinden değil.

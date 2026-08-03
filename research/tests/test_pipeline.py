@@ -992,6 +992,186 @@ def test_grid_trailing_mode_shifts_range_up() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Çöküş deneyi: stop-loss ve look-ahead'siz aralık seçimi
+# --------------------------------------------------------------------------- #
+
+
+def _hourly_path(prices: list[float], start: str = "2026-01-01") -> pd.DataFrame:
+    """Saatlik OHLCV (high/low ardışık kapanışları kapsar)."""
+    idx = pd.date_range(start, periods=len(prices), freq="1h", tz="UTC")
+    p = np.asarray(prices, dtype="float64")
+    prev = np.concatenate([[p[0]], p[:-1]])
+    return pd.DataFrame(
+        {"open": prev, "high": np.maximum(prev, p), "low": np.minimum(prev, p),
+         "close": p, "volume": np.ones(len(p))},
+        index=idx,
+    )
+
+
+def test_range_comes_only_from_warmup_window() -> None:
+    """EN KRİTİK: aralık SADECE ilk N günden türetilmeli, sonrası görülmemeli."""
+    from ..grid_backtest import select_range_from_warmup
+
+    # Ilk 7 gun 100-110 bandinda; 8. gunden sonra 50'ye cokuyor.
+    calm = [100.0 + (i % 11) for i in range(7 * 24)]
+    crash = list(np.linspace(100.0, 50.0, 5 * 24))
+    df = _hourly_path(calm + crash)
+
+    lo, hi, warm, trade = select_range_from_warmup(df, warmup_days=7.0)
+    assert len(warm) == 7 * 24, "Isinma tam 7 gun olmali."
+    assert len(trade) == len(crash), "Islem donemi isinmadan SONRA baslamali."
+    assert warm.index[-1] < trade.index[0], "Pencereler cakismamali."
+
+    # Aralik yalnizca sakin donemden gelmeli: cokus dibini (50) GORMEMELI.
+    assert abs(lo - 100.0) < 1e-9, f"Alt sinir isinmanin dibi olmali, bulunan {lo}"
+    assert abs(hi - 110.0) < 1e-9, f"Ust sinir isinmanin tepesi olmali, bulunan {hi}"
+    assert lo > df["low"].min(), "Look-ahead: aralik donem dibini gormus!"
+
+
+def test_warmup_range_is_used_by_engine_and_excludes_warmup_from_trading() -> None:
+    """Motor ısınma aralığını kullanmalı ve o dönemde işlem yapmamalı."""
+    from ..config import GridConfig
+    from ..grid_backtest import run_grid_backtest
+
+    calm = [100.0 + (i % 11) for i in range(7 * 24)]
+    crash = list(np.linspace(100.0, 60.0, 10 * 24))
+    df = _hourly_path(calm + crash)
+
+    cfg = GridConfig(lower_price=None, upper_price=None, range_warmup_days=7.0,
+                     n_levels=11, total_capital=11_000.0, spacing="linear",
+                     commission_rate=0.0, slippage_bps=0.0)
+    res = run_grid_backtest(df, cfg)
+
+    assert res.metrics["isinma"]["kullanildi"] is True
+    assert abs(res.config["alt_sinir"] - 100.0) < 1e-9
+    assert abs(res.config["ust_sinir"] - 110.0) < 1e-9
+    # Sermaye egrisi yalnizca ISLEM donemini kapsamali.
+    assert res.equity.index[0] >= df.index[7 * 24], "Isinma doneminde islem olmamali."
+    if not res.trades.empty:
+        assert res.trades["zaman"].min() >= df.index[7 * 24]
+
+
+def test_stop_loss_triggers_below_threshold_and_halts_trading() -> None:
+    """Stop-loss alt sınırın X% altında tetiklenmeli ve grid TAMAMEN durmalı."""
+    from ..config import GridConfig
+    from ..grid_backtest import run_grid_backtest
+
+    # 100'den 50'ye duz dusus; alt sinir 90, stop %5 alti = 85.5.
+    df = _hourly_path(list(np.linspace(100.0, 50.0, 200)))
+    base = dict(lower_price=90.0, upper_price=110.0, n_levels=11,
+                total_capital=11_000.0, spacing="linear", range_warmup_days=0.0,
+                commission_rate=0.0, slippage_bps=0.0)
+
+    stopped = run_grid_backtest(df, GridConfig(**base, stop_loss_pct=0.05))
+    plain = run_grid_backtest(df, GridConfig(**base, stop_loss_pct=None))
+
+    assert stopped.metrics["stop_tetiklendi"] is True
+    assert plain.metrics["stop_tetiklendi"] is False
+    assert abs(stopped.metrics["stop_fiyati"] - 85.5) < 1e-9
+
+    # Stop sonrasi: envanter sifir, sermaye sabit (yalnizca nakit).
+    assert stopped.metrics["elde_kalan_miktar"] == 0.0
+    assert stopped.metrics["gerceklesmemis_kz"] == 0.0
+    stop_ts = stopped.metrics["stop_zamani"]
+    after = stopped.inventory.loc[stopped.inventory.index >= stop_ts]
+    assert (after == 0.0).all(), "Stop sonrasi envanter tasinmamali."
+    eq_after = stopped.equity.loc[stopped.equity.index > stop_ts]
+    if len(eq_after) > 1:
+        assert eq_after.std() < 1e-9, "Stop sonrasi sermaye degismemeli (nakitte)."
+
+    # Stop-loss cokuste zarari AZALTMALI.
+    assert stopped.metrics["toplam_kz"] > plain.metrics["toplam_kz"], \
+        "Stop-loss dusen bicagi yakalamayi birakip zarari azaltmali."
+    assert stopped.metrics["max_drawdown"] > plain.metrics["max_drawdown"]
+
+
+def test_stop_loss_does_not_fire_when_range_holds() -> None:
+    """Fiyat aralıkta kalırsa stop tetiklenmemeli (gereksiz çıkış olmamalı)."""
+    from ..config import GridConfig
+    from ..grid_backtest import run_grid_backtest
+
+    df = _hourly_path([100.0 + 5 * np.sin(i / 6.0) for i in range(300)])
+    cfg = GridConfig(lower_price=90.0, upper_price=110.0, n_levels=11,
+                     total_capital=11_000.0, spacing="linear", range_warmup_days=0.0,
+                     stop_loss_pct=0.05, commission_rate=0.0, slippage_bps=0.0)
+    res = run_grid_backtest(df, cfg)
+    assert res.metrics["stop_tetiklendi"] is False
+    assert res.metrics["aralik_kirildi"] is False
+
+
+def test_crash_experiment_variants_and_summary() -> None:
+    """Varyant üretimi ve özet tablo doğru kurulmalı."""
+    from ..tools.crash_experiment import CRASH_PERIODS, build_variants, run_period, summary_table
+
+    v = build_variants(stop_pct=0.05)
+    assert set(v) == {"static", "trailing", "static+stop", "trailing+stop"}
+    assert v["static"].stop_loss_pct is None
+    assert v["static+stop"].stop_loss_pct == 0.05
+    assert all(c.lower_price is None for c in v.values()), \
+        "Aralik isinmadan turetilmeli, sabit sinir verilmemeli."
+
+    calm = [100.0 + (i % 9) for i in range(8 * 24)]
+    crash = list(np.linspace(100.0, 55.0, 12 * 24))
+    df = _hourly_path(calm + crash)
+    table, info = run_period("test", df, stop_pct=0.05)
+
+    assert len(table) == 4, "Dort varyant da calismali."
+    assert set(table["varyant"]) == set(v)
+    assert info["isinma"]["kullanildi"] is True
+    assert table["aralik_kirildi"].all(), "Cokuste aralik kirilmali."
+
+    s = summary_table(table)
+    assert ("toplam_getiri", "static") in s.columns
+    assert ("max_drawdown", "static+stop") in s.columns
+
+
+def test_synthetic_crash_actually_crashes() -> None:
+    """Sentetik senaryo gerçekten sert düşüş içermeli (stres testi anlamlı olsun)."""
+    from ..tools.crash_experiment import CRASH_PERIODS, synthetic_crash
+
+    for i, p in enumerate(CRASH_PERIODS):
+        df = synthetic_crash(p, seed=i)
+        dip = float(df["close"].min() / df["close"].iloc[0] - 1.0)
+        assert dip < -0.20, f"{p.tag}: dusus yetersiz ({dip:.1%})"
+        assert df.index.is_monotonic_increasing and not df.index.has_duplicates
+        assert (df["high"] >= df["low"]).all()
+
+
+def test_fetch_binance_accepts_explicit_date_range() -> None:
+    """--start/--end tarihleri doğru çözülmeli ve dosya adına yansımalı."""
+    from datetime import datetime as _dt
+
+    from ..tools.fetch_binance import fetch_history, klines_to_frame, parse_date
+
+    assert parse_date("2022-05-01") == _dt(2022, 5, 1, tzinfo=timezone.utc)
+    assert parse_date(None) is None
+
+    start_ms = int(_dt(2022, 5, 1, tzinfo=timezone.utc).timestamp() * 1000)
+    captured: dict[str, Any] = {}
+
+    def fake(symbol, a, b):
+        captured["a"], captured["b"] = a, b
+        return klines_to_frame(_kline_rows(start_ms, 3 * 1440, price=30_000.0)), {"kaynak": "test"}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        import research.tools.fetch_binance as fb
+
+        orig = fb.download_rest
+        fb.download_rest = fake  # type: ignore[assignment]
+        try:
+            bars, meta = fetch_history(symbol="BTCUSDT", source="rest", out_dir=tmp,
+                                       start="2022-05-01", end="2022-05-04", tag="luna2022")
+        finally:
+            fb.download_rest = orig  # type: ignore[assignment]
+
+    assert captured["a"] == _dt(2022, 5, 1, tzinfo=timezone.utc)
+    assert captured["b"] == _dt(2022, 5, 4, tzinfo=timezone.utc)
+    name = Path(meta["dosya"]).name
+    assert "luna2022" in name and "20220501" in name, f"Donem etiketi dosya adinda olmali: {name}"
+    assert len(bars) > 0
+
+
+# --------------------------------------------------------------------------- #
 # Üçgen arbitraj ölçüm aracı
 # --------------------------------------------------------------------------- #
 

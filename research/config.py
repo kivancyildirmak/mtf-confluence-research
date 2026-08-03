@@ -397,6 +397,18 @@ class GridConfig:
     regime_window: str = "7D"
     #: Rejim etiketlemesinde "yatay" sayılacak azami net değişim (mutlak oran).
     sideways_threshold: float = 0.02
+    #: Aralığı ilk N günün fiyat aralığından türet (0 = kapalı).
+    #:
+    #: SIZINTI KARŞITI: Aralığı dönemin TAMAMINA bakarak seçmek klasik bir
+    #: look-ahead hatasıdır — gerçekte grid'i kurarken geleceği bilemezsiniz.
+    #: Bu ayar açıkken ilk ``range_warmup_days`` gün yalnızca GÖZLENİR (işlem
+    #: yok), aralık o pencereden belirlenir ve işlem ondan SONRA başlar.
+    range_warmup_days: float = 7.0
+    #: Isınma penceresinden türetilen aralığa eklenecek pay (üstten ve alttan).
+    range_pad_pct: float = 0.0
+    #: Stop-loss: fiyat alt sınırın bu oran ALTINA inerse tüm pozisyon satılır
+    #: ve grid durur. ``None`` = stop yok (düşen bıçağı yakalamaya devam eder).
+    stop_loss_pct: float | None = None
 
 
 # --------------------------------------------------------------------------- #
