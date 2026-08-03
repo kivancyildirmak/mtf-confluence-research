@@ -617,3 +617,81 @@ Tek bir 60 günlük toplam sayı, hangi rejimin baskın olduğunu gizler. Bu yü
 dönem haftalık pencerelere bölünür; her pencere için getiri, drawdown, fiyatın
 net değişimi ve **rejim etiketi** (`yukselis` / `dusus` / `yatay`) raporlanır.
 Beklenen ve gözlenen davranış: grid yatay piyasada kazanır, düşüşte kaybeder.
+
+---
+
+## 13. Ölçüm araçları (işlem yapmaz, anahtarsız)
+
+İkisi de yalnızca **public fiyat okur**. Emir göndermez, anahtar/HMAC
+kullanmaz, `submit_order`'a dokunmaz. Amaçları "fırsat var mı?" sorusunu
+**ölçmektir** — kâr vaat etmek değil.
+
+### 13.1 Üçgen arbitraj — `tools/triangular_paribu.py`
+
+```bash
+python -m research.tools.triangular_paribu
+python -m research.tools.triangular_paribu --list-only
+python -m research.tools.triangular_paribu --watch 300 --interval 5
+python -m research.tools.triangular_paribu --start TL --legs
+```
+
+**Önce parite evreni raporlanır.** Üçgen için coin-coin paritesi (örn.
+`BTC_USDT`) şarttır; borsada her şey TL'ye karşı işlem görüyorsa
+`TL -> X -> Y -> TL` döngüsünün orta bacağı yoktur ve üçgen **yapısal olarak
+imkânsızdır**. Araç bunu açıkça yazar ve ölçüm yapmadan durur.
+
+**Gerçekçi fiyatlama.** Orta fiyat (mid) kullanmak bu işin en yaygın hatasıdır
+ve olmayan fırsatları var gösterir. Her bacak gerçekte dolacağı taraftan
+fiyatlanır: alıyorsan `lowestAsk` ödersin, satıyorsan `highestBid` alırsın.
+Spread üç bacakta üç kez aleyhine çalışır.
+
+**Komisyon zorunlu.** 3 işlem × `%0.2` = `%0.6`. Örnek çıktı (gerçekçi
+spread'lerle, tutarlı fiyatlar):
+
+```
+  dongu                            brut %      net %  kar
+  TL -> USDT -> BTC -> TL         -0.1201    -0.7182  hayir
+  TL -> ETH -> USDT -> TL         -0.1279    -0.7259  hayir
+
+  >>> NET POZITIF DONGU YOK. Su anda uygulanabilir firsat BULUNMUYOR.
+      Brut getiri (-0.1201%) komisyon HARIC bile negatif:
+      fiyatlar tutarli, aradaki fark tamamen spread'ten geliyor.
+```
+
+Net pozitif döngü **yoksa bunu açıkça yazar**; "fırsat var" gibi göstermez.
+Fırsat çıktığında da uyarır: ölçüm anlıktır ve **defter derinliği kontrol
+edilmez** — ilan edilen ask/bid yalnızca en üst seviyedir.
+
+**`--watch`**: fırsatlar anlıktır, tek ölçüm yanıltır. Bu mod süre boyunca
+örnekler ve kaç ölçümde net-pozitif fırsat çıktığını, döngü bazında ortalama/en
+iyi net getiriyi sayar.
+
+### 13.2 TL primi — `tools/cross_exchange.py`
+
+```bash
+python -m research.tools.cross_exchange
+python -m research.tools.cross_exchange --watch 600 --interval 10
+```
+
+`TL primi = (Paribu_BTC_TL / global_BTC_TL - 1) × 100`, burada global fiyat
+Binance'ten gelir: önce doğrudan `BTCTRY` denenir, yoksa `BTCUSDT × USDTTRY`.
+
+> **Bu bir gözlem aracıdır, işlem stratejisi değildir.** Ölçülen fark **tek
+> borsayla yakalanamaz**: iki borsada da aynı anda bakiye tutmak, transfer
+> süresi + çekim ücretlerini göze almak, transfer sırasında primin kapanma
+> riskini üstlenmek ve her iki tarafta komisyon + spread ödemek gerekir. Prim,
+> TL'nin konvertibilite maliyetini ve yerel talebi yansıtır; **kalıcı olması
+> normaldir ve kalıcı olması onu ücretsiz para yapmaz.** Bu uyarı aracın
+> çıktısının en başında da basılır.
+
+`--watch` primin ortalamasını, standart sapmasını, min/maks ve medyanını verir.
+Std sapma ortalamanın çeyreğinden küçükse araç "prim dalgalanmıyor, kalıcı bir
+seviye" yorumunu yapar — yani arbitraj fırsatı değil, yapısal fiyat farkı.
+
+### 13.3 Ağsız test edilebilirlik
+
+Her iki aracın da hesap çekirdeği **saf fonksiyonlardır**; ağ yalnızca ince bir
+katmandır ve testlerde enjekte edilir (`getter` / `PriceSources`). Böylece
+üçgen matematiği, ask/bid yönü, komisyon düşümü, prim formülü ve `--watch`
+sayaçları internet olmadan doğrulanır. `--watch` döngüleri `sleeper`/`clock`
+enjeksiyonuyla anında test edilir.

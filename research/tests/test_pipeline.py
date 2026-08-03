@@ -992,6 +992,239 @@ def test_grid_trailing_mode_shifts_range_up() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Üçgen arbitraj ölçüm aracı
+# --------------------------------------------------------------------------- #
+
+
+def _ticker(pairs: dict[str, tuple[float, float]]) -> dict:
+    """``{"BTC_TL": (ask, bid)}`` -> Paribu ticker biçimi."""
+    return {
+        sym: {"last": (a + b) / 2, "lowestAsk": a, "highestBid": b, "volume": "1"}
+        for sym, (a, b) in pairs.items()
+    }
+
+
+def test_triangular_universe_detects_missing_coin_coin_pairs() -> None:
+    """Sadece TL pariteleri varsa üçgen YAPISAL olarak imkânsız — bu raporlanmalı."""
+    from ..tools.triangular_paribu import describe_universe
+
+    only_tl = _ticker({"BTC_TL": (100.0, 99.0), "ETH_TL": (10.0, 9.9),
+                       "USDT_TL": (34.0, 33.9)})
+    u = describe_universe(only_tl)
+    assert u["coin_coin"] == [], "TL disi parite yok."
+    assert u["ucgen_mumkun"] is False, "Ucgen imkansiz olarak raporlanmali."
+
+    with_cross = dict(only_tl, **_ticker({"BTC_USDT": (3.0, 2.9)}))
+    u2 = describe_universe(with_cross)
+    assert u2["coin_coin"] == ["BTC_USDT"]
+    assert u2["ucgen_mumkun"] is True
+    assert set(u2["para_birimleri"]) == {"BTC", "ETH", "USDT", "TL"}
+
+
+def test_triangular_uses_ask_when_buying_and_bid_when_selling() -> None:
+    """GERÇEKÇİ yön: alışta lowestAsk ödenmeli, satışta highestBid alınmalı."""
+    from ..tools.triangular_paribu import build_markets, convert
+
+    markets = build_markets(_ticker({"BTC_TL": (110.0, 90.0)}))
+
+    # TL -> BTC: BTC ALIYORUZ, ask (110) odemeliyiz.
+    out, leg = convert(1100.0, "TL", "BTC", markets, fee=0.0)
+    assert leg["yon"] == "AL" and leg["fiyat"] == 110.0
+    assert abs(out - 10.0) < 1e-12, "1100 TL / 110 ask = 10 BTC"
+
+    # BTC -> TL: BTC SATIYORUZ, bid (90) almaliyiz.
+    out2, leg2 = convert(10.0, "BTC", "TL", markets, fee=0.0)
+    assert leg2["yon"] == "SAT" and leg2["fiyat"] == 90.0
+    assert abs(out2 - 900.0) < 1e-12, "10 BTC * 90 bid = 900 TL"
+
+    # Ortalama fiyat kullanilsaydi ikisi de 100 olur, spread kaybi gorunmezdi.
+    assert out2 < 1100.0, "Spread her iki bacakta da aleyhe calismali."
+
+
+def test_triangular_deducts_three_commissions() -> None:
+    """Net getiri brütten TAM 3 işlem komisyonu kadar düşük olmalı."""
+    from ..tools.triangular_paribu import build_markets, evaluate_cycle
+
+    # Spread'siz, tam tutarli fiyatlar -> brut getiri tam 0.
+    markets = build_markets(_ticker({
+        "BTC_TL": (100.0, 100.0),
+        "USDT_TL": (10.0, 10.0),
+        "BTC_USDT": (10.0, 10.0),
+    }))
+    fee = 0.002
+    r = evaluate_cycle(("TL", "BTC", "USDT"), markets, fee)
+    assert r is not None
+    assert abs(r["brut_getiri"]) < 1e-12, "Tutarli fiyatlarda brut getiri 0 olmali."
+    assert abs(r["net_getiri"] - ((1 - fee) ** 3 - 1)) < 1e-12
+    assert abs(r["toplam_komisyon"] - 3 * fee) < 1e-15
+    assert r["kar_var"] is False
+    assert len(r["bacaklar"]) == 3
+
+
+def test_triangular_reports_no_opportunity_honestly() -> None:
+    """Brüt pozitif ama komisyon sonrası negatifse 'fırsat var' DENMEMELİ."""
+    from ..tools.triangular_paribu import measure
+
+    # BTC_USDT hafif yanlis fiyatli: brut kucuk pozitif, ama %0.6 komisyonun alti.
+    payload = _ticker({
+        "BTC_TL": (100.0, 99.98),
+        "USDT_TL": (10.0, 9.998),
+        "BTC_USDT": (10.01, 10.008),
+    })
+    m = measure(payload, fee=0.002, start="TL")
+    assert m["dongu_sayisi"] > 0
+    best = m["sonuclar"][0]
+    assert best["net_getiri"] < 0, "Komisyon brut kazanci yutmali."
+    assert m["net_pozitif"] == [], "Net pozitif dongu YOK olarak raporlanmali."
+
+
+def test_triangular_finds_genuine_opportunity_when_it_exists() -> None:
+    """Gerçekten kârlı bir tutarsızlık varsa araç onu bulabilmeli."""
+    from ..tools.triangular_paribu import measure
+
+    # BTC_USDT belirgin sekilde ucuz -> TL->BTC->USDT->TL karli olmali.
+    payload = _ticker({
+        "BTC_TL": (100.0, 99.9),
+        "USDT_TL": (10.0, 9.99),
+        "BTC_USDT": (9.0, 8.99),   # BTC, USDT cinsinden cok ucuz
+    })
+    m = measure(payload, fee=0.002)
+    assert len(m["net_pozitif"]) > 0, "Gercek firsat bulunamadi."
+    assert m["sonuclar"][0]["net_getiri"] > 0
+
+
+def test_triangular_watch_counts_opportunities_without_network() -> None:
+    """--watch modu ağsız çalışmalı ve fırsatlı ölçümleri saymalı."""
+    from ..tools.triangular_paribu import watch
+
+    karli = _ticker({"BTC_TL": (100.0, 99.9), "USDT_TL": (10.0, 9.99),
+                     "BTC_USDT": (9.0, 8.99)})
+    karsiz = _ticker({"BTC_TL": (100.0, 99.9), "USDT_TL": (10.0, 9.99),
+                      "BTC_USDT": (10.0, 9.99)})
+    seq = [karli, karsiz, karsiz, karli]
+    calls = {"i": 0}
+
+    def getter() -> dict:
+        p = seq[min(calls["i"], len(seq) - 1)]
+        calls["i"] += 1
+        return p
+
+    ticks = {"t": 0.0}
+
+    def clock() -> float:
+        return ticks["t"]
+
+    def sleeper(s: float) -> None:
+        ticks["t"] += s
+
+    w = watch(duration=4.0, interval=1.0, fee=0.002, getter=getter,
+              sleeper=sleeper, clock=clock)
+    assert w["ornek"] == 4 and w["hata"] == 0
+    assert w["firsatli_ornek"] == 2, f"2 firsatli olcum beklenirdi: {w['firsatli_ornek']}"
+    assert abs(w["firsat_orani"] - 0.5) < 1e-9
+    assert w["dongu_bazinda"], "Dongu bazinda ozet uretilmeli."
+
+
+def test_triangular_survives_broken_ticker() -> None:
+    """Bozuk/eksik parite verisi çökmeye yol açmamalı."""
+    from ..tools.triangular_paribu import build_markets, measure
+
+    broken = {
+        "BTC_TL": {"lowestAsk": "0", "highestBid": "abc"},   # gecersiz fiyat
+        "GARIP": {"lowestAsk": "1", "highestBid": "1"},       # ayrisamayan sembol
+        "ETH_TL": {"lowestAsk": "10", "highestBid": "9.9"},
+        "BOS_TL": {},
+    }
+    markets = build_markets(broken)
+    assert ("ETH", "TL") in markets and ("BTC", "TL") not in markets
+    m = measure(broken, fee=0.002)
+    assert m["dongu_sayisi"] == 0, "Ucgen kurulamamali ama cokme de olmamali."
+
+
+# --------------------------------------------------------------------------- #
+# Borsalar arası TL primi
+# --------------------------------------------------------------------------- #
+
+
+def test_cross_exchange_premium_math() -> None:
+    """Prim formülü: (paribu / global - 1) * 100."""
+    from ..tools.cross_exchange import compute_premium
+
+    assert abs(compute_premium(105.0, 100.0) - 5.0) < 1e-12
+    assert abs(compute_premium(97.0, 100.0) - (-3.0)) < 1e-12
+    assert compute_premium(0.0, 100.0) != compute_premium(0.0, 100.0)  # NaN
+    assert compute_premium(100.0, 0.0) != compute_premium(100.0, 0.0)  # NaN
+
+
+def test_cross_exchange_prefers_direct_pair_then_falls_back_to_product() -> None:
+    """BTCTRY varsa doğrudan; yoksa BTCUSDT × USDTTRY kullanılmalı."""
+    from ..tools.cross_exchange import global_btc_try
+
+    price, detail = global_btc_try(lambda s: {"BTCTRY": 3_500_000.0}.get(s))
+    assert price == 3_500_000.0 and detail["yol"] == "dogrudan"
+
+    price2, detail2 = global_btc_try(
+        lambda s: {"BTCUSDT": 100_000.0, "USDTTRY": 34.0}.get(s)
+    )
+    assert abs(price2 - 3_400_000.0) < 1e-6 and detail2["yol"] == "carpim"
+
+    price3, detail3 = global_btc_try(lambda s: None)
+    assert price3 != price3 and detail3["yol"] == "yok", "Hicbiri yoksa NaN."
+
+
+def test_cross_exchange_measure_once_without_network() -> None:
+    """Enjekte edilmiş kaynaklarla ağsız ölçüm yapılabilmeli."""
+    from ..tools.cross_exchange import PriceSources, measure_once
+
+    src = PriceSources(
+        paribu=lambda: _ticker({"BTC_TL": (3_570_000.0, 3_569_000.0)}),
+        binance=lambda s: {"BTCUSDT": 100_000.0, "USDTTRY": 35.0}.get(s),
+    )
+    m = measure_once(src)
+    assert m["gecerli"] is True
+    assert abs(m["global"] - 3_500_000.0) < 1e-6
+    # paribu 'last' = (ask+bid)/2 = 3_569_500
+    assert abs(m["prim_yuzde"] - ((3_569_500 / 3_500_000 - 1) * 100)) < 1e-9
+    assert m["yol"] == "carpim"
+
+
+def test_cross_exchange_watch_summarises_distribution() -> None:
+    """--watch primin ortalama/std/min/maks dağılımını vermeli."""
+    from ..tools.cross_exchange import PriceSources, watch
+
+    primler = [3_500_000.0, 3_535_000.0, 3_570_000.0, 3_605_000.0]  # %0, 1, 2, 3
+    calls = {"i": 0}
+
+    def paribu() -> dict:
+        px = primler[min(calls["i"], len(primler) - 1)]
+        calls["i"] += 1
+        return _ticker({"BTC_TL": (px, px)})
+
+    ticks = {"t": 0.0}
+    src = PriceSources(paribu=paribu,
+                       binance=lambda s: {"BTCUSDT": 100_000.0, "USDTTRY": 35.0}.get(s))
+
+    w = watch(4.0, 1.0, sources=src, sleeper=lambda s: ticks.__setitem__("t", ticks["t"] + s),
+              clock=lambda: ticks["t"], verbose=False)
+    s = w["ozet"]
+    assert s["n"] == 4 and w["hata"] == 0
+    assert abs(s["min"] - 0.0) < 1e-6
+    assert abs(s["maks"] - 3.0) < 1e-6
+    assert abs(s["ortalama"] - 1.5) < 1e-6
+    assert s["std"] > 0 and s["pozitif_oran"] == 0.75
+
+
+def test_cross_exchange_handles_missing_prices() -> None:
+    """Fiyat alınamazsa geçersiz olarak işaretlenmeli, çökmemeli."""
+    from ..tools.cross_exchange import PriceSources, measure_once
+
+    src = PriceSources(paribu=lambda: {}, binance=lambda s: None)
+    m = measure_once(src)
+    assert m["gecerli"] is False
+    assert m["yol"] == "yok"
+
+
+# --------------------------------------------------------------------------- #
 # Yardımcılar
 # --------------------------------------------------------------------------- #
 
