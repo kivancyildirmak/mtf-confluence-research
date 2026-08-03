@@ -7,7 +7,10 @@
 // Giris B        : trend yukari VE close > EMA(20) VE close[1] <= EMA(20)[1]
 // Stop           : giris - 3*ATR(14), sonra (giristen sonraki en yuksek high) - 3*ATR(14)
 //                  math.max ile asla asagi inmez. Sabit hedef yok.
-// Pozisyon       : qty = (strategy.equity * 0.005) / (giris - stop),  pyramiding = 0
+// Pozisyon       : qty = su ucunun en kucugu, pyramiding = 0
+//                    risk bazli     : sermaye * %0.5 / (3*ATR)
+//                    pozisyon siniri : sermaye * %20  / giris
+//                    kayip tavani    : sermaye * %2   / giris
 //
 // Look-ahead notu: tum gostergeler kapanmis bar verisiyle hesaplanir. Kirilim
 // penceresi ta.highest(high, 20)[1] ile ONCEKI bara kadar alinir; barin kendi
@@ -22,7 +25,18 @@
 // her fiyat seviyesinde ayni orani uyguluyor.
 //
 // Komisyon ISLEM BASINA yuzdedir, alista ve satista ayri kesilir:
-// varsayilan %0.30 -> gidis-donus %0.60. Input olarak ayarlanabilir.
+// varsayilan %0.30 -> gidis-donus %0.60.
+//
+// KOMISYONU DEGISTIRMEK ICIN: strategy() parametreleri "const" olmak zorunda,
+// input.float() oraya konulamaz (CE10123: "An argument of 'input float' type
+// was used but a 'const float' is expected"). Gerek de yok - komisyonu
+// derlemeden degistirebilirsiniz:
+//
+//     Ayarlar (dis carki) -> Properties -> Commission
+//
+// Oradaki deger buradaki varsayilani ezer ve strategy.* degiskenlerine (dolayisiyla
+// kose tablosuna) aninda yansir. Sadece "Commission type" alaninin "Percent"
+// kaldigindan emin olun.
 //
 // Maliyetler sadece K/Z'yi etkiler; sinyaller close ve hesaplanan stop
 // seviyesinden uretildigi icin islem SAYISI ve TARIHLERI degismez.
@@ -34,11 +48,7 @@ strategy(
      overlay                 = true,
      initial_capital         = 100000,
      commission_type         = strategy.commission.percent,
-     commission_value        = input.float(0.30, "Komisyon % (islem basina)",
-       minval = 0, step = 0.05, group = "0) Maliyet",
-       tooltip = "Islem BASINA yuzde - alista ve satista ayri kesilir, yani " +
-         "gidis-donus maliyet bunun iki katidir (%0.30 -> %0.60). Kayma " +
-         "(slippage) 0'a alindigi icin kayma maliyeti de bu orana gomulmustur."),
+     commission_value        = 0.30,   // input OLAMAZ - yukaridaki nota bakin
      slippage                = 0,
      process_orders_on_close = true,
      calc_on_every_tick      = false,

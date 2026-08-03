@@ -74,9 +74,21 @@ kucuk cikiyor (BTCIM 2015'te 0.08 TL) ve 5 tick = 0.05 TL fiyatin **%62'sine**
 denk geliyordu. Sabit tick maliyeti fiyat seviyesine gore devasa sapma urettigi
 icin slippage 0'a alindi ve tum maliyet komisyona gomuldu.
 
-`Komisyon %` **input**, varsayilan **0.30**. Islem BASINA uygulanir — alista ve
-satista ayri kesilir, yani gidis-donus maliyet **%0.60**. Test ederken Inputs
-sekmesindeki `0) Maliyet` grubundan degistirebilirsiniz.
+Komisyon varsayilani **%0.30**, islem BASINA — alista ve satista ayri kesilir,
+yani gidis-donus maliyet **%0.60**.
+
+**Komisyonu degistirmek icin Inputs'a bakmayin, Properties'e bakin.**
+`strategy()` parametreleri `const` olmak zorundadir, `input.float()` oraya
+konulamaz (`CE10123: An argument of 'input float' type was used but a
+'const float' is expected`). Gerek de yok — komisyon derlemeden degistirilebilir:
+
+```
+Ayarlar (dis carki) -> Properties -> Commission
+```
+
+Oradaki deger scriptteki varsayilani ezer ve `strategy.*` degiskenlerine,
+dolayisiyla kose tablosuna aninda yansir. `Commission type` alaninin **Percent**
+kaldigindan emin olun. Ayni ekranda slippage'i de gorebilirsiniz — 0 olmali.
 
 Maliyetler sadece K/Z'yi etkiler; sinyaller `close` ve hesaplanan stop
 seviyesinden uretildigi icin islem **sayisi ve tarihleri** degismez. Ayni
