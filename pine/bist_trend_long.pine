@@ -1,0 +1,281 @@
+//@version=6
+// =============================================================================
+// BIST - Long Only Trend Takibi
+// -----------------------------------------------------------------------------
+// Trend filtresi : close > EMA(200) VE EMA(200) > EMA(200)[10]
+// Giris A        : trend yukari VE close > son 20 barin en yuksegi (onceki bara kadar)
+// Giris B        : trend yukari VE close > EMA(20) VE close[1] <= EMA(20)[1]
+// Stop           : giris - 3*ATR(14), sonra (giristen sonraki en yuksek high) - 3*ATR(14)
+//                  math.max ile asla asagi inmez. Sabit hedef yok.
+// Pozisyon       : qty = (strategy.equity * 0.005) / (giris - stop),  pyramiding = 0
+//
+// Look-ahead notu: tum gostergeler kapanmis bar verisiyle hesaplanir. Kirilim
+// penceresi ta.highest(high, 20)[1] ile ONCEKI bara kadar alinir; barin kendi
+// high'i pencereye girseydi close > high gerekirdi ki bu imkansizdir.
+// request.security() kullanilmaz, tek zaman dilimi.
+//
+// slippage = 5 notu: TradingView'de slippage TICK cinsindendir, yuzde degil.
+// BIST hisselerinde mintick genelde 0.01 TL oldugundan 5 tick = 0.05 TL'dir;
+// 20 TL'lik bir hissede bu ~%0.25, 100 TL'lik bir hissede ~%0.05 eder. Yani
+// kayma etkisi fiyat seviyesine gore degisir - semboller arasi karsilastirma
+// yaparken bunu akilda tutun. Kayma ve komisyon sadece K/Z'yi etkiler;
+// sinyaller close ve hesaplanan stop seviyesinden uretildigi icin islem
+// SAYISI ve TARIHLERI bu ayarlardan etkilenmez.
+// =============================================================================
+
+strategy(
+     title                   = "BIST Trend Takibi (Long Only)",
+     shorttitle              = "BIST TREND",
+     overlay                 = true,
+     initial_capital         = 100000,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.05,
+     slippage                = 5,
+     process_orders_on_close = true,
+     calc_on_every_tick      = false,
+     pyramiding              = 0,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     max_bars_back           = 500)
+
+// ─── Girdiler ────────────────────────────────────────────────────────────────
+gT = "1) Tarih araligi"
+startTime  = input.time(timestamp("01 Jan 1990 00:00 +0300"), "Baslangic", group = gT)
+endTime    = input.time(timestamp("01 Jan 2100 00:00 +0300"), "Bitis",     group = gT)
+closeAtEnd = input.bool(true, "Aralik bitince aciktaki pozisyonu kapat", group = gT,
+     tooltip = "Eski %60 / yeni %40 donemlerini ayri olcerken aciktaki pozisyonun " +
+               "sonucu bir sonraki doneme sizmasin diye acik birakilmasi onerilir.")
+
+gS = "2) Strateji"
+entryMode = input.string("A) Kirilim", "Giris modu",
+     options = ["A) Kirilim", "B) Geri cekilme"], group = gS)
+trendLen  = input.int(200,  "Trend EMA uzunlugu",          minval = 1, group = gS)
+slopeLb   = input.int(10,   "Trend egimi karsilastirmasi (bar)", minval = 1, group = gS)
+brkLen    = input.int(20,   "Kirilim penceresi (bar)",     minval = 1, group = gS)
+fastLen   = input.int(20,   "Geri cekilme EMA uzunlugu",   minval = 1, group = gS)
+atrLen    = input.int(14,   "ATR uzunlugu",                minval = 1, group = gS)
+atrMult   = input.float(3.0,"ATR carpani (stop)", minval = 0.1, step = 0.1, group = gS)
+riskPctIn = input.float(0.5,"Islem basina risk (%)", minval = 0.01, step = 0.05, group = gS)
+riskPct   = riskPctIn / 100.0
+
+gE = "3) Cikis / pozisyon"
+exitOnClose = input.bool(true, "Cikis bar kapanisinda (bar ici stop emri yok)", group = gE,
+     tooltip = "Acik (varsayilan): close <= stop oldugunda strategy.close() ile bar " +
+               "kapanisinda cikilir - gun ici doldurma varsayilmaz.\n" +
+               "Kapali: strategy.exit(stop=...) ile bar ici stop emri kullanilir; " +
+               "dolum stop fiyatindan olur ve sonuclar iyimser gorunur.")
+maxPosPct   = input.float(0.0, "Maks pozisyon buyuklugu (% sermaye, 0 = sinirsiz)",
+     minval = 0, step = 5, group = gE,
+     tooltip = "0 birakilirsa spesifikasyondaki formul aynen uygulanir. Dusuk " +
+               "volatiliteli barlarda 3*ATR kucuk kalip pozisyonun sermayeyi asmasi " +
+               "(ortuk kaldirac) mumkundur; bunu sinirlamak icin 100 girin.")
+
+gV = "4) Gorunum"
+showTable = input.bool(true, "Ozet tabloyu goster", group = gV)
+posIn     = input.string("Sag ust", "Tablo konumu",
+     options = ["Sag ust", "Sag alt", "Sol ust", "Sol alt"], group = gV)
+txtSize   = input.string("Kucuk", "Tablo yazi boyutu",
+     options = ["Kucuk", "Normal", "Buyuk"], group = gV)
+
+// ─── Gostergeler ─────────────────────────────────────────────────────────────
+emaTrend     = ta.ema(close, trendLen)
+emaTrendPrev = emaTrend[slopeLb]
+emaFast      = ta.ema(close, fastLen)
+atrVal       = ta.atr(atrLen)
+hhPrev       = ta.highest(high, brkLen)[1]      // onceki bara kadar olan pencere
+
+// Isinma bitmeden hicbir sinyal uretilmez (na karsilastirmalarini engeller).
+ready = not na(emaTrend) and not na(emaTrendPrev) and not na(emaFast) and
+         not na(emaFast[1]) and not na(atrVal) and not na(hhPrev) and atrVal > 0
+
+trendUp     = ready and close > emaTrend and emaTrend > emaTrendPrev
+breakoutSig = ready and close > hhPrev
+pullbackSig = ready and close > emaFast and close[1] <= emaFast[1]
+
+useBreakout = entryMode == "A) Kirilim"
+entrySignal = trendUp and (useBreakout ? breakoutSig : pullbackSig)
+
+inRange = time >= startTime and time <= endTime
+
+// ─── Pozisyon durumu ─────────────────────────────────────────────────────────
+var float stopLevel = na    // gecerli stop seviyesi (asla asagi inmez)
+var float hhSince   = na    // giristen SONRAKI barlarin en yuksek high'i
+var float curRisk   = na    // acik islemde riske edilen tutar (R hesabi icin)
+
+// ─── Istatistik durumu ───────────────────────────────────────────────────────
+var float peakEq        = na
+var float maxDDPct      = 0.0
+var int   lastClosed    = 0
+var int   consecLoss    = 0
+var int   maxConsecLoss = 0
+var float sumWinR       = 0.0
+var int   nWinR         = 0
+var float sumLossR      = 0.0
+var int   nLossR        = 0
+
+// ─── Kapanan islemleri hasat et ──────────────────────────────────────────────
+// process_orders_on_close nedeniyle bir islem bar t'nin kapanisinda kapanir ve
+// strategy.closedtrades bar t+1'de artmis gorunur. Bu blok giris blogundan ONCE
+// calisir; boylece curRisk yeni bir giris tarafindan ezilmeden okunur.
+if strategy.closedtrades > lastClosed
+    for i = lastClosed to strategy.closedtrades - 1
+        p  = strategy.closedtrades.profit(i)          // komisyon dahil net K/Z
+        rr = (na(curRisk) or curRisk <= 0) ? float(na) : p / curRisk
+        if p > 0
+            if not na(rr)
+                sumWinR := sumWinR + rr
+                nWinR   := nWinR + 1
+            consecLoss := 0
+        else if p < 0
+            if not na(rr)
+                sumLossR := sumLossR + rr
+                nLossR   := nLossR + 1
+            consecLoss    := consecLoss + 1
+            maxConsecLoss := consecLoss > maxConsecLoss ? consecLoss : maxConsecLoss
+        else
+            consecLoss := 0
+    lastClosed := strategy.closedtrades
+
+// ─── Islem mantigi ───────────────────────────────────────────────────────────
+// Bar icindeki sira:
+//   1. Pozisyondaysak: once ONCEKI barin sonunda belirlenmis stop ile karsilastir,
+//      cikmadiysak takip eden stopu bu barin high'i ile guncelle.
+//   2. Flat isek (ve bu barda cikmadiysak) giris kosuluna bak.
+// strategy.position_size, bu barin dolumlarindan ONCEKI durumu yansitir; yani
+// giris barinda 0'dir. Bu sayede giris barinda cikis kontrolu yapilmaz ve
+// cikis barinda ayni bar icinde yeniden giris olmaz.
+inPos          = strategy.position_size > 0
+exitedThisBar  = false
+enteredThisBar = false
+
+if inPos
+    if not inRange and closeAtEnd
+        strategy.close("L", comment = "Aralik disi")
+        exitedThisBar := true
+    else if exitOnClose and not na(stopLevel) and close <= stopLevel
+        strategy.close("L", comment = "Stop (kapanis)")
+        exitedThisBar := true
+    else
+        hhSince := na(hhSince) ? high : math.max(hhSince, high)
+        if not na(atrVal)
+            trail     = hhSince - atrMult * atrVal
+            stopLevel := na(stopLevel) ? trail : math.max(stopLevel, trail)
+        // Bar ici mod: stop emri bu barda gonderilir, emulator bir SONRAKI bardan
+        // itibaren tetikler. Yani giris barindan sonraki ilk bar korumasizdir.
+        if not exitOnClose and not na(stopLevel)
+            strategy.exit("X", from_entry = "L", stop = stopLevel, comment = "Stop (bar ici)")
+
+if not inPos and not exitedThisBar and inRange and entrySignal
+    riskPerShare = atrMult * atrVal
+    riskAmount   = strategy.equity * riskPct
+    qRaw         = riskPerShare > 0 ? riskAmount / riskPerShare : 0.0
+    qCap         = (maxPosPct > 0 and close > 0) ? strategy.equity * maxPosPct / 100.0 / close : qRaw
+    q            = math.min(qRaw, qCap)
+    if q > 0
+        strategy.entry("L", strategy.long, qty = q)
+        stopLevel      := close - riskPerShare   // baslangic stopu
+        hhSince        := na                     // takip giristen SONRAKI barla baslar
+        curRisk        := q * riskPerShare       // gerceklesen lot uzerinden risk
+        enteredThisBar := true
+
+// Stop cizgisini SIFIRLAMADAN once yakala; aksi halde giris barinda (pozisyon
+// henuz gorunmuyor) ve cikis barinda (stopLevel na'ya cekiliyor) cizgi kopuk cikar.
+stopPlot = (inPos or enteredThisBar) and not na(stopLevel) ? stopLevel : na
+
+// Pozisyon kapaninca durum degiskenlerini temizle. Bu blok giris blogundan
+// SONRA gelmeli, aksi halde ayni barda acilan yeni pozisyonun stopu silinirdi.
+// (strategy.position_size cikis barinda hala > 0 gorundugu icin kosul
+//  position_size'a degil exitedThisBar'a bakiyor.)
+if exitedThisBar
+    stopLevel := na
+    hhSince   := na
+    // curRisk sifirlanmaz: kapanan islem bir sonraki barda hasat edilirken okunur.
+
+// ─── Drawdown takibi (mark-to-market, secili tarih araliginda) ───────────────
+if inRange
+    eqNow    = strategy.equity
+    peakEq   := na(peakEq) ? eqNow : math.max(peakEq, eqNow)
+    ddNow    = peakEq > 0 ? (peakEq - eqNow) / peakEq * 100.0 : 0.0
+    maxDDPct := math.max(maxDDPct, ddNow)
+
+// ─── Cizimler ────────────────────────────────────────────────────────────────
+plot(emaTrend, "EMA Trend", color = color.new(color.orange, 0), linewidth = 2)
+plot(useBreakout ? na : emaFast, "EMA Hizli", color = color.new(color.aqua, 0))
+plot(useBreakout ? hhPrev : na, "Kirilim seviyesi", color = color.new(color.gray, 40))
+plot(stopPlot, "Takip eden stop",
+     color = color.new(color.red, 0), style = plot.style_linebr, linewidth = 2)
+bgcolor(inRange ? color(na) : color.new(color.gray, 92), title = "Aralik disi")
+
+// ─── Ozet tablo ──────────────────────────────────────────────────────────────
+fmt(x, digits) => na(x) ? "-" : str.tostring(x, digits)
+
+tblPos  = posIn == "Sag ust" ? position.top_right :
+          posIn == "Sag alt" ? position.bottom_right :
+          posIn == "Sol ust" ? position.top_left : position.bottom_left
+tblSize = txtSize == "Kucuk" ? size.small : txtSize == "Normal" ? size.normal : size.large
+
+var table t = table.new(tblPos, 2, 12,
+     border_width = 1,  border_color = color.new(color.gray, 60),
+     frame_width  = 1,  frame_color  = color.new(color.gray, 40))
+
+if showTable and barstate.islast
+    tradesN   = strategy.closedtrades
+    winRate   = tradesN > 0 ? 100.0 * strategy.wintrades / tradesN : na
+    netRetPct = 100.0 * strategy.netprofit / strategy.initial_capital
+    pf        = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    avgWinR   = nWinR  > 0 ? sumWinR  / nWinR  : na
+    avgLossR  = nLossR > 0 ? sumLossR / nLossR : na
+    wlRatio   = not na(avgWinR) and not na(avgLossR) and avgLossR != 0 ?
+                 math.abs(avgWinR / avgLossR) : na
+    thin      = tradesN < 20                    // 20 altinda "veri yetersiz"
+
+    hdrBg  = color.new(color.blue,  25)
+    cellBg = color.new(color.black, 20)
+    lblCol = color.new(color.silver, 0)
+    valCol = color.white
+
+    table.cell(t, 0, 0, syminfo.ticker, bgcolor = hdrBg, text_color = color.white,
+         text_size = tblSize, text_halign = text.align_left)
+    table.cell(t, 1, 0, useBreakout ? "A) Kirilim" : "B) Geri cekilme",
+         bgcolor = hdrBg, text_color = color.white, text_size = tblSize,
+         text_halign = text.align_right)
+
+    table.cell(t, 0, 1, "Donem", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
+    table.cell(t, 1, 1, str.format_time(startTime, "yyyy-MM-dd", syminfo.timezone) + " / " +
+         str.format_time(endTime, "yyyy-MM-dd", syminfo.timezone),
+         bgcolor = cellBg, text_color = valCol, text_size = tblSize, text_halign = text.align_right)
+
+    table.cell(t, 0, 2, "Islem sayisi", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
+    table.cell(t, 1, 2, str.tostring(tradesN) + (thin ? "  (veri yetersiz)" : ""),
+         bgcolor = cellBg, text_color = thin ? color.orange : valCol, text_size = tblSize, text_halign = text.align_right)
+
+    table.cell(t, 0, 3, "Kazanma orani %", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
+    table.cell(t, 1, 3, fmt(winRate, "#.#"), bgcolor = cellBg, text_color = valCol, text_size = tblSize, text_halign = text.align_right)
+
+    table.cell(t, 0, 4, "Net getiri %", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
+    table.cell(t, 1, 4, fmt(netRetPct, "#.##"), bgcolor = cellBg,
+         text_color = netRetPct >= 0 ? color.lime : color.red, text_size = tblSize, text_halign = text.align_right)
+
+    table.cell(t, 0, 5, "Max drawdown %", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
+    table.cell(t, 1, 5, fmt(maxDDPct, "#.##"), bgcolor = cellBg, text_color = color.red, text_size = tblSize, text_halign = text.align_right)
+
+    table.cell(t, 0, 6, "Profit factor", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
+    table.cell(t, 1, 6, fmt(pf, "#.##"), bgcolor = cellBg, text_color = valCol, text_size = tblSize, text_halign = text.align_right)
+
+    table.cell(t, 0, 7, "Maks ardisik kayip", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
+    table.cell(t, 1, 7, str.tostring(maxConsecLoss), bgcolor = cellBg, text_color = valCol, text_size = tblSize, text_halign = text.align_right)
+
+    table.cell(t, 0, 8, "Ort kazanc / kayip (R)", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
+    table.cell(t, 1, 8, fmt(avgWinR, "#.##") + " / " + fmt(avgLossR, "#.##"),
+         bgcolor = cellBg, text_color = valCol, text_size = tblSize, text_halign = text.align_right)
+
+    table.cell(t, 0, 9, "Ort kazanc/kayip orani", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
+    table.cell(t, 1, 9, fmt(wlRatio, "#.##"), bgcolor = cellBg, text_color = valCol, text_size = tblSize, text_halign = text.align_right)
+
+    table.cell(t, 0, 10, "Net kar (TL)", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
+    table.cell(t, 1, 10, str.tostring(strategy.netprofit, "#"), bgcolor = cellBg,
+         text_color = strategy.netprofit >= 0 ? color.lime : color.red, text_size = tblSize, text_halign = text.align_right)
+
+    table.cell(t, 0, 11, "Acik pozisyon", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
+    table.cell(t, 1, 11, strategy.position_size > 0 ? "VAR" : "yok", bgcolor = cellBg,
+         text_color = valCol, text_size = tblSize, text_halign = text.align_right)
