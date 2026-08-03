@@ -68,14 +68,24 @@ exitOnClose = input.bool(true, "Cikis bar kapanisinda (bar ici stop emri yok)", 
                "kapanisinda cikilir - gun ici doldurma varsayilmaz.\n" +
                "Kapali: strategy.exit(stop=...) ile bar ici stop emri kullanilir; " +
                "dolum stop fiyatindan olur ve sonuclar iyimser gorunur.")
-maxPosPct   = input.float(100.0, "Maks pozisyon buyuklugu (% sermaye, 0 = sinirsiz)",
+maxPosPct   = input.float(20.0, "Maks pozisyon buyuklugu (% sermaye, 0 = sinirsiz)",
      minval = 0, step = 5, group = gE,
-     tooltip = "VARSAYILAN 100 = pozisyon degeri sermayeyi asamaz. 3*ATR cok " +
+     tooltip = "VARSAYILAN 20 = pozisyon degeri sermayenin %20'sini asamaz. 3*ATR cok " +
                "kucuk kaldiginda risk/(3*ATR) formulu sermayenin katlarina ulasan " +
                "lot uretir; sinirsiz birakmak tek islemde sermayenin katlari kadar " +
                "zarara yol acabilir. 0 = sinirsiz (spesifikasyonun ham hali) - " +
                "sadece ne oldugunu bilerek kullanin. Sinirin kac islemde devreye " +
                "girdigi tablodaki 'Poz. siniri' satirinda gosterilir.")
+maxLossPct  = input.float(2.0, "Tek islemde maks kayip (% sermaye, 0 = kapali)",
+     minval = 0, step = 0.5, group = gE,
+     tooltip = "En kotu ihtimalle pozisyonun tamami kaybedilir varsayimiyla " +
+               "lotu sinirlar: q <= sermaye * %tavan / giris fiyati. Yani pozisyon " +
+               "degeri sermayenin bu yuzdesini asamaz.\n\n" +
+               "DIKKAT: %2 tavan, %20'lik 'Maks pozisyon buyuklugu' sinirindan her " +
+               "zaman daha dardir - poz. siniri bu ayarla fiilen devre disi kalir. " +
+               "Ayrica 3*ATR stopa gore hesaplanan lot neredeyse her barda bu " +
+               "tavanla kirpilir, dolayisiyla islem basina gercek risk %0.5'in " +
+               "belirgin altina iner ve net getiri kucultur.")
 
 gV = "4) Gorunum"
 showTable = input.bool(true, "Ozet tabloyu goster", group = gV)
@@ -121,7 +131,8 @@ var float sumLossR      = 0.0
 var int   nLossR        = 0
 
 // Pozisyon siniri / ortuk kaldirac teshisi
-var int   nClipped      = 0    // sinirin devreye girip lotu kirptigi giris sayisi
+var int   nClipLoss     = 0    // kayip tavaninin lotu kirptigi giris sayisi
+var int   nClipPos      = 0    // pozisyon sinirinin lotu kirptigi giris sayisi
 var int   nOverLev      = 0    // gerceklesen pozisyon degeri sermayeyi asan giris sayisi
 var float maxRawExpPct  = 0.0  // sinir olmasaydi ulasilacak en buyuk pozisyon (% sermaye)
 
@@ -180,8 +191,13 @@ if inPos
 if not inPos and not exitedThisBar and inRange and entrySignal
     riskPerShare = atrMult * atrVal
     riskAmount   = strategy.equity * riskPct
+    // Aday 1: 3*ATR stopa gore risk bazli lot
     qRaw         = riskPerShare > 0 ? riskAmount / riskPerShare : 0.0
-    qCap         = (maxPosPct > 0 and close > 0) ? strategy.equity * maxPosPct / 100.0 / close : qRaw
+    // Aday 2: pozisyon degeri sermayenin %maxPosPct'ini asmasin
+    qCapPos      = (maxPosPct > 0 and close > 0) ? strategy.equity * maxPosPct / 100.0 / close : qRaw
+    // Aday 3: tek islemde maks kayip tavani (en kotu durum = pozisyonun tamami)
+    qCapLoss     = (maxLossPct > 0 and close > 0) ? strategy.equity * maxLossPct / 100.0 / close : qRaw
+    qCap         = math.min(qCapPos, qCapLoss)
     q            = math.min(qRaw, qCap)
     if q > 0
         strategy.entry("L", strategy.long, qty = q)
@@ -193,8 +209,13 @@ if not inPos and not exitedThisBar and inRange and entrySignal
         // Teshis: sinir olmasaydi pozisyon sermayenin yuzde kacini tutardi?
         rawExpPct    = strategy.equity > 0 ? 100.0 * qRaw * close / strategy.equity : 0.0
         maxRawExpPct := math.max(maxRawExpPct, rawExpPct)
-        if qCap < qRaw
-            nClipped := nClipped + 1
+        // Hangi tavanin bagladigini ayri say: kayip tavani varsayilan ayarda
+        // neredeyse her islemde baglar (tasarim geregi), poz. siniri baglarsa
+        // veride durgun/bozuk bolge var demektir.
+        if qCapLoss < qRaw and qCapLoss <= qCapPos
+            nClipLoss := nClipLoss + 1
+        if qCapPos < qRaw and qCapPos < qCapLoss
+            nClipPos := nClipPos + 1
         // Tolerans: sinir tam devredeyken q*close == equity olur, kayan nokta
         // yuvarlamasi bunu yanlislikla "asim" saymasin.
         if q * close > strategy.equity * 1.0001
@@ -236,7 +257,7 @@ tblPos  = posIn == "Sag ust" ? position.top_right :
           posIn == "Sol ust" ? position.top_left : position.bottom_left
 tblSize = txtSize == "Kucuk" ? size.small : txtSize == "Normal" ? size.normal : size.large
 
-var table t = table.new(tblPos, 2, 13,
+var table t = table.new(tblPos, 2, 14,
      border_width = 1,  border_color = color.new(color.gray, 60),
      frame_width  = 1,  frame_color  = color.new(color.gray, 40))
 
@@ -287,27 +308,37 @@ if showTable and barstate.islast
     table.cell(t, 0, 7, "Maks ardisik kayip", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
     table.cell(t, 1, 7, str.tostring(maxConsecLoss), bgcolor = cellBg, text_color = valCol, text_size = tblSize, text_halign = text.align_right)
 
-    table.cell(t, 0, 8, "Ort kazanc / kayip (R)", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
-    table.cell(t, 1, 8, fmt(avgWinR, "#.##") + " / " + fmt(avgLossR, "#.##"),
-         bgcolor = cellBg, text_color = valCol, text_size = tblSize, text_halign = text.align_right)
+    table.cell(t, 0, 8, "Ort kazanc (R)", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
+    table.cell(t, 1, 8, fmt(avgWinR, "#.##"), bgcolor = cellBg, text_color = valCol, text_size = tblSize, text_halign = text.align_right)
 
-    table.cell(t, 0, 9, "Ort kazanc/kayip orani", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
-    table.cell(t, 1, 9, fmt(wlRatio, "#.##"), bgcolor = cellBg, text_color = valCol, text_size = tblSize, text_halign = text.align_right)
+    // Ort kayip 1.5R'i asarsa kirmizi: cikislar stopun cok altinda gerceklesiyor
+    // demektir (bosluk / kapanista atlama), stop mesafesi tutmuyor.
+    lossHot = not na(avgLossR) and avgLossR < -1.5
+    table.cell(t, 0, 9, "Ort kayip (R)", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
+    table.cell(t, 1, 9, fmt(avgLossR, "#.##"), bgcolor = cellBg,
+         text_color = lossHot ? color.red : valCol, text_size = tblSize, text_halign = text.align_right)
 
-    table.cell(t, 0, 10, "Net kar (TL)", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
-    table.cell(t, 1, 10, str.tostring(strategy.netprofit, "#"), bgcolor = cellBg,
+    table.cell(t, 0, 10, "Ort kazanc/kayip orani", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
+    table.cell(t, 1, 10, fmt(wlRatio, "#.##"), bgcolor = cellBg, text_color = valCol, text_size = tblSize, text_halign = text.align_right)
+
+    table.cell(t, 0, 11, "Net kar (TL)", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
+    table.cell(t, 1, 11, str.tostring(strategy.netprofit, "#"), bgcolor = cellBg,
          text_color = strategy.netprofit >= 0 ? color.lime : color.red, text_size = tblSize, text_halign = text.align_right)
 
-    table.cell(t, 0, 11, "Acik pozisyon", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
-    table.cell(t, 1, 11, strategy.position_size > 0 ? "VAR" : "yok", bgcolor = cellBg,
+    table.cell(t, 0, 12, "Acik pozisyon", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
+    table.cell(t, 1, 12, strategy.position_size > 0 ? "VAR" : "yok", bgcolor = cellBg,
          text_color = valCol, text_size = tblSize, text_halign = text.align_right)
 
     // Pozisyon siniri / ortuk kaldirac uyarisi - sessizce kirpilmasin.
+    // "ham maks %" = hicbir tavan olmasaydi 3*ATR formulunun actigi en buyuk
+    // pozisyon (% sermaye). %100'u asiyorsa o sembolde ATR'nin coktugu durgun
+    // veri bolgesi var demektir - asil bakilacak sayi bu.
     expTxt   = "ham maks %" + str.tostring(maxRawExpPct, "#")
     limitTxt = nOverLev > 0 ? str.tostring(nOverLev) + " ISLEM SERMAYEYI ASTI, " + expTxt :
-               nClipped > 0 ? str.tostring(nClipped) + " islemde kirpildi, " + expTxt :
+               (nClipLoss + nClipPos) > 0 ?
+                 str.tostring(nClipLoss) + " tavan / " + str.tostring(nClipPos) + " poz, " + expTxt :
                "yok, " + expTxt
-    limitCol = nOverLev > 0 ? color.red : nClipped > 0 ? color.orange : valCol
-    table.cell(t, 0, 12, "Poz. siniri", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
-    table.cell(t, 1, 12, limitTxt, bgcolor = cellBg, text_color = limitCol,
+    limitCol = nOverLev > 0 ? color.red : maxRawExpPct > 100.0 ? color.orange : valCol
+    table.cell(t, 0, 13, "Poz. siniri", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
+    table.cell(t, 1, 13, limitTxt, bgcolor = cellBg, text_color = limitCol,
          text_size = tblSize, text_halign = text.align_right)

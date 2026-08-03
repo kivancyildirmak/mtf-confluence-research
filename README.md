@@ -51,8 +51,14 @@ sonunda acik kalan islem hic kapanmaz ve istatistiklere girmez.
 ### Kose tablosu
 
 Sembol · islem sayisi · kazanma orani % · net getiri % · max drawdown % ·
-profit factor · maks ardisik kayip · ortalama kazanc/kayip (R ve oran) ·
-net kar · acik pozisyon var/yok · **poz. siniri** (kirpma/asim sayisi).
+profit factor · maks ardisik kayip · **ort kazanc (R)** · **ort kayip (R)** ·
+ort kazanc/kayip orani · net kar · acik pozisyon var/yok ·
+**poz. siniri** (kirpma sayisi + ham maks pozisyon).
+
+`Ort kayip (R)` **-1.5R'i asarsa kirmizi** yanar. Beklenen deger -1R civaridir
+(stop mesafesi kadar). Belirgin asiyorsa cikislar stopun cok altinda
+gerceklesiyor demektir — bosluk ya da kapanista atlama var, stop mesafesi
+gercek riski temsil etmiyor.
 
 Islem sayisi **20'nin altindaysa** hucre turuncuya doner ve `(veri yetersiz)`
 yazar. Max drawdown TradingView'in kendi kutusundan degil, `strategy.equity`
@@ -67,18 +73,35 @@ sembol karsilastirirken akilda tutun. Kayma ve komisyon sadece K/Z'yi etkiler;
 sinyaller `close` ve hesaplanan stop seviyesinden uretildigi icin islem
 **sayisi ve tarihleri** bu ayarlardan etkilenmez.
 
-**Ortuk kaldirac — varsayilan sinir %100.** Illikit ya da durgun veride ayni
-kapanis tekrar edince TR sifir olur ve ATR cokede yaklasir. `risk / (3*ATR)`
+**Ortuk kaldirac — lot uc tavanin en kucugu.** Illikit ya da durgun veride ayni
+kapanis tekrar edince TR sifir olur ve ATR cokmeye yaklasir. `risk / (3*ATR)`
 formulu o barda sermayenin katlarina ulasan lot uretir; ustune bir fiyat
 sureksizligi gelirse tek islemde sermayenin katlari kadar zarar yazilir.
-Bu yuzden `Maks pozisyon buyuklugu` varsayilani **100** (pozisyon degeri
-sermayeyi asamaz). `0` yazarak sinirsiz hale getirebilirsiniz — spesifikasyonun
-ham hali budur ama ne yaptiginizi bilerek kullanin.
+Bu yuzden lot su ucunun **en kucugu** olarak hesaplanir:
 
-Sinirin devreye girip girmedigi tabloda **`Poz. siniri`** satirinda gorunur:
-kac islemde kirpildigi, kac islemde pozisyon sermayeyi astigi ve sinir
-olmasaydi ulasilacak en buyuk pozisyon (`ham maks %`). Bu deger %100'un cok
-uzerindeyse sembolun verisinde durgun/bozuk bolge var demektir.
+| aday | formul | varsayilan |
+|---|---|---|
+| risk bazli | `sermaye * %0.5 / (3*ATR)` | — |
+| pozisyon siniri | `sermaye * %20 / giris` | `Maks pozisyon buyuklugu = 20` |
+| kayip tavani | `sermaye * %2 / giris` | `Tek islemde maks kayip = 2` |
+
+Kayip tavani "en kotu ihtimalle pozisyonun tamami gider, o da sermayenin %2'sini
+gecmesin" varsayimidir. **%2 tavan %20'lik pozisyon sinirindan her zaman dardir**,
+yani varsayilan ayarda pozisyon siniri fiilen devre disidir; ikinci bir emniyet
+kemeri olarak durur. Ikisi de `0` ile kapatilabilir.
+
+Bunun bedeli var: 3*ATR'ye gore hesaplanan lot neredeyse her barda tavanla
+kirpildigi icin **islem basina gercek risk %0.5'in belirgin altina iner**
+(sentetik testte ort. %0.12) ve net getiri kuculur. Risk normalize edilmedigi
+icin islemler artik esit agirlikli degildir — R istatistikleri her islemin kendi
+riskine gore hesaplandigindan tutarli kalir, ama "her islem %0.5 risk"
+varsayimi gecerli degildir.
+
+Tabloda **`Poz. siniri`** satiri `<n> tavan / <n> poz, ham maks %<x>` formatinda
+hangi tavanin kac kez bagladigini gosterir. `ham maks %` hicbir tavan olmasaydi
+formulun actigi en buyuk pozisyondur — **asil bakilacak sayi budur**. %100'u
+asiyorsa (satir turuncuya doner) o sembolde ATR'nin coktugu durgun veri bolgesi
+var demektir.
 
 **2005 oncesi TRY verisi kullanilamaz.** Redenominasyon (6 sifir atilmasi) ve
 hiperenflasyon yuzunden fiyat serisi sureksiz. Bu yuzden `Tarih araligi kullan`
