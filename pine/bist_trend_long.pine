@@ -7,10 +7,17 @@
 // Giris B        : trend yukari VE close > EMA(20) VE close[1] <= EMA(20)[1]
 // Stop           : giris - 3*ATR(14), sonra (giristen sonraki en yuksek high) - 3*ATR(14)
 //                  math.max ile asla asagi inmez. Sabit hedef yok.
-// Pozisyon       : qty = su ucunun en kucugu, pyramiding = 0
-//                    risk bazli     : sermaye * %0.5 / (3*ATR)
-//                    pozisyon siniri : sermaye * %20  / giris
-//                    kayip tavani    : sermaye * %2   / giris
+// Pozisyon       : FULL CAPITAL COMPOUNDING - pyramiding = 0
+//                    qty = math.floor(strategy.equity / close)
+//                  Her giriste mevcut sermayenin tamami kullanilir; giris aninda
+//                  flat oldugumuz icin strategy.equity = 100.000 + kapanmis
+//                  islemlerin net K/Z'si, yani karlar bilesik devreder.
+//                  Risk bazli lot, pozisyon siniri ve kayip tavani KALDIRILDI.
+//
+// UYARI: bu model sermayenin %100'unu tek hisseye yatirir. 3*ATR stop hala
+// cikisi belirler ama artik lotu SINIRLAMAZ - tek islemde zarar, fiyatin
+// giristen cikisa dususu kadardir (stop bosluk yuzunden atlanirsa daha da
+// fazlasi). Drawdown'lar risk bazli surumden cok daha buyuk cikacaktir.
 //
 // Look-ahead notu: tum gostergeler kapanmis bar verisiyle hesaplanir. Kirilim
 // penceresi ta.highest(high, 20)[1] ile ONCEKI bara kadar alinir; barin kendi
@@ -78,8 +85,6 @@ brkLen    = input.int(20,   "Kirilim penceresi (bar)",     minval = 1, group = g
 fastLen   = input.int(20,   "Geri cekilme EMA uzunlugu",   minval = 1, group = gS)
 atrLen    = input.int(14,   "ATR uzunlugu",                minval = 1, group = gS)
 atrMult   = input.float(3.0,"ATR carpani (stop)", minval = 0.1, step = 0.1, group = gS)
-riskPctIn = input.float(0.5,"Islem basina risk (%)", minval = 0.01, step = 0.05, group = gS)
-riskPct   = riskPctIn / 100.0
 
 gE = "3) Cikis / pozisyon"
 exitOnClose = input.bool(true, "Cikis bar kapanisinda (bar ici stop emri yok)", group = gE,
@@ -87,24 +92,10 @@ exitOnClose = input.bool(true, "Cikis bar kapanisinda (bar ici stop emri yok)", 
                "kapanisinda cikilir - gun ici doldurma varsayilmaz.\n" +
                "Kapali: strategy.exit(stop=...) ile bar ici stop emri kullanilir; " +
                "dolum stop fiyatindan olur ve sonuclar iyimser gorunur.")
-maxPosPct   = input.float(20.0, "Maks pozisyon buyuklugu (% sermaye, 0 = sinirsiz)",
-     minval = 0, step = 5, group = gE,
-     tooltip = "VARSAYILAN 20 = pozisyon degeri sermayenin %20'sini asamaz. 3*ATR cok " +
-               "kucuk kaldiginda risk/(3*ATR) formulu sermayenin katlarina ulasan " +
-               "lot uretir; sinirsiz birakmak tek islemde sermayenin katlari kadar " +
-               "zarara yol acabilir. 0 = sinirsiz (spesifikasyonun ham hali) - " +
-               "sadece ne oldugunu bilerek kullanin. Sinirin kac islemde devreye " +
-               "girdigi tablodaki 'Poz. siniri' satirinda gosterilir.")
-maxLossPct  = input.float(2.0, "Tek islemde maks kayip (% sermaye, 0 = kapali)",
-     minval = 0, step = 0.5, group = gE,
-     tooltip = "En kotu ihtimalle pozisyonun tamami kaybedilir varsayimiyla " +
-               "lotu sinirlar: q <= sermaye * %tavan / giris fiyati. Yani pozisyon " +
-               "degeri sermayenin bu yuzdesini asamaz.\n\n" +
-               "DIKKAT: %2 tavan, %20'lik 'Maks pozisyon buyuklugu' sinirindan her " +
-               "zaman daha dardir - poz. siniri bu ayarla fiilen devre disi kalir. " +
-               "Ayrica 3*ATR stopa gore hesaplanan lot neredeyse her barda bu " +
-               "tavanla kirpilir, dolayisiyla islem basina gercek risk %0.5'in " +
-               "belirgin altina iner ve net getiri kucultur.")
+wholeLots   = input.bool(true, "Tam lot (floor) kullan", group = gE,
+     tooltip = "Acik (varsayilan): qty = math.floor(strategy.equity / close) - " +
+               "kesirli lot alinmaz, artan bakiye nakit kalir. Kapali: kesirli " +
+               "lot kullanilir ve sermayenin tamami her islemde tam olarak calisir.")
 
 gV = "4) Gorunum"
 showTable = input.bool(true, "Ozet tabloyu goster", group = gV)
@@ -150,10 +141,8 @@ var float sumLossR      = 0.0
 var int   nLossR        = 0
 
 // Pozisyon siniri / ortuk kaldirac teshisi
-var int   nClipLoss     = 0    // kayip tavaninin lotu kirptigi giris sayisi
-var int   nClipPos      = 0    // pozisyon sinirinin lotu kirptigi giris sayisi
-var int   nOverLev      = 0    // gerceklesen pozisyon degeri sermayeyi asan giris sayisi
-var float maxRawExpPct  = 0.0  // sinir olmasaydi ulasilacak en buyuk pozisyon (% sermaye)
+var float maxUsePct     = 0.0  // giriste sermayenin kullanilan en buyuk yuzdesi
+var float minUsePct     = na   // giriste sermayenin kullanilan en kucuk yuzdesi
 
 // ─── Kapanan islemleri hasat et ──────────────────────────────────────────────
 // process_orders_on_close nedeniyle bir islem bar t'nin kapanisinda kapanir ve
@@ -208,37 +197,26 @@ if inPos
             strategy.exit("X", from_entry = "L", stop = stopLevel, comment = "Stop (bar ici)")
 
 if not inPos and not exitedThisBar and inRange and entrySignal
-    riskPerShare = atrMult * atrVal
-    riskAmount   = strategy.equity * riskPct
-    // Aday 1: 3*ATR stopa gore risk bazli lot
-    qRaw         = riskPerShare > 0 ? riskAmount / riskPerShare : 0.0
-    // Aday 2: pozisyon degeri sermayenin %maxPosPct'ini asmasin
-    qCapPos      = (maxPosPct > 0 and close > 0) ? strategy.equity * maxPosPct / 100.0 / close : qRaw
-    // Aday 3: tek islemde maks kayip tavani (en kotu durum = pozisyonun tamami)
-    qCapLoss     = (maxLossPct > 0 and close > 0) ? strategy.equity * maxLossPct / 100.0 / close : qRaw
-    qCap         = math.min(qCapPos, qCapLoss)
-    q            = math.min(qRaw, qCap)
+    // Full capital compounding: mevcut sermayenin tamami kullanilir.
+    // strategy.equity giris aninda flat oldugumuz icin = baslangic sermayesi +
+    // kapanmis islemlerin net K/Z'si, yani karlar bilesik olarak devreder.
+    // Not: pozisyon degeri sermayenin ~%100'u oldugu icin komisyon ustune biner.
+    // Emirler "insufficient funds" ile reddedilirse Properties -> Margin for long
+    // positions alaninin 0 oldugunu kontrol edin.
+    riskPerShare = atrMult * atrVal          // sadece stop mesafesi ve R istatistigi icin
+    qRawFull     = close > 0 ? strategy.equity / close : 0.0
+    q            = wholeLots ? math.floor(qRawFull) : qRawFull
     if q > 0
         strategy.entry("L", strategy.long, qty = q)
-        stopLevel      := close - riskPerShare   // baslangic stopu
+        stopLevel      := close - riskPerShare   // baslangic stopu (mantik degismedi)
         hhSince        := na                     // takip giristen SONRAKI barla baslar
-        curRisk        := q * riskPerShare       // gerceklesen lot uzerinden risk
+        curRisk        := q * riskPerShare       // R paydasi: lot x stop mesafesi
         enteredThisBar := true
 
-        // Teshis: sinir olmasaydi pozisyon sermayenin yuzde kacini tutardi?
-        rawExpPct    = strategy.equity > 0 ? 100.0 * qRaw * close / strategy.equity : 0.0
-        maxRawExpPct := math.max(maxRawExpPct, rawExpPct)
-        // Hangi tavanin bagladigini ayri say: kayip tavani varsayilan ayarda
-        // neredeyse her islemde baglar (tasarim geregi), poz. siniri baglarsa
-        // veride durgun/bozuk bolge var demektir.
-        if qCapLoss < qRaw and qCapLoss <= qCapPos
-            nClipLoss := nClipLoss + 1
-        if qCapPos < qRaw and qCapPos < qCapLoss
-            nClipPos := nClipPos + 1
-        // Tolerans: sinir tam devredeyken q*close == equity olur, kayan nokta
-        // yuvarlamasi bunu yanlislikla "asim" saymasin.
-        if q * close > strategy.equity * 1.0001
-            nOverLev := nOverLev + 1
+        // Teshis: sermayenin yuzde kaci fiilen pozisyona girdi (kalani nakit).
+        usedPct    = strategy.equity > 0 ? 100.0 * q * close / strategy.equity : 0.0
+        maxUsePct := math.max(maxUsePct, usedPct)
+        minUsePct := na(minUsePct) ? usedPct : math.min(minUsePct, usedPct)
 
 // Stop cizgisini SIFIRLAMADAN once yakala; aksi halde giris barinda (pozisyon
 // henuz gorunmuyor) ve cikis barinda (stopLevel na'ya cekiliyor) cizgi kopuk cikar.
@@ -349,15 +327,11 @@ if showTable and barstate.islast
          text_color = valCol, text_size = tblSize, text_halign = text.align_right)
 
     // Pozisyon siniri / ortuk kaldirac uyarisi - sessizce kirpilmasin.
-    // "ham maks %" = hicbir tavan olmasaydi 3*ATR formulunun actigi en buyuk
-    // pozisyon (% sermaye). %100'u asiyorsa o sembolde ATR'nin coktugu durgun
-    // veri bolgesi var demektir - asil bakilacak sayi bu.
-    expTxt   = "ham maks %" + str.tostring(maxRawExpPct, "#")
-    limitTxt = nOverLev > 0 ? str.tostring(nOverLev) + " ISLEM SERMAYEYI ASTI, " + expTxt :
-               (nClipLoss + nClipPos) > 0 ?
-                 str.tostring(nClipLoss) + " tavan / " + str.tostring(nClipPos) + " poz, " + expTxt :
-               "yok, " + expTxt
-    limitCol = nOverLev > 0 ? color.red : maxRawExpPct > 100.0 ? color.orange : valCol
-    table.cell(t, 0, 13, "Poz. siniri", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
+    // Sermayenin yuzde kaci fiilen pozisyona girdi. Tam lot (floor) modunda
+    // %100'un biraz altinda kalir; fiyat sermayeye gore yuksekse (az sayida lot)
+    // sapma buyur ve o sembolde bilesiklenme beklenenden yavas ilerler.
+    limitTxt = "kullanim %" + fmt(minUsePct, "#.#") + " - %" + fmt(maxUsePct, "#.#")
+    limitCol = not na(minUsePct) and minUsePct < 90.0 ? color.orange : valCol
+    table.cell(t, 0, 13, "Sermaye kullanimi", bgcolor = cellBg, text_color = lblCol, text_size = tblSize, text_halign = text.align_left)
     table.cell(t, 1, 13, limitTxt, bgcolor = cellBg, text_color = limitCol,
          text_size = tblSize, text_halign = text.align_right)

@@ -17,11 +17,11 @@ sonuclari okumak icin tasarlandi.
 | Baslangic stop | `giris - 3 * ATR(14)` |
 | Takip eden stop | `(giristen sonraki en yuksek high) - 3 * ATR(14)`, `math.max` ile asla asagi inmez |
 | Hedef | yok — cikis sadece stopla |
-| Pozisyon | `qty = (strategy.equity * 0.005) / (giris - stop)`, `pyramiding = 0` |
+| Pozisyon | `qty = math.floor(strategy.equity / close)` — full capital compounding, `pyramiding = 0` |
 
-`strategy()` ayarlari: komisyon yuzde bazli (input, varsayilan **%0.30**),
-**slippage 0**, `process_orders_on_close=true`, `calc_on_every_tick=false`,
-`initial_capital=100000`.
+`strategy()` ayarlari: komisyon yuzde bazli **%0.30** (Properties'ten
+degistirilebilir), **slippage 0**, `process_orders_on_close=true`,
+`calc_on_every_tick=false`, `initial_capital=100000`.
 
 ### Kurulum
 
@@ -54,7 +54,7 @@ sonunda acik kalan islem hic kapanmaz ve istatistiklere girmez.
 Sembol · islem sayisi · kazanma orani % · net getiri % · max drawdown % ·
 profit factor · maks ardisik kayip · **ort kazanc (R)** · **ort kayip (R)** ·
 ort kazanc/kayip orani · net kar · acik pozisyon var/yok ·
-**poz. siniri** (kirpma sayisi + ham maks pozisyon).
+**sermaye kullanimi** (min - maks %).
 
 `Ort kayip (R)` **-1.5R'i asarsa kirmizi** yanar. Beklenen deger -1R civaridir
 (stop mesafesi kadar). Belirgin asiyorsa cikislar stopun cok altinda
@@ -100,42 +100,44 @@ cinsinden agirligi `gidis-donus % x fiyat / (3*ATR)` kadardir — ATR fiyata gor
 kucukse (dar stop) maliyet R'nin ciddi bir kismini yer. `Ort kayip (R)`
 -1.5R'i asip kirmizi yaniyorsa once bunu kontrol edin.
 
-**Ortuk kaldirac — lot uc tavanin en kucugu.** Illikit ya da durgun veride ayni
-kapanis tekrar edince TR sifir olur ve ATR cokmeye yaklasir. `risk / (3*ATR)`
-formulu o barda sermayenin katlarina ulasan lot uretir; ustune bir fiyat
-sureksizligi gelirse tek islemde sermayenin katlari kadar zarar yazilir.
-Bu yuzden lot su ucunun **en kucugu** olarak hesaplanir:
+**Pozisyon: full capital compounding.** Her giriste mevcut sermayenin tamami
+kullanilir:
 
-| aday | formul | varsayilan |
-|---|---|---|
-| risk bazli | `sermaye * %0.5 / (3*ATR)` | — |
-| pozisyon siniri | `sermaye * %20 / giris` | `Maks pozisyon buyuklugu = 20` |
-| kayip tavani | `sermaye * %2 / giris` | `Tek islemde maks kayip = 2` |
+```
+qty = math.floor(strategy.equity / close)
+```
 
-Kayip tavani "en kotu ihtimalle pozisyonun tamami gider, o da sermayenin %2'sini
-gecmesin" varsayimidir. **%2 tavan %20'lik pozisyon sinirindan her zaman dardir**,
-yani varsayilan ayarda pozisyon siniri fiilen devre disidir; ikinci bir emniyet
-kemeri olarak durur. Ikisi de `0` ile kapatilabilir.
+Giris aninda pozisyon flat oldugu icin `strategy.equity` = 100.000 + kapanmis
+islemlerin net K/Z'si; yani karlar sonraki islemlerde **bilesik** olarak devreder.
+`pyramiding = 0`, ayni anda tek pozisyon.
 
-Bunun bedeli var: 3*ATR'ye gore hesaplanan lot neredeyse her barda tavanla
-kirpildigi icin **islem basina gercek risk %0.5'in belirgin altina iner**
-(sentetik testte ort. %0.12) ve net getiri kuculur. Risk normalize edilmedigi
-icin islemler artik esit agirlikli degildir — R istatistikleri her islemin kendi
-riskine gore hesaplandigindan tutarli kalir, ama "her islem %0.5 risk"
-varsayimi gecerli degildir.
+`Tam lot (floor) kullan` varsayilan **acik** — kesirli lot alinmaz, artan bakiye
+nakit kalir. Kapatirsaniz kesirli lot kullanilir ve sermayenin tam %100'u calisir.
 
-Tabloda **`Poz. siniri`** satiri `<n> tavan / <n> poz, ham maks %<x>` formatinda
-hangi tavanin kac kez bagladigini gosterir. `ham maks %` hicbir tavan olmasaydi
-formulun actigi en buyuk pozisyondur — **asil bakilacak sayi budur**. %100'u
-asiyorsa (satir turuncuya doner) o sembolde ATR'nin coktugu durgun veri bolgesi
-var demektir.
+**Risk bazli lot, pozisyon siniri ve kayip tavani kaldirildi.** 3*ATR stop hala
+cikisi belirliyor ama artik **lotu sinirlamiyor**. Sonuclari yorumlarken bunun
+anlami: tek islemdeki zarar, fiyatin giristen cikisa dususu kadardir — stop
+bosluk yuzunden atlanirsa daha da fazlasi. Drawdown'lar risk bazli surume gore
+cok daha buyuk cikacaktir; sentetik testte tek bir -%99'luk bar hesabi
+sifirliyor. Bu modelin dogasi, hata degil.
+
+`Ort kayip (R)` satiri korundu — R paydasi artik `lot x 3*ATR`, yani stop
+mesafesinin lot cinsinden karsiligi. ATR'nin coktugu barlarda bu payda cok
+kuculdugu icin R degeri devasa negatiflere gidebilir; **-1.5R kirmizisi** bu
+durumda dogru uyariyi verir.
+
+Tabloda **`Sermaye kullanimi`** satiri girislerde sermayenin yuzde kacinin
+fiilen pozisyona girdigini `min - maks` araligi olarak gosterir. Tam lot
+modunda %100'un biraz altinda olmasi normaldir. **%90'in altina duserse satir
+turuncuya doner** — fiyat sermayeye gore yuksek demektir (az sayida lot
+alinabiliyor), o sembolde bilesiklenme beklenenden yavas ilerler.
 
 **2005 oncesi TRY verisi kullanilamaz.** Redenominasyon (6 sifir atilmasi) ve
 hiperenflasyon yuzunden fiyat serisi sureksiz. Bu yuzden `Tarih araligi kullan`
 varsayilan olarak **acik** ve baslangic **01.01.2015**. Kapatirsaniz sembolun
-tum gecmisi islenir; eski veride yukaridaki kaldirac patolojisi tetiklenir.
-Pozisyon siniri bu durumda tek islem zararini sermayenin ~1 katiyla sinirlar
-ama artefakti yok etmez — tarih filtresi asil koruma.
+tum gecmisi islenir. Full capital compounding modelinde pozisyon siniri
+olmadigi icin **tarih filtresi tek korumadir**: eski veride tek bir
+sureksizlik bari hesabi sifirlar.
 
 ### Cikis modeli
 
